@@ -1,0 +1,12 @@
+Flask
+PyMuPDF
+PySide6
+numpy
+ollama
+psycopg2-binary
+pypdf
+python-docx
+python-dotenv
+rapidocr-onnxruntime
+reportlab
+supabase
