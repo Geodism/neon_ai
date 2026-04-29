@@ -598,3 +598,164 @@ Why this is the safest cluster:
 Current conclusion:
 
 Argon runtime dependency surface is smaller after Phases 3A through 4C, but total separation is not complete.
+
+## 12. Current Remaining Argon Dependencies After Phase 5E
+
+Fresh source scan performed across `D:\Neon_ai\src` for:
+
+- `ensure_legacy_import_paths()`
+- `legacy_app_root()`
+- `sys.path.insert`
+- `sys.path.append`
+- `D:\Argon_ai`
+- imports from bare `database.*`
+- imports from bare `automation.*`
+- imports from bare `gateway`
+- imports from bare `invoice_generator`
+- imports from bare `wo_exporter`
+- imports from bare `purchase_order_generator`
+- `load_dotenv(...)`
+
+### 12.1 Current scan summary
+
+- remaining `ensure_legacy_import_paths()` runtime call sites: `2`
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:12)
+  - [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:24)
+- remaining `legacy_app_root()` references: `2` runtime references plus `1` function definition
+  - all in [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py)
+- remaining `sys.path.insert(...)` references: `1`
+  - [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:44)
+- remaining `sys.path.append(...)` references: `0`
+- remaining hardcoded `D:\Argon_ai` references: `1`
+  - [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:26)
+- remaining bare `database.*` import sites: `6`
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:16)
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:24)
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:29)
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:30)
+  - [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:26)
+  - [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:27)
+- remaining bare `automation.*` import sites: `0`
+- remaining bare `gateway` import sites: `1`
+  - [main.py](d:/Neon_ai/src/neon_ai/main.py:15)
+- remaining bare `invoice_generator` import sites: `0`
+- remaining bare `wo_exporter` import sites: `0`
+- remaining bare `purchase_order_generator` import sites: `0`
+- remaining `load_dotenv(...)` calls: `3`
+  - direct legacy `.env` load still present: `1`
+    - [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:47)
+  - Neon-local / non-Argon `load_dotenv(...)` calls: `2`
+    - [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:49)
+    - [config.py](d:/Neon_ai/src/neon_ai/config.py:41)
+
+### 12.2 Active remaining Argon dependencies
+
+| File | Line | Import / function | Why it remains | Neon replacement target | Priority |
+| --- | --- | --- | --- | --- | --- |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:18) | `18` | `legacy_app_root()` | Central helper still resolves the legacy app root for the import bridge. | `bootstrap.py` with Neon-only path logic after all runtime callers are removed | HIGH |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:26) | `26` | `Path(r"D:\Argon_ai\app")` | Hardcoded legacy fallback path still exists. | `bootstrap.py` with Argon fallback removed | HIGH |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:37) | `37` | `legacy_root = legacy_app_root()` | The legacy bridge still activates the Argon app root at runtime. | `bootstrap.py` with legacy bridge removed after callers are rewired | HIGH |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:44) | `44` | `sys.path.insert(0, path_str)` | This is the remaining import bridge that makes bare legacy modules importable. | `bootstrap.py` with bridge removed after remaining bare imports are gone | HIGH |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:47) | `47` | `load_dotenv(legacy_env_file, override=False)` | Legacy `.env` loading still participates in runtime config. | Neon-only env loading via [config.py](d:/Neon_ai/src/neon_ai/config.py) / bootstrap cleanup | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:12) | `12` | `ensure_legacy_import_paths()` | `main.py` still needs the bridge because it keeps bare `gateway` and bare `database.*` imports. | Rewire `main.py` to `neon_ai.gateway` and `neon_ai.database.*`, then remove the call | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:15) | `15` | `from gateway import check_for_instructions` | Startup gateway loop still resolves `gateway` through the legacy bridge. | `from neon_ai.gateway import check_for_instructions` | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:16) | `16` | `from database.automation import ...` | Startup sweep loop still imports automation helpers by bare legacy name. | `from neon_ai.database.automation import ...` | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:24) | `24` | `from database.purchases import ...` | Startup sweep loop still imports purchase helpers by bare legacy name. | `from neon_ai.database.purchases import ...` | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:29) | `29` | `from database.rfq import sweep_for_outstanding_rfq_followups` | RFQ sweep still resolves through the legacy bridge. | `from neon_ai.database.rfq import sweep_for_outstanding_rfq_followups` | HIGH |
+| [main.py](d:/Neon_ai/src/neon_ai/main.py:30) | `30` | `from database.vendor_invoices import sweep_for_ready_to_pay_vendor_invoices` | Vendor-invoice sweep still resolves through the legacy bridge. | `from neon_ai.database.vendor_invoices import sweep_for_ready_to_pay_vendor_invoices` | HIGH |
+| [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:24) | `24` | `ensure_legacy_import_paths()` | `Tiber` still needs the bridge because it keeps bare `database.*` imports. | Rewire `tiber_dialog.py` to `neon_ai.database.timer` and `neon_ai.database.workorders`, then remove the call | HIGH |
+| [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:26) | `26` | `from database.timer import ...` | Tiber still imports timer DB helpers by bare legacy name. | `from neon_ai.database.timer import ...` | HIGH |
+| [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py:27) | `27` | `from database.workorders import ...` | Tiber still imports workorder DB helpers by bare legacy name. | `from neon_ai.database.workorders import ...` | HIGH |
+
+### 12.3 Non-Argon scan hits that still appeared
+
+These scan hits remain in the source tree, but they are not themselves unresolved Argon dependencies:
+
+| File | Line | Import / function | Why it remains | Neon replacement target | Priority |
+| --- | --- | --- | --- | --- | --- |
+| [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py:49) | `49` | `load_dotenv(neon_env_file, override=True)` | Neon-local env load used to override config with `D:\Neon_ai\.env`. | None needed unless bootstrap is later consolidated into `config.py` | LOW |
+| [config.py](d:/Neon_ai/src/neon_ai/config.py:41) | `41` | `load_dotenv(env_file, override=True)` | Neon-local env load used by the Neon-owned config helper. | None needed | LOW |
+
+### 12.4 Files now clean
+
+The following files were re-checked against the Phase 5E scan pattern set and showed no remaining:
+
+- `ensure_legacy_import_paths()`
+- `legacy_app_root()`
+- `sys.path.insert(...)`
+- `sys.path.append(...)`
+- hardcoded `D:\Argon_ai`
+- bare `database.*`
+- bare `automation.*`
+- bare `gateway`
+- bare `invoice_generator`
+- bare `wo_exporter`
+- bare `purchase_order_generator`
+- `load_dotenv(...)`
+
+Verified clean files:
+
+- [gateway.py](d:/Neon_ai/src/neon_ai/gateway.py)
+- [local_brain.py](d:/Neon_ai/src/neon_ai/automation/local_brain.py)
+- [read_model.py](d:/Neon_ai/src/neon_ai/database/read_model.py)
+- [workorders.py](d:/Neon_ai/src/neon_ai/database/workorders.py)
+- [automation.py](d:/Neon_ai/src/neon_ai/database/automation.py)
+- [classification_feedback.py](d:/Neon_ai/src/neon_ai/database/classification_feedback.py)
+- [connection.py](d:/Neon_ai/src/neon_ai/database/connection.py)
+- [customers.py](d:/Neon_ai/src/neon_ai/database/customers.py)
+- [employees.py](d:/Neon_ai/src/neon_ai/database/employees.py)
+- [estimates.py](d:/Neon_ai/src/neon_ai/database/estimates.py)
+- [folders.py](d:/Neon_ai/src/neon_ai/database/folders.py)
+- [invoices.py](d:/Neon_ai/src/neon_ai/database/invoices.py)
+- [materials.py](d:/Neon_ai/src/neon_ai/database/materials.py)
+- [metrics.py](d:/Neon_ai/src/neon_ai/database/metrics.py)
+- [purchases.py](d:/Neon_ai/src/neon_ai/database/purchases.py)
+- [rfq.py](d:/Neon_ai/src/neon_ai/database/rfq.py)
+- [roles.py](d:/Neon_ai/src/neon_ai/database/roles.py)
+- [timer.py](d:/Neon_ai/src/neon_ai/database/timer.py)
+- [timesheets.py](d:/Neon_ai/src/neon_ai/database/timesheets.py)
+- [vendor_invoices.py](d:/Neon_ai/src/neon_ai/database/vendor_invoices.py)
+- [vendors.py](d:/Neon_ai/src/neon_ai/database/vendors.py)
+- [doc_generator.py](d:/Neon_ai/src/neon_ai/doc_generator.py)
+- [invoice_generator.py](d:/Neon_ai/src/neon_ai/invoice_generator.py)
+- [purchase_order_generator.py](d:/Neon_ai/src/neon_ai/purchase_order_generator.py)
+- [wo_exporter.py](d:/Neon_ai/src/neon_ai/wo_exporter.py)
+- [private_brain_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/private_brain_dialog.py)
+- [customer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/customer_page.py)
+- [dashboard_page.py](d:/Neon_ai/src/neon_ai/ui/pages/dashboard_page.py)
+- [employee_manager_page.py](d:/Neon_ai/src/neon_ai/ui/pages/employee_manager_page.py)
+- [estimate_doc_view_page.py](d:/Neon_ai/src/neon_ai/ui/pages/estimate_doc_view_page.py)
+- [estimate_entry_page.py](d:/Neon_ai/src/neon_ai/ui/pages/estimate_entry_page.py)
+- [estimate_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/estimate_viewer_page.py)
+- [invoice_creator_page.py](d:/Neon_ai/src/neon_ai/ui/pages/invoice_creator_page.py)
+- [invoice_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/invoice_viewer_page.py)
+- [material_page.py](d:/Neon_ai/src/neon_ai/ui/pages/material_page.py)
+- [price_request_page.py](d:/Neon_ai/src/neon_ai/ui/pages/price_request_page.py)
+- [purchase_order_form_page.py](d:/Neon_ai/src/neon_ai/ui/pages/purchase_order_form_page.py)
+- [purchase_order_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/purchase_order_viewer_page.py)
+- [receiving_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/receiving_viewer_page.py)
+- [rfq_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/rfq_viewer_page.py)
+- [site_page.py](d:/Neon_ai/src/neon_ai/ui/pages/site_page.py)
+- [time_entry_page.py](d:/Neon_ai/src/neon_ai/ui/pages/time_entry_page.py)
+- [timesheet_manager_page.py](d:/Neon_ai/src/neon_ai/ui/pages/timesheet_manager_page.py)
+- [vendor_invoice_page.py](d:/Neon_ai/src/neon_ai/ui/pages/vendor_invoice_page.py)
+- [vendor_page.py](d:/Neon_ai/src/neon_ai/ui/pages/vendor_page.py)
+- [workorder_form_page.py](d:/Neon_ai/src/neon_ai/ui/pages/workorder_form_page.py)
+- [workorder_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/workorder_viewer_page.py)
+
+### 12.5 Bootstrap / page conclusion
+
+- `bootstrap.py` is now the only remaining source of direct `D:\Argon_ai` path logic.
+- `bootstrap.py` is also the only remaining source of direct legacy `.env` loading.
+- Among app pages/dialogs, only [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py) still actively requires `ensure_legacy_import_paths()` based on current same-file bare imports.
+- [main.py](d:/Neon_ai/src/neon_ai/main.py) still requires `ensure_legacy_import_paths()` for the remaining startup bridge imports, but it is application bootstrap code rather than a page module.
+
+### 12.6 Current conclusion
+
+Argon runtime dependency surface is now concentrated in three places:
+
+1. [bootstrap.py](d:/Neon_ai/src/neon_ai/bootstrap.py)
+2. [main.py](d:/Neon_ai/src/neon_ai/main.py)
+3. [tiber_dialog.py](d:/Neon_ai/src/neon_ai/ui/dialogs/tiber_dialog.py)
+
+The scan does not prove total separation yet. It does prove that most migrated pages and internalized support modules are now clean of the audited Argon dependency patterns.

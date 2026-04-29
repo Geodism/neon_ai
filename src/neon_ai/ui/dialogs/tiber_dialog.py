@@ -19,12 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.timer import get_employees, get_tasks, get_todays_task_time, insert_time
-from database.workorders import get_open_workorders, get_open_workorders_dict
+from neon_ai.database.timer import get_employees, get_tasks, get_todays_task_time, insert_time
+from neon_ai.database.workorders import get_open_workorders, get_open_workorders_dict
 
 
 class TiberDialog(QDialog):

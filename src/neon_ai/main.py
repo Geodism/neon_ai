@@ -8,12 +8,9 @@ from datetime import datetime
 
 from PySide6.QtWidgets import QApplication
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-ensure_legacy_import_paths()
-
 from neon_ai.ui.main_window import NeonMainWindow
-from gateway import check_for_instructions
-from database.automation import (
+from neon_ai.gateway import check_for_instructions
+from neon_ai.database.automation import (
     sweep_for_aging_unsent_estimates,
     sweep_for_completed_rfq_estimates,
     sweep_for_deposit_invoice_reminders,
@@ -21,13 +18,13 @@ from database.automation import (
     sweep_for_ready_leads,
     sweep_for_sent_estimate_followups,
 )
-from database.purchases import (
+from neon_ai.database.purchases import (
     sweep_for_backordered_purchase_orders,
     sweep_for_locked_purchase_orders,
     sweep_for_po_eta_followups,
 )
-from database.rfq import sweep_for_outstanding_rfq_followups
-from database.vendor_invoices import sweep_for_ready_to_pay_vendor_invoices
+from neon_ai.database.rfq import sweep_for_outstanding_rfq_followups
+from neon_ai.database.vendor_invoices import sweep_for_ready_to_pay_vendor_invoices
 
 
 def run_gateway_loop() -> None:
