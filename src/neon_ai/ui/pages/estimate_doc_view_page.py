@@ -25,20 +25,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths, legacy_app_root
-
-ensure_legacy_import_paths()
-
-from database.automation import build_client_estimate_doc, get_client_estimate_doc_path
-from database.estimates import (
+from neon_ai.database.automation import build_client_estimate_doc, get_client_estimate_doc_path
+from neon_ai.database.estimates import (
     get_dashboard_estimates,
     get_detailed_estimate_data,
     recalculate_estimate_totals,
     update_estimate_status,
 )
-from database.rfq import create_and_send_rfq_batch, get_estimate_rfq_status, get_vendor_choices
+from neon_ai.database.rfq import create_and_send_rfq_batch, get_estimate_rfq_status, get_vendor_choices
 
-RFQ_EMAIL_MEMORY_PATH = legacy_app_root() / "rfq_vendor_email_memory.json"
+RFQ_EMAIL_MEMORY_PATH = Path(__file__).resolve().parents[4] / "resources" / "rfq_vendor_email_memory.json"
 
 
 def load_rfq_email_memory() -> dict:
@@ -53,6 +49,7 @@ def load_rfq_email_memory() -> dict:
 
 def save_rfq_email_memory(memory: dict) -> None:
     try:
+        RFQ_EMAIL_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         RFQ_EMAIL_MEMORY_PATH.write_text(json.dumps(memory, indent=2), encoding="utf-8")
     except Exception:
         pass

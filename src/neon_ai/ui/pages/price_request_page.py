@@ -15,12 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.estimates import add_single_material, get_all_estimates, get_estimate_materials
-from database.rfq import get_active_rfqs, get_all_vendors, get_quoted_vendors_for_estimate, save_rfq_package
+from neon_ai.database.estimates import add_single_material, get_all_estimates, get_estimate_materials
+from neon_ai.database.rfq import get_active_rfqs, get_all_vendors, get_quoted_vendors_for_estimate, save_rfq_package
 
 
 class PriceRequestPage(QWidget):

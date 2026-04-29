@@ -20,11 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.estimates import (
+from neon_ai.database.estimates import (
     convert_estimate_to_workorder,
     get_dashboard_estimates,
     get_estimate_notes,
