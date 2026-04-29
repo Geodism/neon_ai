@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import time
+import traceback
+
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -29,6 +32,59 @@ from neon_ai.database.vendors import (
 )
 
 
+class VendorLoadWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, previous_vendor_id: int | None) -> None:
+        super().__init__()
+        self._previous_vendor_id = previous_vendor_id
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            rows = get_vendor_pipeline()
+            selected_label = ""
+            detail_payload: dict[str, object] | None = None
+
+            for row in rows:
+                if self._previous_vendor_id and int(row["VendorID"]) == int(self._previous_vendor_id):
+                    selected_label = f"{row['VendorName']} (ID {row['VendorID']})"
+                    break
+
+            if selected_label and self._previous_vendor_id:
+                try:
+                    detail_payload = {
+                        "vendor": get_vendor_by_id(int(self._previous_vendor_id)),
+                        "contacts": get_vendor_contacts(int(self._previous_vendor_id)),
+                        "overview": get_vendor_overview(int(self._previous_vendor_id)),
+                        "error": None,
+                    }
+                except Exception as exc:
+                    traceback.print_exc()
+                    detail_payload = {
+                        "vendor": None,
+                        "contacts": [],
+                        "overview": {},
+                        "error": str(exc),
+                    }
+
+            self.finished.emit(
+                {
+                    "rows": rows,
+                    "selected_label": selected_label,
+                    "selected_vendor_id": self._previous_vendor_id if selected_label else None,
+                    "detail": detail_payload,
+                }
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(str(exc))
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=worker name=vendor_page.load_data elapsed_ms={elapsed_ms:.2f}")
+
+
 class VendorPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -39,6 +95,10 @@ class VendorPage(QWidget):
         self._suspend_pipeline_events = False
         self._loading_vendor = False
         self._ignore_next_pipeline_event = False
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: VendorLoadWorker | None = None
+        self._is_refreshing = False
+        self._pending_refresh = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -46,13 +106,18 @@ class VendorPage(QWidget):
 
         title = QLabel("Vendor Command")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh_data)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_data)
         header = QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(refresh_button)
+        header.addWidget(self.refresh_button)
         layout.addLayout(header)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -293,24 +358,106 @@ class VendorPage(QWidget):
         return group
 
     def refresh_data(self) -> None:
-        previous_vendor_id = self.active_vendor_id
-        self.vendor_lookup = {}
-        combo_values: list[str] = []
-        selected_label = ""
+        started = time.perf_counter()
+        try:
+            if self._is_refreshing:
+                self._pending_refresh = True
+                return
 
+            self._is_refreshing = True
+            self._pending_refresh = False
+            self.refresh_button.setEnabled(False)
+            self.status_label.setText("Loading vendors...")
+
+            self._refresh_thread = QThread(self)
+            self._refresh_worker = VendorLoadWorker(self.active_vendor_id)
+            self._refresh_worker.moveToThread(self._refresh_thread)
+            self._refresh_thread.started.connect(self._refresh_worker.run)
+            self._refresh_worker.finished.connect(self._on_refresh_loaded)
+            self._refresh_worker.failed.connect(self._on_refresh_failed)
+            self._refresh_worker.finished.connect(self._refresh_thread.quit)
+            self._refresh_worker.failed.connect(self._refresh_thread.quit)
+            self._refresh_thread.finished.connect(
+                lambda thread=self._refresh_thread, worker=self._refresh_worker: self._cleanup_refresh_worker(
+                    thread, worker
+                )
+            )
+            self._refresh_thread.start()
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=page name=vendor_page.refresh_data elapsed_ms={elapsed_ms:.2f}")
+
+    def _on_refresh_loaded(self, payload: object) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+        selected_label = str(data.get("selected_label") or "")
+        selected_vendor_id = data.get("selected_vendor_id")
+        detail = data.get("detail") if isinstance(data.get("detail"), dict) else None
+
+        self._populate_pipeline(rows)
+        self._populate_vendor_combo(rows, selected_label)
+
+        if selected_label and selected_vendor_id:
+            self._select_pipeline_row(int(selected_vendor_id))
+            detail_error = str(detail.get("error") or "") if detail else ""
+            vendor = detail.get("vendor") if detail else None
+            if detail_error:
+                self.status_label.setText(f"Vendor detail refresh failed: {detail_error}")
+            elif isinstance(vendor, dict) and vendor:
+                contacts = detail.get("contacts") if detail else []
+                overview = detail.get("overview") if detail else {}
+                self._apply_vendor_detail(
+                    int(selected_vendor_id),
+                    vendor,
+                    contacts if isinstance(contacts, list) else [],
+                    overview if isinstance(overview, dict) else {},
+                    switch_tab="editor",
+                )
+                self.status_label.setText("")
+            else:
+                self.status_label.setText("")
+        elif not rows:
+            self._prepare_new_vendor()
+            self._clear_overview()
+            self.status_label.setText("")
+        else:
+            self.vendor_combo.blockSignals(True)
+            self.vendor_combo.setCurrentIndex(-1)
+            self.vendor_combo.blockSignals(False)
+            self.active_vendor_id = None
+            self._clear_overview()
+            self.status_label.setText("")
+
+    def _on_refresh_failed(self, error_message: str) -> None:
+        print(error_message)
+        self._show_pipeline_error_row(f"DB Error: {error_message}")
+        self.status_label.setText(f"Vendor refresh failed: {error_message}")
+
+    def _cleanup_refresh_worker(self, thread: QThread | None, worker: VendorLoadWorker | None) -> None:
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+        if self._refresh_thread is thread:
+            self._refresh_thread = None
+        pending_refresh = self._pending_refresh
+        self._is_refreshing = False
+        self.refresh_button.setEnabled(True)
+        if pending_refresh:
+            self._pending_refresh = False
+            QTimer.singleShot(0, self.refresh_data)
+
+    def _populate_pipeline(self, rows: list[dict]) -> None:
+        self.vendor_lookup = {}
+        self._suspend_pipeline_events = True
         self.pipeline_table.setSortingEnabled(False)
         self.pipeline_table.setRowCount(0)
-
-        try:
-            rows = get_vendor_pipeline()
-        except Exception as exc:
-            QMessageBox.critical(self, "Database Error", f"Failed to load vendors:\n{exc}")
-            return
 
         for row in rows:
             label = f"{row['VendorName']} (ID {row['VendorID']})"
             self.vendor_lookup[label] = row["VendorID"]
-            combo_values.append(label)
 
             table_row = self.pipeline_table.rowCount()
             self.pipeline_table.insertRow(table_row)
@@ -327,11 +474,11 @@ class VendorPage(QWidget):
                 item.setTextAlignment(alignment)
                 self.pipeline_table.setItem(table_row, col_index, item)
 
-            if previous_vendor_id and int(row["VendorID"]) == int(previous_vendor_id):
-                selected_label = label
-
         self.pipeline_table.setSortingEnabled(True)
+        self._suspend_pipeline_events = False
 
+    def _populate_vendor_combo(self, rows: list[dict], selected_label: str) -> None:
+        combo_values = [f"{row['VendorName']} (ID {row['VendorID']})" for row in rows]
         self.vendor_combo.blockSignals(True)
         self.vendor_combo.clear()
         self.vendor_combo.addItems(combo_values)
@@ -339,15 +486,15 @@ class VendorPage(QWidget):
             self.vendor_combo.setCurrentText(selected_label)
         self.vendor_combo.blockSignals(False)
 
-        if selected_label:
-            self._select_vendor(self.vendor_lookup[selected_label], switch_tab="editor")
-        elif not rows:
-            self._prepare_new_vendor()
-            self._clear_overview()
-        else:
-            self.vendor_combo.setCurrentIndex(-1)
-            self.active_vendor_id = None
-            self._clear_overview()
+    def _select_pipeline_row(self, vendor_id: int) -> None:
+        self._suspend_pipeline_events = True
+        self.pipeline_table.clearSelection()
+        for row in range(self.pipeline_table.rowCount()):
+            item = self.pipeline_table.item(row, 0)
+            if item and item.text() == str(vendor_id):
+                self.pipeline_table.selectRow(row)
+                break
+        self._suspend_pipeline_events = False
 
     def _prepare_new_vendor(self) -> None:
         self.active_vendor_id = None
@@ -379,6 +526,18 @@ class VendorPage(QWidget):
 
         if not vendor:
             return
+
+        self._apply_vendor_detail(vendor_id, vendor, contacts, overview, switch_tab=switch_tab)
+
+    def _apply_vendor_detail(
+        self,
+        vendor_id: int,
+        vendor: dict,
+        contacts: list[dict],
+        overview: dict,
+        switch_tab: str | None = None,
+    ) -> None:
+        self.active_vendor_id = vendor_id
 
         self.vendor_fields["vendor_name"].setText(vendor.get("VendorName") or "")
         self.vendor_fields["account_number"].setText("" if vendor.get("AccountNumber") is None else str(vendor.get("AccountNumber")))
@@ -480,6 +639,16 @@ class VendorPage(QWidget):
             item = QTableWidgetItem(value)
             item.setTextAlignment(alignments.get(column, Qt.AlignmentFlag.AlignLeft))
             table.setItem(row, column, item)
+
+    def _show_pipeline_error_row(self, message: str) -> None:
+        self.pipeline_table.setSortingEnabled(False)
+        self.pipeline_table.setRowCount(1)
+        self.pipeline_table.setItem(0, 0, QTableWidgetItem(""))
+        item = QTableWidgetItem(message)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.pipeline_table.setItem(0, 1, item)
+        for column in range(2, self.pipeline_table.columnCount()):
+            self.pipeline_table.setItem(0, column, QTableWidgetItem(""))
 
     def _on_vendor_select(self) -> None:
         if self._ignore_next_pipeline_event:
