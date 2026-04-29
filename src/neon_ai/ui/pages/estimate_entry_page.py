@@ -20,10 +20,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
 from neon_ai.database.customers import get_all_customers, get_sites_for_customer
 from neon_ai.database.estimates import (
     get_all_estimate_summaries,

@@ -29,10 +29,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
 from neon_ai.database.estimates import get_all_estimates, get_estimate_materials
 from neon_ai.database.materials import (
     get_material_price_for_vendor,

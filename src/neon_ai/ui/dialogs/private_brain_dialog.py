@@ -15,10 +15,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
 from neon_ai.automation.local_brain import brain_instance
 
 
