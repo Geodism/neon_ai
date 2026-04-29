@@ -1,18 +1,10 @@
-import sys
 import os
 import ollama
 import json
 import re
 
-from neon_ai.bootstrap import legacy_app_root, project_root
-
-for path in (project_root(), legacy_app_root()):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-
 from neon_ai.database.automation import get_project_memory, add_note_to_active_job, send_smart_discovery
-from database.read_model import build_chat_context, build_direct_answer, get_debug_summary
+from neon_ai.database.read_model import build_chat_context, build_direct_answer, get_debug_summary
 
 class ArgonLocalAI:
     def __init__(self, workflow_json_path="ArgonLeadToCash.json"):

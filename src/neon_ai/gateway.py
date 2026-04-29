@@ -7,17 +7,10 @@ import json
 import mimetypes 
 import tempfile
 import re
-import sys
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 
-from neon_ai.bootstrap import legacy_app_root, project_root
 from neon_ai.config import load_neon_env
-
-for path in (project_root(), legacy_app_root()):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
 
 load_neon_env()
 
