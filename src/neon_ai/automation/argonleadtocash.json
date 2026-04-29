@@ -1,0 +1,504 @@
+{
+  "WorkflowName": "ArgonLeadToCash",
+  "Version": "1.0",
+  "Description": "Email-driven workflow for lead intake, estimating, procurement, invoicing, and job follow-up.",
+  "GlobalSettings": {
+    "GatewayInbox": "sitkastatus@gmail.com",
+    "OwnerNotificationEmail": "yourpersonalemail@example.com",
+    "DefaultEstimateFollowUpDays": [3, 7],
+    "DefaultDepositPercent": 10,
+    "DefaultStartInvoicePercent": 40,
+    "WeeklyInvoiceReviewDay": "Friday",
+    "TimeAndMaterialInvoicePolicy": "InvoiceWeekly",
+    "HumanApprovalRequired": [
+      "SendEstimate",
+      "ApproveContract",
+      "ApproveSubstitution",
+      "RescheduleJob",
+      "ConfirmPaymentReceived",
+      "ApproveUnusualPO",
+      "CloseJob"
+    ]
+  },
+  "Entities": {
+    "Lead": {
+      "LeadID": "string",
+      "Status": "New | AwaitingInfo | ReadyForCall | SiteVisitNeeded | Estimating | EstimateSent | FollowUpDue | Won | Lost",
+      "CustomerName": "string",
+      "CustomerEmail": "string",
+      "CustomerPhone": "string",
+      "SiteAddress": "string",
+      "ScopeOfWork": "string",
+      "JobType": "KitchenReno | ServiceChange | HotTub | Troubleshooting | Other",
+      "Source": "Email | WebsiteForm",
+      "OriginalMessageID": "string",
+      "Attachments": []
+    },
+    "Estimate": {
+      "EstimateID": "string",
+      "LeadID": "string",
+      "WorkOrderID": "string",
+      "Status": "Draft | Sent | Accepted | Rejected | Expired",
+      "DateSent": "datetime",
+      "FollowUpScheduleDays": [3, 7],
+      "AcceptanceProofType": "Email | SignedQuote | Contract",
+      "AcceptanceProofFileID": "string",
+      "LineItems": []
+    },
+    "WorkOrder": {
+      "WorkOrderID": "string",
+      "LeadID": "string",
+      "EstimateID": "string",
+      "Status": "PendingDeposit | DepositPaid | Procurement | MaterialsPartial | ReadyToSchedule | InProgress | AwaitingMilestoneBilling | AwaitingTMBilling | SubstantiallyComplete | FinalInvoiceDue | Closed",
+      "BillingModel": "Milestone | TimeAndMaterial",
+      "CustomerID": "string",
+      "SiteID": "string",
+      "TentativeStartDate": "date",
+      "AssignedElectrician": "string"
+    },
+    "PurchaseOrder": {
+      "PurchaseOrderID": "string",
+      "WorkOrderID": "string",
+      "VendorID": "string",
+      "Status": "Draft | Sent | VendorConfirmed | PartialReceived | FullyReceived | ShortageFollowUp | Closed",
+      "Items": []
+    },
+    "VendorInvoice": {
+      "VendorInvoiceID": "string",
+      "VendorID": "string",
+      "PurchaseOrderID": "string",
+      "WorkOrderID": "string",
+      "Status": "Received | Matched | Exception | Approved | Paid",
+      "InvoiceNumber": "string",
+      "Amount": "number",
+      "ReceivedDate": "datetime"
+    },
+    "CustomerInvoice": {
+      "CustomerInvoiceID": "string",
+      "WorkOrderID": "string",
+      "InvoiceType": "Deposit | Start | Progress | WeeklyTM | Final",
+      "Status": "Draft | Sent | Paid | Overdue",
+      "Amount": "number",
+      "PercentOfContract": "number",
+      "IssuedDate": "datetime",
+      "PaidDate": "datetime"
+    }
+  },
+  "Triggers": [
+    {
+      "TriggerID": "InboundEmailReceived",
+      "Type": "EmailReceived",
+      "Source": "GatewayInbox",
+      "RouteTo": "ClassifyInboundMessage"
+    },
+    {
+      "TriggerID": "EstimateSubmittedByOwner",
+      "Type": "ManualSubmission",
+      "Source": "Owner",
+      "RouteTo": "SendEstimateToCustomer"
+    },
+    {
+      "TriggerID": "EstimateFollowUpTimer",
+      "Type": "Scheduled",
+      "Source": "System",
+      "RouteTo": "RunEstimateFollowUp"
+    },
+    {
+      "TriggerID": "EstimateAccepted",
+      "Type": "EmailOrDocumentReceived",
+      "Source": "Customer",
+      "RouteTo": "ConvertEstimateToWorkOrder"
+    },
+    {
+      "TriggerID": "DepositMarkedPaid",
+      "Type": "ManualStatusUpdate",
+      "Source": "Owner",
+      "RouteTo": "StartProcurement"
+    },
+    {
+      "TriggerID": "VendorQuoteReceived",
+      "Type": "EmailReceived",
+      "Source": "Vendor",
+      "RouteTo": "IngestVendorQuote"
+    },
+    {
+      "TriggerID": "PackingSlipReceived",
+      "Type": "EmailReceived",
+      "Source": "Owner",
+      "RouteTo": "ReceivePurchaseOrderItems"
+    },
+    {
+      "TriggerID": "WeeklyReviewTimer",
+      "Type": "Scheduled",
+      "Source": "System",
+      "RouteTo": "SendWeeklyOpenJobsDigest"
+    },
+    {
+      "TriggerID": "VendorInvoiceReceived",
+      "Type": "EmailReceived",
+      "Source": "Vendor",
+      "RouteTo": "MatchVendorInvoiceToPO"
+    },
+    {
+      "TriggerID": "AdditionalPORequest",
+      "Type": "EmailReceived",
+      "Source": "Owner",
+      "RouteTo": "CreateAdditionalPurchaseOrder"
+    }
+  ],
+  "Steps": [
+    {
+      "StepID": "ClassifyInboundMessage",
+      "Description": "Read incoming email and determine message type.",
+      "Input": {
+        "EmailSubject": "string",
+        "EmailBody": "string",
+        "Attachments": []
+      },
+      "Output": {
+        "MessageType": "NewJobInquiry | VendorQuote | VendorInvoice | PackingSlip | General | Spam",
+        "Confidence": "number"
+      },
+      "Next": {
+        "NewJobInquiry": "CreateOrUpdateLead",
+        "VendorQuote": "IngestVendorQuote",
+        "VendorInvoice": "MatchVendorInvoiceToPO",
+        "PackingSlip": "ReceivePurchaseOrderItems",
+        "General": "RouteToOwner",
+        "Spam": "ArchiveMessage"
+      }
+    },
+    {
+      "StepID": "CreateOrUpdateLead",
+      "Description": "Extract lead information from inbound inquiry.",
+      "RequiredFields": [
+        "CustomerName",
+        "CustomerEmail",
+        "CustomerPhone",
+        "SiteAddress",
+        "ScopeOfWork"
+      ],
+      "Actions": [
+        "ExtractLeadFields",
+        "CreateLeadRecord",
+        "CheckForMissingFields"
+      ],
+      "Next": {
+        "AllFieldsPresent": "SendLeadAcknowledgement",
+        "FieldsMissing": "RequestMissingLeadInfo"
+      }
+    },
+    {
+      "StepID": "RequestMissingLeadInfo",
+      "Description": "Email customer asking for missing information.",
+      "Template": "LeadInfoRequest",
+      "Next": "NotifyOwnerOfNewLead"
+    },
+    {
+      "StepID": "SendLeadAcknowledgement",
+      "Description": "Send thank-you and explain next step.",
+      "Template": "LeadAcknowledgement",
+      "Next": "NotifyOwnerOfNewLead"
+    },
+    {
+      "StepID": "NotifyOwnerOfNewLead",
+      "Description": "Send internal summary email to owner.",
+      "Template": "OwnerLeadSummary",
+      "Output": {
+        "RecommendedAction": "CallCustomer | ScheduleSiteVisit | RequestPhotos"
+      },
+      "Next": "AwaitManualEstimate"
+    },
+    {
+      "StepID": "AwaitManualEstimate",
+      "Description": "Pause until owner completes estimate.",
+      "Type": "HumanTask",
+      "Next": "SendEstimateToCustomer"
+    },
+    {
+      "StepID": "SendEstimateToCustomer",
+      "Description": "Deliver estimate and start follow-up timer.",
+      "ApprovalRequired": true,
+      "Template": "EstimateDelivery",
+      "Actions": [
+        "StoreEstimate",
+        "EmailEstimate",
+        "ScheduleFollowUpTimers"
+      ],
+      "Next": "WaitForEstimateResponse"
+    },
+    {
+      "StepID": "RunEstimateFollowUp",
+      "Description": "Send follow-up if estimate has not been accepted or rejected.",
+      "Conditions": [
+        "Estimate.Status == Sent"
+      ],
+      "Template": "EstimateFollowUp",
+      "EscalationAfterFinalFollowUp": "NotifyOwnerToCallCustomer",
+      "Next": "WaitForEstimateResponse"
+    },
+    {
+      "StepID": "NotifyOwnerToCallCustomer",
+      "Description": "Prompt owner to personally follow up.",
+      "Template": "OwnerCallPrompt",
+      "Next": "WaitForEstimateResponse"
+    },
+    {
+      "StepID": "ConvertEstimateToWorkOrder",
+      "Description": "Create active job from accepted estimate.",
+      "Actions": [
+        "StoreAcceptanceProof",
+        "CreateOrLinkCustomer",
+        "CreateOrLinkSite",
+        "CreateWorkOrder",
+        "UpdateEstimateStatusToAccepted"
+      ],
+      "Next": "SendWelcomeEmail"
+    },
+    {
+      "StepID": "SendWelcomeEmail",
+      "Description": "Welcome customer and explain onboarding steps.",
+      "Template": "WelcomeAfterAcceptance",
+      "Next": "GenerateDepositInvoice"
+    },
+    {
+      "StepID": "GenerateDepositInvoice",
+      "Description": "Create and send deposit invoice.",
+      "Input": {
+        "DepositPercent": 10
+      },
+      "Actions": [
+        "CreateCustomerInvoice",
+        "SendCustomerInvoice"
+      ],
+      "Next": "WaitForDepositPayment"
+    },
+    {
+      "StepID": "WaitForDepositPayment",
+      "Description": "Wait until owner marks invoice as paid.",
+      "Type": "HumanStatusUpdate",
+      "Next": "StartProcurement"
+    },
+    {
+      "StepID": "StartProcurement",
+      "Description": "Extract material package and request vendor pricing.",
+      "Actions": [
+        "BuildMaterialPackageFromEstimate",
+        "SendRFQToVendor"
+      ],
+      "Next": "WaitForVendorQuote"
+    },
+    {
+      "StepID": "IngestVendorQuote",
+      "Description": "Read vendor quote and compare to expected items.",
+      "Actions": [
+        "ExtractQuotedItems",
+        "CompareAgainstEstimateMaterial",
+        "FlagDiscrepancies",
+        "CreatePurchaseOrderDraft"
+      ],
+      "Next": "ApproveAndSendPurchaseOrder"
+    },
+    {
+      "StepID": "ApproveAndSendPurchaseOrder",
+      "Description": "Approve PO if normal, or ask owner if unusual.",
+      "Conditions": [
+        "NoCriticalDiscrepancies"
+      ],
+      "ApprovalRequired": true,
+      "Actions": [
+        "SendPurchaseOrderToVendor",
+        "UpdatePOStatus"
+      ],
+      "Next": "WaitForMaterials"
+    },
+    {
+      "StepID": "ReceivePurchaseOrderItems",
+      "Description": "Match packing slip against PO and received items.",
+      "Actions": [
+        "ExtractPackingSlipData",
+        "MatchAgainstPurchaseOrder",
+        "UpdateReceivedQuantities"
+      ],
+      "Next": {
+        "FullyReceived": "SendCustomerReadinessConfirmation",
+        "PartiallyReceived": "HandleMaterialShortage"
+      }
+    },
+    {
+      "StepID": "HandleMaterialShortage",
+      "Description": "Alert owner and email vendor for ETA on missing parts.",
+      "Actions": [
+        "SendVendorShortageFollowUp",
+        "NotifyOwnerOfShortage"
+      ],
+      "Next": "AwaitOwnerDecisionOnSchedule"
+    },
+    {
+      "StepID": "AwaitOwnerDecisionOnSchedule",
+      "Description": "Owner decides whether to keep schedule or reschedule.",
+      "Type": "HumanTask",
+      "Next": {
+        "KeepSchedule": "SendCustomerReadinessConfirmation",
+        "Reschedule": "NotifyCustomerOfDelay"
+      }
+    },
+    {
+      "StepID": "SendCustomerReadinessConfirmation",
+      "Description": "Tell customer that materials are in and job is on track.",
+      "Template": "JobOnTrackConfirmation",
+      "Next": "AwaitWorkStart"
+    },
+    {
+      "StepID": "AwaitWorkStart",
+      "Description": "Wait for work to begin.",
+      "Type": "HumanOrSystemEvent",
+      "Next": "GenerateStartInvoice"
+    },
+    {
+      "StepID": "GenerateStartInvoice",
+      "Description": "Issue work-start invoice, such as 40 percent.",
+      "Conditions": [
+        "WorkOrder.BillingModel == Milestone"
+      ],
+      "Input": {
+        "StartInvoicePercent": 40
+      },
+      "Actions": [
+        "CreateCustomerInvoice",
+        "SendCustomerInvoice"
+      ],
+      "Next": "ManageOngoingBilling"
+    },
+    {
+      "StepID": "ManageOngoingBilling",
+      "Description": "Handle weekly T&M billing or milestone billing.",
+      "Next": {
+        "Milestone": "AwaitMilestoneConfirmation",
+        "TimeAndMaterial": "WeeklyTMReview"
+      }
+    },
+    {
+      "StepID": "AwaitMilestoneConfirmation",
+      "Description": "Wait for electrician or PM to confirm milestone completion.",
+      "Type": "HumanTask",
+      "Next": "GenerateProgressInvoice"
+    },
+    {
+      "StepID": "GenerateProgressInvoice",
+      "Description": "Invoice customer for completed milestone.",
+      "Actions": [
+        "CreateCustomerInvoice",
+        "SendCustomerInvoice"
+      ],
+      "Next": "ManageOngoingBilling"
+    },
+    {
+      "StepID": "WeeklyTMReview",
+      "Description": "Review open T&M jobs and issue weekly invoices.",
+      "Actions": [
+        "CollectUninvoicedHours",
+        "CollectUninvoicedMaterials",
+        "CreateWeeklyTMInvoice",
+        "SendCustomerInvoice"
+      ],
+      "Next": "ManageOngoingBilling"
+    },
+    {
+      "StepID": "CreateAdditionalPurchaseOrder",
+      "Description": "Create PO from owner email request for extra materials.",
+      "Actions": [
+        "ParseOwnerRequest",
+        "LinkToWorkOrder",
+        "CreatePurchaseOrderDraft"
+      ],
+      "Next": "ApproveAndSendPurchaseOrder"
+    },
+    {
+      "StepID": "MatchVendorInvoiceToPO",
+      "Description": "Read vendor invoice and match against PO.",
+      "Actions": [
+        "ExtractVendorInvoiceFields",
+        "FindMatchingPO",
+        "FlagExceptionsIfAny",
+        "StoreVendorInvoice"
+      ],
+      "Next": "NotifyOwnerVendorInvoiceArrived"
+    },
+    {
+      "StepID": "NotifyOwnerVendorInvoiceArrived",
+      "Description": "Tell owner vendor invoice has been logged.",
+      "Template": "VendorInvoiceNotification",
+      "Next": "AwaitPaymentStatusUpdate"
+    },
+    {
+      "StepID": "AwaitPaymentStatusUpdate",
+      "Description": "Wait for owner to mark vendor invoice as paid.",
+      "Type": "HumanStatusUpdate",
+      "Next": "UpdateVendorInvoicePaid"
+    },
+    {
+      "StepID": "UpdateVendorInvoicePaid",
+      "Description": "Mark vendor invoice paid.",
+      "Actions": [
+        "SetVendorInvoiceStatusPaid"
+      ],
+      "Next": "End"
+    },
+    {
+      "StepID": "SendWeeklyOpenJobsDigest",
+      "Description": "Send owner a weekly summary of open jobs and billing needs.",
+      "Actions": [
+        "FindOpenWorkOrders",
+        "SummarizeBillingStatus",
+        "SummarizePendingMilestones",
+        "SummarizePendingVendorInvoices",
+        "SendDigestEmail"
+      ],
+      "Template": "WeeklyOpenJobsDigest",
+      "Next": "End"
+    }
+  ],
+  "Templates": {
+    "LeadAcknowledgement": {
+      "Subject": "Thanks for contacting us",
+      "Purpose": "Acknowledge inquiry and explain next steps"
+    },
+    "LeadInfoRequest": {
+      "Subject": "A few details needed for your electrical request",
+      "Purpose": "Collect missing customer/job information"
+    },
+    "OwnerLeadSummary": {
+      "Subject": "New lead summary",
+      "Purpose": "Internal tasking email to owner"
+    },
+    "EstimateDelivery": {
+      "Subject": "Your estimate",
+      "Purpose": "Send estimate to customer"
+    },
+    "EstimateFollowUp": {
+      "Subject": "Following up on your estimate",
+      "Purpose": "Automated follow-up"
+    },
+    "OwnerCallPrompt": {
+      "Subject": "Customer follow-up call recommended",
+      "Purpose": "Prompt owner to call"
+    },
+    "WelcomeAfterAcceptance": {
+      "Subject": "Welcome - next steps for your project",
+      "Purpose": "Onboarding after sale"
+    },
+    "JobOnTrackConfirmation": {
+      "Subject": "Your project is on track",
+      "Purpose": "Confirm materials received and schedule intact"
+    },
+    "VendorInvoiceNotification": {
+      "Subject": "Vendor invoice received",
+      "Purpose": "Notify owner of supplier invoice"
+    },
+    "WeeklyOpenJobsDigest": {
+      "Subject": "Weekly open jobs review",
+      "Purpose": "Cash flow and invoicing review"
+    }
+  }
+}

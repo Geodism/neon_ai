@@ -166,3 +166,141 @@ Safest migration order inside Neon:
 3. Internalize the remaining `database.*` modules used by CRUD/admin pages.
 4. Remove the `D:\Argon_ai\app` fallback from `bootstrap.py`.
 5. Remove legacy `.env` loading after all required secrets/config are carried by Neon-local config.
+
+## 8. Phase 3A Completed
+
+Phase 3A internalized the database slice needed by the completed parity pages:
+
+- [vendor_invoice_page.py](d:/Neon_ai/src/neon_ai/ui/pages/vendor_invoice_page.py)
+- [estimate_entry_page.py](d:/Neon_ai/src/neon_ai/ui/pages/estimate_entry_page.py)
+- [rfq_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/rfq_viewer_page.py)
+
+### Database modules internalized into `neon_ai.database`
+
+Primary modules copied/ported into `D:\Neon_ai\src\neon_ai\database`:
+
+- [vendor_invoices.py](d:/Neon_ai/src/neon_ai/database/vendor_invoices.py)
+- [estimates.py](d:/Neon_ai/src/neon_ai/database/estimates.py)
+- [rfq.py](d:/Neon_ai/src/neon_ai/database/rfq.py)
+- [purchases.py](d:/Neon_ai/src/neon_ai/database/purchases.py)
+- [materials.py](d:/Neon_ai/src/neon_ai/database/materials.py)
+- [customers.py](d:/Neon_ai/src/neon_ai/database/customers.py)
+- [roles.py](d:/Neon_ai/src/neon_ai/database/roles.py)
+
+Support modules internalized during the same pass so the changed files no longer rely on bare `database.*` imports:
+
+- [timesheets.py](d:/Neon_ai/src/neon_ai/database/timesheets.py)
+- [folders.py](d:/Neon_ai/src/neon_ai/database/folders.py)
+- [automation.py](d:/Neon_ai/src/neon_ai/database/automation.py)
+- [vendors.py](d:/Neon_ai/src/neon_ai/database/vendors.py)
+
+All of the above were rewired to use `from neon_ai.database.connection import get_connection` instead of `from database.connection import get_connection`.
+
+### Pages updated to use `neon_ai.database` imports
+
+The following completed parity pages were updated from bare `database.*` imports to `neon_ai.database.*` imports:
+
+- [vendor_invoice_page.py](d:/Neon_ai/src/neon_ai/ui/pages/vendor_invoice_page.py)
+- [estimate_entry_page.py](d:/Neon_ai/src/neon_ai/ui/pages/estimate_entry_page.py)
+- [rfq_viewer_page.py](d:/Neon_ai/src/neon_ai/ui/pages/rfq_viewer_page.py)
+
+### Remaining non-database dependencies discovered
+
+Phase 3A did not complete total Argon separation. The updated procurement/estimate slice still reaches legacy non-database helpers through transitive imports:
+
+- `gateway`
+  - still used for send/email flows inside internalized modules such as [rfq.py](d:/Neon_ai/src/neon_ai/database/rfq.py), [purchases.py](d:/Neon_ai/src/neon_ai/database/purchases.py), [vendor_invoices.py](d:/Neon_ai/src/neon_ai/database/vendor_invoices.py), and [automation.py](d:/Neon_ai/src/neon_ai/database/automation.py)
+- `purchase_order_generator`
+  - still used by [purchases.py](d:/Neon_ai/src/neon_ai/database/purchases.py) for PO document generation/export helpers
+- `doc_generator`
+  - still used by [automation.py](d:/Neon_ai/src/neon_ai/database/automation.py) for estimate/customer document workflows
+
+These are now the main non-database blockers for this internalized workflow slice.
+
+### Remaining `ensure_legacy_import_paths()` usage
+
+Phase 3A did not remove the legacy path bridge.
+
+- `ensure_legacy_import_paths()` is still present across the Neon shell, dialogs, and page modules listed in Section 2.
+- It is still required for unresolved legacy imports outside the Phase 3A database slice, especially:
+  - `gateway.py`
+  - `automation.local_brain`
+  - document/report helper modules still imported from the Argon app root
+
+This means the application is not yet fully separated from `D:\Argon_ai\app`.
+
+### Next recommended phase
+
+Recommended next step: Phase 3B should internalize the remaining non-database helper chain used by the completed procurement/estimate pages.
+
+Suggested order:
+
+1. Create Neon-local replacements for `gateway.py`, `purchase_order_generator.py`, and `doc_generator.py`.
+2. Repoint the already-internalized procurement/estimate database modules to those Neon-local helpers.
+3. Re-audit `ensure_legacy_import_paths()` usage after those helper migrations.
+4. Only then begin internalizing the next group of page-specific `database.*` modules for still-legacy CRUD/admin pages.
+
+Phase 3A reduced direct `database.*` dependency for the completed procurement/estimate pages, but total separation is not complete yet.
+
+## 9. Phase 4A Completed
+
+Phase 4A internalized the non-database helper chain that was still hanging off the Phase 3A procurement and estimate slice.
+
+### Helper modules internalized into Neon
+
+The following legacy app-root helpers were internalized into Neon-owned modules:
+
+- `D:\Argon_ai\app\gateway.py` -> [neon_ai.gateway](d:/Neon_ai/src/neon_ai/gateway.py)
+- `D:\Argon_ai\app\purchase_order_generator.py` -> [neon_ai.purchase_order_generator](d:/Neon_ai/src/neon_ai/purchase_order_generator.py)
+- `D:\Argon_ai\app\doc_generator.py` -> [neon_ai.doc_generator](d:/Neon_ai/src/neon_ai/doc_generator.py)
+
+### Phase 3A modules updated to use Neon-owned helpers
+
+The Phase 3A database slice was updated to import these Neon-local helpers instead of resolving them from `D:\Argon_ai\app`:
+
+- [rfq.py](d:/Neon_ai/src/neon_ai/database/rfq.py)
+- [purchases.py](d:/Neon_ai/src/neon_ai/database/purchases.py)
+- [vendor_invoices.py](d:/Neon_ai/src/neon_ai/database/vendor_invoices.py)
+- [automation.py](d:/Neon_ai/src/neon_ai/database/automation.py)
+
+This means the previously internalized procurement and estimate workflow no longer depends on legacy `gateway.py`, `purchase_order_generator.py`, or `doc_generator.py` through those database modules.
+
+### Verification boundary
+
+- No live email send was performed in this audit.
+- Source-level helper replacement was the completed scope for Phase 4A.
+- Total separation from `D:\Argon_ai\app` is still not complete.
+
+### Remaining dependencies discovered
+
+Phase 4A removed the main non-database helper chain for the completed procurement and estimate slice, but the following legacy dependencies remain:
+
+- `automation.local_brain`
+  - still needs to be internalized from `D:\Argon_ai\app\automation\local_brain.py`
+  - still blocks full removal of the legacy path bridge for the Private Brain dialog
+- `database.classification_feedback`
+  - still needs to be internalized from `D:\Argon_ai\app\database\classification_feedback.py`
+  - still represents a remaining direct legacy database dependency
+- remaining `ensure_legacy_import_paths()` call sites
+  - the bridge remains active across the shell, dialogs, and page modules listed in Section 2
+  - this means Neon still retains a runtime fallback into `D:\Argon_ai\app`
+- remaining page modules still importing bare `database.*`
+  - Phase 4A did not finish the rest of the page-by-page database migration outside the already-internalized slice
+  - those pages still depend on legacy-path resolution until their imports are moved to `neon_ai.database.*`
+
+### Recommended next phase
+
+Recommended next step: Phase 4B should internalize the next two remaining legacy modules that still block clean separation work.
+
+Phase 4B targets:
+
+1. `D:\Argon_ai\app\automation\local_brain.py` -> `D:\Neon_ai\src\neon_ai\automation\local_brain.py`
+2. `D:\Argon_ai\app\database\classification_feedback.py` -> `D:\Neon_ai\src\neon_ai\database\classification_feedback.py`
+
+After that, re-audit:
+
+1. all remaining `ensure_legacy_import_paths()` call sites
+2. all remaining bare `database.*` imports in page modules
+3. whether `bootstrap.py` still requires the `D:\Argon_ai\app` fallback for active runtime code paths
+
+Phase 4A materially reduced the helper-level Argon dependency surface, but it did not complete total separation.

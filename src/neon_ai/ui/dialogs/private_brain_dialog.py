@@ -19,7 +19,7 @@ from neon_ai.bootstrap import ensure_legacy_import_paths
 
 ensure_legacy_import_paths()
 
-from automation.local_brain import brain_instance
+from neon_ai.automation.local_brain import brain_instance
 
 
 class PrivateBrainDialog(QDialog):

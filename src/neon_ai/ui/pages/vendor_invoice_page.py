@@ -26,7 +26,7 @@ from neon_ai.bootstrap import ensure_legacy_import_paths
 
 ensure_legacy_import_paths()
 
-from database.vendor_invoices import (
+from neon_ai.database.vendor_invoices import (
     apply_vendor_invoice_adjustment,
     create_vendor_invoice_draft,
     generate_vendor_invoice_report,

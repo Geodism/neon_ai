@@ -24,16 +24,16 @@ from neon_ai.bootstrap import ensure_legacy_import_paths
 
 ensure_legacy_import_paths()
 
-from database.customers import get_all_customers, get_sites_for_customer
-from database.estimates import (
+from neon_ai.database.customers import get_all_customers, get_sites_for_customer
+from neon_ai.database.estimates import (
     get_all_estimate_summaries,
     get_detailed_estimate_data,
     insert_full_estimate,
     sync_estimate_pricing_from_sources,
     update_draft_estimate,
 )
-from database.materials import get_carried_price, search_materials
-from database.roles import get_standard_roles
+from neon_ai.database.materials import get_carried_price, search_materials
+from neon_ai.database.roles import get_standard_roles
 
 
 class LedgerTable(QTableWidget):

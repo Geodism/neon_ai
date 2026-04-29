@@ -33,14 +33,14 @@ from neon_ai.bootstrap import ensure_legacy_import_paths
 
 ensure_legacy_import_paths()
 
-from database.estimates import get_all_estimates, get_estimate_materials
-from database.materials import (
+from neon_ai.database.estimates import get_all_estimates, get_estimate_materials
+from neon_ai.database.materials import (
     get_material_price_for_vendor,
     get_or_create_material_from_estimate,
     record_purchase_order_price,
     search_materials,
 )
-from database.purchases import (
+from neon_ai.database.purchases import (
     archive_purchase_order_docx,
     get_carried_items_for_po_builder,
     get_existing_po_details,
@@ -58,7 +58,7 @@ from database.purchases import (
     save_purchase_order_draft,
     send_purchase_order_now,
 )
-from database.rfq import (
+from neon_ai.database.rfq import (
     build_rfq_preview_text,
     get_active_rfqs,
     get_all_vendors,
@@ -71,7 +71,7 @@ from database.rfq import (
     send_rfq_by_id,
     update_rfq_item_price,
 )
-from database.timesheets import get_open_workorder_choices
+from neon_ai.database.timesheets import get_open_workorder_choices
 
 
 class RFQViewerPage(QWidget):
