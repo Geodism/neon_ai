@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+import time
+import traceback
+
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -29,12 +32,41 @@ from neon_ai.database.materials import (
 )
 
 
+class MaterialLoadWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, search_text: str, include_inactive: bool) -> None:
+        super().__init__()
+        self._search_text = search_text
+        self._include_inactive = include_inactive
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            rows = get_material_pipeline(
+                search_text=self._search_text,
+                include_inactive=self._include_inactive,
+            )
+            self.finished.emit(rows)
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(str(exc))
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=worker name=material_page.load_data elapsed_ms={elapsed_ms:.2f}")
+
+
 class MaterialPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.active_item_id: int | None = None
         self.material_lookup: dict[str, dict] = {}
         self._loading_material = False
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: MaterialLoadWorker | None = None
+        self._is_refreshing = False
+        self._pending_refresh = False
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self.refresh_data)
@@ -45,13 +77,17 @@ class MaterialPage(QWidget):
 
         title = QLabel("Material Catalog Command")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh_data)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_data)
         header = QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(refresh_button)
+        header.addWidget(self.refresh_button)
         layout.addLayout(header)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.status_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -240,21 +276,48 @@ class MaterialPage(QWidget):
         self._search_timer.start(250)
 
     def refresh_data(self) -> None:
-        selected_item_id = self.active_item_id
+        started = time.perf_counter()
+        try:
+            if self._is_refreshing:
+                self._pending_refresh = True
+                return
+
+            self._is_refreshing = True
+            self._pending_refresh = False
+            self.refresh_button.setEnabled(False)
+            self.status_label.setText("Loading materials...")
+
+            search_text = self.search_field.text().strip()
+            include_inactive = self.show_inactive_checkbox.isChecked()
+            selected_item_id = self.active_item_id
+
+            self._refresh_thread = QThread(self)
+            self._refresh_worker = MaterialLoadWorker(search_text, include_inactive)
+            self._refresh_worker.moveToThread(self._refresh_thread)
+            self._refresh_thread.started.connect(self._refresh_worker.run)
+            self._refresh_worker.finished.connect(
+                lambda rows, selected_item_id=selected_item_id: self._on_refresh_loaded(rows, selected_item_id)
+            )
+            self._refresh_worker.failed.connect(self._on_refresh_failed)
+            self._refresh_worker.finished.connect(self._refresh_thread.quit)
+            self._refresh_worker.failed.connect(self._refresh_thread.quit)
+            self._refresh_thread.finished.connect(
+                lambda thread=self._refresh_thread, worker=self._refresh_worker: self._cleanup_refresh_worker(
+                    thread, worker
+                )
+            )
+            self._refresh_thread.start()
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=page name=material_page.refresh_data elapsed_ms={elapsed_ms:.2f}")
+
+    def _on_refresh_loaded(self, rows: object, selected_item_id: int | None) -> None:
+        pipeline_rows = list(rows) if isinstance(rows, list) else []
         self.material_lookup.clear()
         self.pipeline_table.setSortingEnabled(False)
         self.pipeline_table.setRowCount(0)
 
-        try:
-            rows = get_material_pipeline(
-                search_text=self.search_field.text().strip(),
-                include_inactive=self.show_inactive_checkbox.isChecked(),
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Database Error", f"Failed to load materials:\n{exc}")
-            return
-
-        for row in rows:
+        for row in pipeline_rows:
             item_id = int(row["ItemID"])
             self.material_lookup[str(item_id)] = row
             table_row = self.pipeline_table.rowCount()
@@ -274,15 +337,38 @@ class MaterialPage(QWidget):
                 self.pipeline_table.setItem(table_row, col_index, item)
 
         self.pipeline_table.setSortingEnabled(True)
+        self.status_label.setText("")
 
         if selected_item_id and str(selected_item_id) in self.material_lookup:
             for row in range(self.pipeline_table.rowCount()):
-                if self.pipeline_table.item(row, 0).text() == str(selected_item_id):
+                current_item = self.pipeline_table.item(row, 0)
+                if current_item and current_item.text() == str(selected_item_id):
                     self.pipeline_table.selectRow(row)
                     self._on_material_select()
                     break
         elif not self.active_item_id:
             self._prepare_new_material()
+
+    def _on_refresh_failed(self, error_message: str) -> None:
+        print(error_message)
+        self._show_pipeline_error_row(f"DB Error: {error_message}")
+        self.status_label.setText("Material refresh failed.")
+
+    def _cleanup_refresh_worker(self, thread: QThread | None, worker: MaterialLoadWorker | None) -> None:
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+        if self._refresh_thread is thread:
+            self._refresh_thread = None
+        pending_refresh = self._pending_refresh
+        self._is_refreshing = False
+        self.refresh_button.setEnabled(True)
+        if pending_refresh:
+            self._pending_refresh = False
+            QTimer.singleShot(0, self.refresh_data)
 
     def _prepare_new_material(self) -> None:
         self.active_item_id = None
@@ -422,6 +508,16 @@ class MaterialPage(QWidget):
             item = QTableWidgetItem(value)
             item.setTextAlignment(alignments.get(column, Qt.AlignmentFlag.AlignLeft))
             table.setItem(row, column, item)
+
+    def _show_pipeline_error_row(self, message: str) -> None:
+        self.pipeline_table.setSortingEnabled(False)
+        self.pipeline_table.setRowCount(1)
+        self.pipeline_table.setItem(0, 0, QTableWidgetItem(""))
+        item = QTableWidgetItem(message)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.pipeline_table.setItem(0, 1, item)
+        for column in range(2, self.pipeline_table.columnCount()):
+            self.pipeline_table.setItem(0, column, QTableWidgetItem(""))
 
     def _format_price_value(self, value: object) -> str:
         return "" if value is None else f"{float(value):.2f}"
