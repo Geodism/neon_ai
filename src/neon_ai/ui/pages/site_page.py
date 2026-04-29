@@ -148,8 +148,6 @@ class SitePage(QWidget):
         splitter.addWidget(right_group)
         splitter.setStretchFactor(1, 3)
         
-        self.refresh_data()
-    
     def refresh_data(self) -> None:
         """Load customers and sites."""
         self.customer_dict = {

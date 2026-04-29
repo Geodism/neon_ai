@@ -27,6 +27,11 @@ from neon_ai.database.rfq import sweep_for_outstanding_rfq_followups
 from neon_ai.database.vendor_invoices import sweep_for_ready_to_pay_vendor_invoices
 
 
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
+
+
 def run_gateway_loop() -> None:
     """Preserve the legacy background loop behavior from app/main.py."""
     print("\n" + "=" * 40)
@@ -68,16 +73,34 @@ def run_gateway_loop() -> None:
 
 
 def main() -> int:
-    if os.environ.get("NEON_DISABLE_GATEWAY") == "1":
-        print("Gateway disabled by NEON_DISABLE_GATEWAY=1")
-    else:
-        gateway_thread = threading.Thread(target=run_gateway_loop, daemon=True)
-        gateway_thread.start()
+    main_started_at = time.perf_counter()
+    try:
+        if os.environ.get("NEON_DISABLE_GATEWAY") == "1":
+            print("Gateway disabled by NEON_DISABLE_GATEWAY=1")
+        else:
+            gateway_thread_started_at = time.perf_counter()
+            try:
+                gateway_thread = threading.Thread(target=run_gateway_loop, daemon=True)
+                gateway_thread.start()
+            finally:
+                _perf_log("startup", "gateway_thread_start", gateway_thread_started_at)
 
-    app = QApplication(sys.argv)
-    window = NeonMainWindow()
-    window.show()
-    return app.exec()
+        qapplication_started_at = time.perf_counter()
+        try:
+            app = QApplication(sys.argv)
+        finally:
+            _perf_log("startup", "qapplication_create", qapplication_started_at)
+
+        main_window_started_at = time.perf_counter()
+        try:
+            window = NeonMainWindow()
+        finally:
+            _perf_log("startup", "main_window_init", main_window_started_at)
+
+        window.show()
+        return app.exec()
+    finally:
+        _perf_log("startup", "main.total", main_started_at)
 
 
 if __name__ == "__main__":

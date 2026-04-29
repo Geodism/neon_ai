@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import time
+import traceback
+
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QGroupBox,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -27,16 +32,62 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return self._sort_value < other_value
 
 
+class DashboardLoadWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            payload = {
+                "workorders": {"rows": None, "error": None},
+                "estimates": {"rows": None, "error": None},
+            }
+
+            try:
+                payload["workorders"]["rows"] = get_dashboard_metrics()
+            except Exception as exc:
+                payload["workorders"]["error"] = str(exc)
+                traceback.print_exc()
+
+            try:
+                payload["estimates"]["rows"] = get_dashboard_estimates()
+            except Exception as exc:
+                payload["estimates"]["error"] = str(exc)
+                traceback.print_exc()
+
+            self.finished.emit(payload)
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(str(exc))
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=worker name=dashboard_page.load_data elapsed_ms={elapsed_ms:.2f}")
+
+
 class DashboardPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: DashboardLoadWorker | None = None
+        self._is_refreshing = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
         title = QLabel("Argon Operations Command")
         title.setStyleSheet("font-size: 24px; font-weight: 700;")
-        layout.addWidget(title)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_data)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.refresh_button)
+        layout.addLayout(header)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.status_label)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(splitter, 1)
@@ -79,15 +130,76 @@ class DashboardPage(QWidget):
         splitter.setSizes([450, 250])
 
     def refresh_data(self) -> None:
-        self._load_workorders()
-        self._load_estimates()
-
-    def _load_workorders(self) -> None:
+        started = time.perf_counter()
         try:
-            rows = get_dashboard_metrics()
-        except Exception as exc:
-            self._show_error_row(self.wo_table, ["DB Error", str(exc), "", "", "", "", ""])
-            return
+            if self._is_refreshing:
+                return
+
+            self._is_refreshing = True
+            self.refresh_button.setEnabled(False)
+            self.status_label.setText("Loading dashboard...")
+
+            self._refresh_thread = QThread(self)
+            self._refresh_worker = DashboardLoadWorker()
+            self._refresh_worker.moveToThread(self._refresh_thread)
+            self._refresh_thread.started.connect(self._refresh_worker.run)
+            self._refresh_worker.finished.connect(self._on_refresh_loaded)
+            self._refresh_worker.failed.connect(self._on_refresh_failed)
+            self._refresh_worker.finished.connect(self._refresh_thread.quit)
+            self._refresh_worker.failed.connect(self._refresh_thread.quit)
+            self._refresh_thread.finished.connect(
+                lambda thread=self._refresh_thread, worker=self._refresh_worker: self._cleanup_refresh_worker(
+                    thread, worker
+                )
+            )
+            self._refresh_thread.start()
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"[PERF] area=page name=dashboard_page.refresh_data elapsed_ms={elapsed_ms:.2f}")
+
+    def _on_refresh_loaded(self, payload: object) -> None:
+        data = payload if isinstance(payload, dict) else {}
+
+        workorders = data.get("workorders", {})
+        workorder_error = workorders.get("error")
+        if workorder_error:
+            self._show_error_row(self.wo_table, ["DB Error", str(workorder_error), "", "", "", "", ""])
+        else:
+            self._populate_workorders(workorders.get("rows") or [])
+
+        estimates = data.get("estimates", {})
+        estimate_error = estimates.get("error")
+        if estimate_error:
+            self._show_error_row(self.est_table, ["DB Error", str(estimate_error), "", ""])
+        else:
+            self._populate_estimates(estimates.get("rows") or [])
+
+        status_parts: list[str] = []
+        if workorder_error:
+            status_parts.append("work orders failed")
+        if estimate_error:
+            status_parts.append("estimates failed")
+        self.status_label.setText("; ".join(status_parts) if status_parts else "")
+
+    def _on_refresh_failed(self, error_message: str) -> None:
+        print(error_message)
+        self._show_error_row(self.wo_table, ["DB Error", error_message, "", "", "", "", ""])
+        self._show_error_row(self.est_table, ["DB Error", error_message, "", ""])
+        self.status_label.setText("Dashboard refresh failed.")
+
+    def _cleanup_refresh_worker(self, thread: QThread | None, worker: DashboardLoadWorker | None) -> None:
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+        if self._refresh_thread is thread:
+            self._refresh_thread = None
+        self._is_refreshing = False
+        self.refresh_button.setEnabled(True)
+
+    def _populate_workorders(self, rows: list[dict]) -> None:
         self.wo_table.setSortingEnabled(False)
         self.wo_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
@@ -111,12 +223,7 @@ class DashboardPage(QWidget):
                 self.wo_table.setItem(row_index, col_index, item)
         self.wo_table.setSortingEnabled(True)
 
-    def _load_estimates(self) -> None:
-        try:
-            rows = get_dashboard_estimates()
-        except Exception as exc:
-            self._show_error_row(self.est_table, ["DB Error", str(exc), "", ""])
-            return
+    def _populate_estimates(self, rows: list[dict]) -> None:
         self.est_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = (

@@ -102,7 +102,13 @@ class RFQViewerPage(QWidget):
 
         title = QLabel("Material Procurement Command")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        layout.addWidget(title, 0, Qt.AlignmentFlag.AlignLeft)
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh_data)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(refresh_button)
+        layout.addLayout(header)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(main_splitter, 1)

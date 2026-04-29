@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import time
 from neon_ai.database.connection import get_connection
 from psycopg2.extras import RealDictCursor
 
@@ -10,6 +11,11 @@ from psycopg2.extras import RealDictCursor
 # sweeper queries still work without excluding historical purchase orders.
 AUTOMATION_MIN_DATE = datetime.date(1900, 1, 1)
 PO_DISPATCH_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "po_dispatch_log.json")
+
+
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
 
 
 def ensure_purchase_schema():
@@ -1181,57 +1187,61 @@ def update_purchase_order_receiving_status(po_id: int):
 
 
 def get_po_followup_status(po_id: int):
-    po_data = get_po_export_data(po_id)
-    record = next((row for row in load_po_dispatch_log() if row.get("po_id") == po_id), {})
-    eta_date_value = po_data.get("ExpectedArrivalDate") if po_data else None
-    eta_note_value = po_data.get("ExpectedArrivalNote") if po_data else None
-    status = {
-        "po_status": po_data.get("Status") if po_data else None,
-        "eta_text": eta_note_value or record.get("eta_text"),
-        "eta_date": (eta_date_value.isoformat() if hasattr(eta_date_value, "isoformat") else eta_date_value) or record.get("eta_date"),
-        "weekly_followup_active": bool(record.get("long_lead")) and not po_has_any_packing_slip(po_id) and not po_is_fully_received(po_id) and (po_data.get("Status") != "ReadyForPickup" if po_data else True),
-        "next_followup": None,
-        "sent_at": record.get("sent_at"),
-        "ready_for_pickup_at": record.get("ready_for_pickup_at"),
-        "last_weekly_followup_sent_at": record.get("last_weekly_followup_sent_at"),
-        "eta_followup_sent_at": record.get("eta_followup_sent_at"),
-        "recipient_email": record.get("recipient_email"),
-    }
+    started_at = time.perf_counter()
+    try:
+        po_data = get_po_export_data(po_id)
+        record = next((row for row in load_po_dispatch_log() if row.get("po_id") == po_id), {})
+        eta_date_value = po_data.get("ExpectedArrivalDate") if po_data else None
+        eta_note_value = po_data.get("ExpectedArrivalNote") if po_data else None
+        status = {
+            "po_status": po_data.get("Status") if po_data else None,
+            "eta_text": eta_note_value or record.get("eta_text"),
+            "eta_date": (eta_date_value.isoformat() if hasattr(eta_date_value, "isoformat") else eta_date_value) or record.get("eta_date"),
+            "weekly_followup_active": bool(record.get("long_lead")) and not po_has_any_packing_slip(po_id) and not po_is_fully_received(po_id) and (po_data.get("Status") != "ReadyForPickup" if po_data else True),
+            "next_followup": None,
+            "sent_at": record.get("sent_at"),
+            "ready_for_pickup_at": record.get("ready_for_pickup_at"),
+            "last_weekly_followup_sent_at": record.get("last_weekly_followup_sent_at"),
+            "eta_followup_sent_at": record.get("eta_followup_sent_at"),
+            "recipient_email": record.get("recipient_email"),
+        }
 
-    if po_has_any_packing_slip(po_id) or po_is_fully_received(po_id):
-        status["next_followup"] = "None - receipt logged"
-        status["weekly_followup_active"] = False
-        return status
+        if po_has_any_packing_slip(po_id) or po_is_fully_received(po_id):
+            status["next_followup"] = "None - receipt logged"
+            status["weekly_followup_active"] = False
+            return status
 
-    if record.get("ready_for_pickup_at"):
-        status["next_followup"] = "Owner pickup pending"
-        status["weekly_followup_active"] = False
-        return status
+        if record.get("ready_for_pickup_at"):
+            status["next_followup"] = "Owner pickup pending"
+            status["weekly_followup_active"] = False
+            return status
 
-    eta_date_raw = record.get("eta_date")
-    if eta_date_raw:
-        try:
-            eta_date = datetime.date.fromisoformat(eta_date_raw)
-            status["next_followup"] = str(eta_date + datetime.timedelta(days=1))
-        except ValueError:
-            pass
-
-    if status["weekly_followup_active"]:
-        last_weekly = record.get("last_weekly_followup_sent_at")
-        if last_weekly:
+        eta_date_raw = record.get("eta_date")
+        if eta_date_raw:
             try:
-                next_weekly = datetime.datetime.fromisoformat(last_weekly).date() + datetime.timedelta(days=7)
-                status["next_followup"] = str(next_weekly)
-            except ValueError:
-                pass
-        elif record.get("sent_at"):
-            try:
-                next_weekly = datetime.datetime.fromisoformat(record["sent_at"]).date() + datetime.timedelta(days=7)
-                status["next_followup"] = str(next_weekly)
+                eta_date = datetime.date.fromisoformat(eta_date_raw)
+                status["next_followup"] = str(eta_date + datetime.timedelta(days=1))
             except ValueError:
                 pass
 
-    return status
+        if status["weekly_followup_active"]:
+            last_weekly = record.get("last_weekly_followup_sent_at")
+            if last_weekly:
+                try:
+                    next_weekly = datetime.datetime.fromisoformat(last_weekly).date() + datetime.timedelta(days=7)
+                    status["next_followup"] = str(next_weekly)
+                except ValueError:
+                    pass
+            elif record.get("sent_at"):
+                try:
+                    next_weekly = datetime.datetime.fromisoformat(record["sent_at"]).date() + datetime.timedelta(days=7)
+                    status["next_followup"] = str(next_weekly)
+                except ValueError:
+                    pass
+
+        return status
+    finally:
+        _perf_log("db", "purchases.get_po_followup_status", started_at)
 
 
 def get_backordered_purchase_orders():
@@ -1728,20 +1738,24 @@ def sweep_for_po_eta_followups():
 # ==========================================
 
 def get_purchase_orders():
-    ensure_purchase_schema()
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    started_at = time.perf_counter()
     try:
-        cur.execute('''
-            SELECT po."PurchaseOrderID", v."VendorName", po."WorkOrderID", po."Date", po."Status", po."PurchaseOrderTotal"
-            FROM "PurchaseOrder" po
-            JOIN "Vendor" v ON po."VendorID" = v."VendorID"
-            WHERE po."Status" != 'Retired'
-            ORDER BY po."PurchaseOrderID" DESC
-        ''')
-        return cur.fetchall()
+        ensure_purchase_schema()
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute('''
+                SELECT po."PurchaseOrderID", v."VendorName", po."WorkOrderID", po."Date", po."Status", po."PurchaseOrderTotal"
+                FROM "PurchaseOrder" po
+                JOIN "Vendor" v ON po."VendorID" = v."VendorID"
+                WHERE po."Status" != 'Retired'
+                ORDER BY po."PurchaseOrderID" DESC
+            ''')
+            return cur.fetchall()
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _perf_log("db", "purchases.get_purchase_orders", started_at)
 
 def get_next_po_id():
     conn = get_connection()
@@ -1785,22 +1799,26 @@ def get_existing_po_id(work_order_id: int, vendor_id: int):
 
 def get_purchase_orders_for_pipeline():
     """Pulls the POs for the bottom-left Master Ledger."""
-    ensure_purchase_schema()
-    from neon_ai.database.connection import get_connection
-    from psycopg2.extras import RealDictCursor
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    started_at = time.perf_counter()
     try:
-        cur.execute('''
-            SELECT po."PurchaseOrderID", po."WorkOrderID", s."SiteName", po."Date", po."Status"
-            FROM "PurchaseOrder" po
-            LEFT JOIN "WorkOrder" wo ON po."WorkOrderID" = wo."WorkOrderID"
-            LEFT JOIN "Site" s ON wo."SiteID" = s."SiteID"
-            ORDER BY po."PurchaseOrderID" DESC
-        ''')
-        return cur.fetchall()
+        ensure_purchase_schema()
+        from neon_ai.database.connection import get_connection
+        from psycopg2.extras import RealDictCursor
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute('''
+                SELECT po."PurchaseOrderID", po."WorkOrderID", s."SiteName", po."Date", po."Status"
+                FROM "PurchaseOrder" po
+                LEFT JOIN "WorkOrder" wo ON po."WorkOrderID" = wo."WorkOrderID"
+                LEFT JOIN "Site" s ON wo."SiteID" = s."SiteID"
+                ORDER BY po."PurchaseOrderID" DESC
+            ''')
+            return cur.fetchall()
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _perf_log("db", "purchases.get_purchase_orders_for_pipeline", started_at)
 
 def get_po_items_with_receiving(po_id: int):
     """Pulls items with Ordered vs Received math."""

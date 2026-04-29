@@ -45,7 +45,13 @@ class MaterialPage(QWidget):
 
         title = QLabel("Material Catalog Command")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        layout.addWidget(title)
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh_data)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(refresh_button)
+        layout.addLayout(header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -53,8 +59,6 @@ class MaterialPage(QWidget):
         splitter.addWidget(self._build_workspace_panel())
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
-
-        self.refresh_data()
 
     def _build_pipeline_panel(self) -> QGroupBox:
         group = QGroupBox("Materials Pipeline")

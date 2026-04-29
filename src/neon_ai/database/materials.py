@@ -1,7 +1,13 @@
 import datetime
+import time
 
 from neon_ai.database.connection import get_connection
 from psycopg2.extras import RealDictCursor
+
+
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
 
 
 _MATERIAL_SCHEMA_READY = False
@@ -218,53 +224,57 @@ def search_materials(search_text, include_inactive=False):
 
 
 def get_material_pipeline(search_text="", include_inactive=True):
-    ensure_material_schema()
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    started_at = time.perf_counter()
     try:
-        filters = []
-        params = []
-        if search_text.strip():
-            filters.append('("PartNumber" ILIKE %s OR "Description" ILIKE %s)')
-            params.extend([f"%{search_text.strip()}%", f"%{search_text.strip()}%"])
-        if not include_inactive:
-            filters.append('COALESCE("IsActive", TRUE) = TRUE')
+        ensure_material_schema()
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            filters = []
+            params = []
+            if search_text.strip():
+                filters.append('("PartNumber" ILIKE %s OR "Description" ILIKE %s)')
+                params.extend([f"%{search_text.strip()}%", f"%{search_text.strip()}%"])
+            if not include_inactive:
+                filters.append('COALESCE("IsActive", TRUE) = TRUE')
 
-        sql = """
-            SELECT
-                "ItemID",
-                "PartNumber",
-                "Description",
-                "Unit",
-                "CarryPriceSource",
-                "IsActive",
-                "InternalPrice",
-                "NedcoPrice",
-                "NedcoLastPriceDate",
-                "NedcoLastRFQ",
-                "NedcoPartNumber",
-                "GescanPrice",
-                "GescanLastPriceDate",
-                "GescanLastRFQ",
-                "GescanPartNumber",
-                "EecolPrice",
-                "EecolLastPriceDate",
-                "EecolLastRFQ",
-                "EecolPartNumber",
-                "GuillevinPrice",
-                "GuillevinLastPriceDate",
-                "GuillevinLastRFQ",
-                "GuillevinPartNumber"
-            FROM "Material"
-        """
-        if filters:
-            sql += " WHERE " + " AND ".join(filters)
-        sql += ' ORDER BY COALESCE("Description", \'\') ASC, "ItemID" ASC'
+            sql = """
+                SELECT
+                    "ItemID",
+                    "PartNumber",
+                    "Description",
+                    "Unit",
+                    "CarryPriceSource",
+                    "IsActive",
+                    "InternalPrice",
+                    "NedcoPrice",
+                    "NedcoLastPriceDate",
+                    "NedcoLastRFQ",
+                    "NedcoPartNumber",
+                    "GescanPrice",
+                    "GescanLastPriceDate",
+                    "GescanLastRFQ",
+                    "GescanPartNumber",
+                    "EecolPrice",
+                    "EecolLastPriceDate",
+                    "EecolLastRFQ",
+                    "EecolPartNumber",
+                    "GuillevinPrice",
+                    "GuillevinLastPriceDate",
+                    "GuillevinLastRFQ",
+                    "GuillevinPartNumber"
+                FROM "Material"
+            """
+            if filters:
+                sql += " WHERE " + " AND ".join(filters)
+            sql += ' ORDER BY COALESCE("Description", \'\') ASC, "ItemID" ASC'
 
-        cur.execute(sql, params)
-        return _decorate_material_rows(cur.fetchall())
+            cur.execute(sql, params)
+            return _decorate_material_rows(cur.fetchall())
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _perf_log("db", "materials.get_material_pipeline", started_at)
 
 
 def get_material_by_id(item_id):

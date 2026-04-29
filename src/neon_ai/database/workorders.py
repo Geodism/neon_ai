@@ -1,4 +1,11 @@
+import time
+
 from neon_ai.database.connection import get_connection
+
+
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
 
 
 def check_closure_requirements(wo_id: int):
@@ -92,40 +99,44 @@ def get_wo_export_data(wo_id: int):
 
 def get_dashboard_work_orders():
     """Pulls the active Work Orders with live financial telemetry."""
-    from neon_ai.database.connection import get_connection
-    conn = get_connection()
-    cur = conn.cursor()
+    started_at = time.perf_counter()
     try:
-        cur.execute("""
-            SELECT 
-                wo."WorkOrderID", 
-                COALESCE(wo."CreatedDate", 'N/A') AS "CreatedDate",
-                s."SiteName",
-                CASE 
-                    WHEN wo."IsClosed" THEN 'CLOSED'
-                    ELSE 'OPEN'
-                END as "Status",
-                
-                -- The Baseline (Estimated Cost)
-                (
-                    COALESCE((SELECT SUM("LineTotal") FROM "EstimateLabor" el JOIN "Estimate" e ON el."EstimateID" = e."EstimateID" WHERE e."SiteID" = wo."SiteID" AND e."IsConverted" = TRUE), 0) +
-                    COALESCE((SELECT SUM("LineTotal") FROM "EstimateMaterial" em JOIN "Estimate" e ON em."EstimateID" = e."EstimateID" WHERE e."SiteID" = wo."SiteID" AND e."IsConverted" = TRUE), 0)
-                ) AS "EstCost",
-                
-                -- The Actual Burn (Labor + Materials)
-                -- FIX: Added ::numeric to EmployeeRate just in case Supabase thinks it is text!
-                (
-                    COALESCE((SELECT SUM(t."HoursWorked" * emp."EmployeeRate"::numeric) FROM "Time" t JOIN "Employee" emp ON t."WorkerID" = emp."EmployeeID" WHERE t."WorkOrderID" = wo."WorkOrderID"), 0) +
-                    COALESCE((SELECT SUM("PurchaseOrderTotal") FROM "PurchaseOrder" WHERE "WorkOrderID" = wo."WorkOrderID"), 0)
-                ) AS "ActCost"
-                
-            FROM "WorkOrder" wo
-            JOIN "Site" s ON wo."SiteID" = s."SiteID"
-            ORDER BY wo."WorkOrderID" DESC
-        """)
-        return cur.fetchall()
+        from neon_ai.database.connection import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT 
+                    wo."WorkOrderID", 
+                    COALESCE(wo."CreatedDate", 'N/A') AS "CreatedDate",
+                    s."SiteName",
+                    CASE 
+                        WHEN wo."IsClosed" THEN 'CLOSED'
+                        ELSE 'OPEN'
+                    END as "Status",
+                    
+                    -- The Baseline (Estimated Cost)
+                    (
+                        COALESCE((SELECT SUM("LineTotal") FROM "EstimateLabor" el JOIN "Estimate" e ON el."EstimateID" = e."EstimateID" WHERE e."SiteID" = wo."SiteID" AND e."IsConverted" = TRUE), 0) +
+                        COALESCE((SELECT SUM("LineTotal") FROM "EstimateMaterial" em JOIN "Estimate" e ON em."EstimateID" = e."EstimateID" WHERE e."SiteID" = wo."SiteID" AND e."IsConverted" = TRUE), 0)
+                    ) AS "EstCost",
+                    
+                    -- The Actual Burn (Labor + Materials)
+                    -- FIX: Added ::numeric to EmployeeRate just in case Supabase thinks it is text!
+                    (
+                        COALESCE((SELECT SUM(t."HoursWorked" * emp."EmployeeRate"::numeric) FROM "Time" t JOIN "Employee" emp ON t."WorkerID" = emp."EmployeeID" WHERE t."WorkOrderID" = wo."WorkOrderID"), 0) +
+                        COALESCE((SELECT SUM("PurchaseOrderTotal") FROM "PurchaseOrder" WHERE "WorkOrderID" = wo."WorkOrderID"), 0)
+                    ) AS "ActCost"
+                    
+                FROM "WorkOrder" wo
+                JOIN "Site" s ON wo."SiteID" = s."SiteID"
+                ORDER BY wo."WorkOrderID" DESC
+            """)
+            return cur.fetchall()
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _perf_log("db", "workorders.get_dashboard_work_orders", started_at)
 
 
 def get_work_order_telemetry(wo_id: int):

@@ -1,8 +1,15 @@
 from tkinter import messagebox
+import time
 
 from neon_ai.database.connection import get_connection
 from neon_ai.database.materials import get_or_create_material_from_estimate
 from psycopg2.extras import RealDictCursor
+
+
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
+
 
 def _log_estimate_sheet_save(cur, estimate_id, action_label, labor_lines, material_lines):
     """Writes an audit note whenever the estimate sheet is saved."""
@@ -449,31 +456,35 @@ def check_po_clearance(estimate_id: int) -> bool:
 
 def get_dashboard_estimates():
     """Pulls pending estimates with Description and bulletproof math."""
-    from neon_ai.database.connection import get_connection
-    conn = get_connection()
-    cur = conn.cursor()
+    started_at = time.perf_counter()
     try:
-        cur.execute("""
-            SELECT 
-                e."EstimateID", 
-                COALESCE(e."CreatedDate"::text, 'N/A'), 
-                c."CustomerName", 
-                s."SiteName", 
-                COALESCE(e."Status", 'Draft') AS "Status",
-                e."Description", -- <--- THE RESTORED WIRE!
-                (
-                    (COALESCE((SELECT SUM("LineTotal") FROM "EstimateLabor" WHERE "EstimateID" = e."EstimateID"), 0) * (1 + (COALESCE(e."LaborMarkUp", 0)/100.0))) +
-                    (COALESCE((SELECT SUM("LineTotal") FROM "EstimateMaterial" WHERE "EstimateID" = e."EstimateID"), 0) * (1 + (COALESCE(e."MaterialMarkUp", 0)/100.0)))
-                ) AS "TotalValue"
-            FROM "Estimate" e
-            JOIN "Site" s ON e."SiteID" = s."SiteID"
-            JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
-            WHERE COALESCE(e."IsConverted", FALSE) = FALSE
-            ORDER BY e."EstimateID" DESC
-        """)
-        return cur.fetchall()
+        from neon_ai.database.connection import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT 
+                    e."EstimateID", 
+                    COALESCE(e."CreatedDate"::text, 'N/A'), 
+                    c."CustomerName", 
+                    s."SiteName", 
+                    COALESCE(e."Status", 'Draft') AS "Status",
+                    e."Description", -- <--- THE RESTORED WIRE!
+                    (
+                        (COALESCE((SELECT SUM("LineTotal") FROM "EstimateLabor" WHERE "EstimateID" = e."EstimateID"), 0) * (1 + (COALESCE(e."LaborMarkUp", 0)/100.0))) +
+                        (COALESCE((SELECT SUM("LineTotal") FROM "EstimateMaterial" WHERE "EstimateID" = e."EstimateID"), 0) * (1 + (COALESCE(e."MaterialMarkUp", 0)/100.0)))
+                    ) AS "TotalValue"
+                FROM "Estimate" e
+                JOIN "Site" s ON e."SiteID" = s."SiteID"
+                JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+                WHERE COALESCE(e."IsConverted", FALSE) = FALSE
+                ORDER BY e."EstimateID" DESC
+            """)
+            return cur.fetchall()
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _perf_log("db", "estimates.get_dashboard_estimates", started_at)
 
 def convert_estimate_to_workorder(estimate_id: int, po_number: str, doc_path: str):
     """

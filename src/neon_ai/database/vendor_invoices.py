@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import re
+import time
 from decimal import Decimal
 
 from docx import Document
@@ -23,6 +24,11 @@ from neon_ai.database.rfq import extract_text_from_attachment, ocr_pdf_attachmen
 
 VENDOR_INVOICE_MEMORY_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "vendor_invoice_memory.json")
 _VENDOR_INVOICE_SCHEMA_READY = False
+
+
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
 
 
 def ensure_vendor_invoice_schema():
@@ -772,25 +778,29 @@ def get_vendor_invoice_workspace(po_id: int):
 
 
 def get_vendor_invoice_workspace_by_invoice_id(invoice_id: int):
-    payload = get_vendor_invoice_detail(invoice_id)
-    if not payload:
-        return None
-    po_id = int(payload["header"]["PurchaseOrderID"])
-    po_data = get_po_export_data(po_id)
-    memory = payload["memory"]
-    rows = _build_default_invoice_rows(po_id, invoice_id, memory.get("receipt_key"))
-    total = sum(float(row.get("subtotal") or 0) for row in rows)
-    return {
-        "po": po_data,
-        "invoice": payload["header"],
-        "rows": rows,
-        "total": total,
-        "report_path": memory.get("report_path"),
-        "receipt_key": memory.get("receipt_key") or "all_received",
-        "receipt_label": memory.get("receipt_label") or "All received material on this PO",
-        "rollup_excluding_current": get_purchase_order_invoice_rollup(po_id, exclude_invoice_id=invoice_id),
-        "receipt_choices": get_purchase_order_receipt_choices(po_id),
-    }
+    started_at = time.perf_counter()
+    try:
+        payload = get_vendor_invoice_detail(invoice_id)
+        if not payload:
+            return None
+        po_id = int(payload["header"]["PurchaseOrderID"])
+        po_data = get_po_export_data(po_id)
+        memory = payload["memory"]
+        rows = _build_default_invoice_rows(po_id, invoice_id, memory.get("receipt_key"))
+        total = sum(float(row.get("subtotal") or 0) for row in rows)
+        return {
+            "po": po_data,
+            "invoice": payload["header"],
+            "rows": rows,
+            "total": total,
+            "report_path": memory.get("report_path"),
+            "receipt_key": memory.get("receipt_key") or "all_received",
+            "receipt_label": memory.get("receipt_label") or "All received material on this PO",
+            "rollup_excluding_current": get_purchase_order_invoice_rollup(po_id, exclude_invoice_id=invoice_id),
+            "receipt_choices": get_purchase_order_receipt_choices(po_id),
+        }
+    finally:
+        _perf_log("db", "vendor_invoices.get_vendor_invoice_workspace_by_invoice_id", started_at)
 
 
 def _recalculate_purchase_order_total(po_id: int):

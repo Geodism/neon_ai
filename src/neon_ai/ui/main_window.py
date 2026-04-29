@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 from PySide6.QtWidgets import (
     QFrame,
@@ -45,6 +46,15 @@ class MenuAction:
     page_key: str
 
 
+def _perf_log(area: str, name: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
+
+
+def _perf_log_skipped(page_key: str) -> None:
+    print(f"[PERF] area=ui name=refresh_skipped:{page_key} elapsed_ms=0 reason=throttle")
+
+
 class NeonMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -53,6 +63,9 @@ class NeonMainWindow(QMainWindow):
         self.setMinimumSize(1000, 700)
 
         self.pages: dict[str, QWidget] = {}
+        self.page_factories: dict[str, type[QWidget]] = {}
+        self.page_last_refresh_at: dict[str, float] = {}
+        self.page_refresh_interval_s = 30.0
         self.menu_structure: dict[str, list[MenuAction]] = {
             "📈 METRICS": [
                 MenuAction("Company Dashboard", "DashboardFrame"),
@@ -105,7 +118,7 @@ class NeonMainWindow(QMainWindow):
 
         self._register_pages()
         self.load_sub_menu("📈 METRICS")
-        self.show_page("DashboardFrame")
+        print(f"[startup] Cached pages after startup: {list(self.pages)}")
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -187,7 +200,7 @@ class NeonMainWindow(QMainWindow):
         return sidebar
 
     def _register_pages(self) -> None:
-        page_defs = {
+        self.page_factories = {
             "DashboardFrame": DashboardPage,
             "CustomerFrame": CustomerPage,
             "SiteFrame": SitePage,
@@ -210,10 +223,22 @@ class NeonMainWindow(QMainWindow):
             "WorkOrderFrame": WorkOrderFormPage,
             "PurchaseOrderFrame": PurchaseOrderFormPage,
         }
-        for page_key, page_class in page_defs.items():
+
+    def _get_or_create_page(self, page_key: str) -> QWidget:
+        page = self.pages.get(page_key)
+        if page is not None:
+            return page
+
+        page_class = self.page_factories[page_key]
+        print(f"[lazy-load] Instantiating page: {page_key}")
+        started_at = time.perf_counter()
+        try:
             page = page_class(self)
             self.pages[page_key] = page
             self.stack.addWidget(page)
+            return page
+        finally:
+            _perf_log("ui", f"create_page:{page_key}", started_at)
 
     def load_sub_menu(self, category_name: str) -> None:
         while self.action_layout.count():
@@ -242,14 +267,24 @@ class NeonMainWindow(QMainWindow):
             self.show_page(actions[0].page_key)
 
     def show_page(self, page_key: str) -> None:
-        page = self.pages[page_key]
-        refresh = getattr(page, "refresh_data", None)
-        if callable(refresh):
-            refresh()
-        self.stack.setCurrentWidget(page)
+        started_at = time.perf_counter()
+        try:
+            page = self._get_or_create_page(page_key)
+            refresh = getattr(page, "refresh_data", None)
+            if callable(refresh):
+                now = time.perf_counter()
+                last_refresh_at = self.page_last_refresh_at.get(page_key)
+                if last_refresh_at is None or (now - last_refresh_at) >= self.page_refresh_interval_s:
+                    refresh()
+                    self.page_last_refresh_at[page_key] = time.perf_counter()
+                else:
+                    _perf_log_skipped(page_key)
+            self.stack.setCurrentWidget(page)
+        finally:
+            _perf_log("ui", f"show_page:{page_key}", started_at)
 
     def open_tiber(self) -> None:
-        dashboard = self.pages["DashboardFrame"]
+        dashboard = self._get_or_create_page("DashboardFrame")
         launch_tiber(self, on_time_logged_callback=dashboard.refresh_data)
 
     def open_private_brain(self) -> None:

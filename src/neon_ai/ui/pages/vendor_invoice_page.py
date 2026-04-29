@@ -60,7 +60,13 @@ class VendorInvoicePage(QWidget):
 
         title = QLabel("Vendor Invoice Command")
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        layout.addWidget(title, 0, Qt.AlignmentFlag.AlignLeft)
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh_data)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(refresh_button)
+        layout.addLayout(header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)

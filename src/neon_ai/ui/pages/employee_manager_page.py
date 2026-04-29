@@ -47,7 +47,6 @@ class EmployeeManagerPage(QWidget):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
 
-        self.refresh_data()
         self._refresh_global_tasks()
 
     def _build_pipeline_panel(self) -> QGroupBox:
