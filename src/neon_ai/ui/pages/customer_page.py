@@ -20,12 +20,8 @@ from PySide6.QtWidgets import (
     QPushButton,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.automation import send_customer_address_verification_request
-from database.customers import (
+from neon_ai.database.automation import send_customer_address_verification_request
+from neon_ai.database.customers import (
     get_customer_by_id,
     get_customer_contacts,
     get_customer_pipeline,

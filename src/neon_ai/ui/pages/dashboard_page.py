@@ -13,12 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.estimates import get_dashboard_estimates
-from database.metrics import get_dashboard_metrics
+from neon_ai.database.estimates import get_dashboard_estimates
+from neon_ai.database.metrics import get_dashboard_metrics
 
 
 class SortableTableWidgetItem(QTableWidgetItem):

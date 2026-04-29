@@ -18,11 +18,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.customers import get_customers, get_sites, save_site, delete_site
+from neon_ai.database.customers import get_customers, get_sites, save_site, delete_site
 
 
 class SitePage(QWidget):

@@ -20,13 +20,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.employees import get_all_employees, save_employee
-from database.roles import add_standard_role, get_standard_roles
-from database.timesheets import add_standard_task, delete_standard_task, get_standard_tasks
+from neon_ai.database.employees import get_all_employees, save_employee
+from neon_ai.database.roles import add_standard_role, get_standard_roles
+from neon_ai.database.timesheets import add_standard_task, delete_standard_task, get_standard_tasks
 
 
 class EmployeeManagerPage(QWidget):

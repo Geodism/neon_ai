@@ -20,11 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.materials import (
+from neon_ai.database.materials import (
     get_carry_source_choices,
     get_material_by_id,
     get_material_pipeline,

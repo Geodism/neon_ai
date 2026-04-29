@@ -20,11 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.vendors import (
+from neon_ai.database.vendors import (
     get_vendor_by_id,
     get_vendor_contacts,
     get_vendor_overview,
