@@ -26,12 +26,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.employees import get_all_employees
-from database.timesheets import (
+from neon_ai.database.employees import get_all_employees
+from neon_ai.database.timesheets import (
     add_manual_time,
     get_employee_timesheet,
     get_open_workorder_choices,
@@ -538,7 +534,7 @@ class TimesheetManagerPage(QWidget):
             label = "Locked" if snapshot["is_locked"] else "Draft"
             path = self._export_timesheet_docx(snapshot, label=label)
 
-            from gateway import MY_EMAIL, send_to_user
+            from neon_ai.gateway import MY_EMAIL, send_to_user
 
             sent = send_to_user(
                 subject=f"Timesheet Review Needed - {employee.get('EmployeeName')} - Week of {snapshot['week_start']}",

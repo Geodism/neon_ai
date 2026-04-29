@@ -13,12 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.timer import get_employees, get_tasks, insert_time
-from database.timesheets import get_open_workorder_choices
+from neon_ai.database.timer import get_employees, get_tasks, insert_time
+from neon_ai.database.timesheets import get_open_workorder_choices
 
 
 class TimeEntryPage(QWidget):

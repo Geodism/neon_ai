@@ -21,12 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.connection import get_connection
-from database.invoices import get_accounts_receivable, get_invoice_detail, mark_invoice_sent
+from neon_ai.database.connection import get_connection
+from neon_ai.database.invoices import get_accounts_receivable, get_invoice_detail, mark_invoice_sent
 
 
 class InvoiceViewerPage(QWidget):
@@ -259,7 +255,7 @@ class InvoiceViewerPage(QWidget):
         if not self.current_inv_id:
             return
         try:
-            from gateway import send_to_user
+            from neon_ai.gateway import send_to_user
 
             detail = get_invoice_detail(self.current_inv_id)
             header = detail["header"] or {}

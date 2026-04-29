@@ -20,11 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.invoices import (
+from neon_ai.database.invoices import (
     get_invoice_detail,
     get_invoice_header_data,
     get_unbilled_labor,
@@ -34,7 +30,7 @@ from database.invoices import (
     mark_invoice_sent,
     save_invoice_draft,
 )
-from invoice_generator import generate_invoice_docx
+from neon_ai.invoice_generator import generate_invoice_docx
 
 
 def normalize_billing_mode(raw_value):
@@ -470,7 +466,7 @@ class InvoiceCreatorPage(QWidget):
             QMessageBox.warning(self, "Missing Invoice", "Export and lock the invoice before sending it.")
             return
         try:
-            from gateway import send_to_user
+            from neon_ai.gateway import send_to_user
 
             detail = get_invoice_detail(self.current_invoice_id)
             header = detail["header"]
