@@ -16,12 +16,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.customers import get_customers, get_sites
-from database.workorders import approve_work_order, get_next_workorder_id, insert_workorder
+from neon_ai.database.customers import get_customers, get_sites
+from neon_ai.database.workorders import approve_work_order, get_next_workorder_id, insert_workorder
 
 
 class WorkOrderFormPage(QWidget):

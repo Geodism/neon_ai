@@ -21,20 +21,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.automation import add_note_to_active_job
-from database.folders import get_target_folder
-from database.workorders import (
+from neon_ai.database.automation import add_note_to_active_job
+from neon_ai.database.folders import get_target_folder
+from neon_ai.database.workorders import (
     check_closure_requirements,
     close_work_order,
     get_dashboard_work_orders,
     get_work_order_telemetry,
     get_wo_export_data,
 )
-from wo_exporter import generate_workorder_docx
+from neon_ai.wo_exporter import generate_workorder_docx
 
 
 class WorkOrderViewerPage(QWidget):

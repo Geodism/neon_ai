@@ -14,13 +14,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.purchases import get_next_po_id, get_vendors, insert_purchase_order
-from database.timer import get_employees
-from database.workorders import get_open_workorders_dict
+from neon_ai.database.purchases import get_next_po_id, get_vendors, insert_purchase_order
+from neon_ai.database.timer import get_employees
+from neon_ai.database.workorders import get_open_workorders_dict
 
 
 class PurchaseOrderFormPage(QWidget):

@@ -19,11 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.bootstrap import ensure_legacy_import_paths
-
-ensure_legacy_import_paths()
-
-from database.purchases import (
+from neon_ai.database.purchases import (
     get_po_items_with_receiving,
     get_purchase_orders_for_pipeline,
     log_material_receipt_batch,
