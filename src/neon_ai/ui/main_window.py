@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from neon_ai.ui.dialogs.tiber_dialog import launch_tiber
 from neon_ai.ui.pages.customer_page import CustomerPage
 from neon_ai.ui.pages.dashboard_page import DashboardPage
+from neon_ai.ui.pages.document_control_page import DocumentControlPage
 from neon_ai.ui.pages.employee_manager_page import EmployeeManagerPage
 from neon_ai.ui.pages.estimate_doc_view_page import EstimateDocViewPage
 from neon_ai.ui.pages.estimate_entry_page import EstimateEntryPage
@@ -55,8 +56,9 @@ def _perf_log_skipped(page_key: str) -> None:
 
 
 class NeonMainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, container=None) -> None:
         super().__init__()
+        self.container = container
         self.setWindowTitle("Argon Operations Command")
         self.resize(1400, 850)
         self.setMinimumSize(1000, 700)
@@ -66,38 +68,41 @@ class NeonMainWindow(QMainWindow):
         self.page_last_refresh_at: dict[str, float] = {}
         self.page_refresh_interval_s = 30.0
         self.menu_structure: dict[str, list[MenuAction]] = {
-            "📈 METRICS": [
+            "ðŸ“ˆ METRICS": [
                 MenuAction("Company Dashboard", "DashboardFrame"),
                 MenuAction("Review Estimates", "EstimateViewerFrame"),
                 MenuAction("View POs", "POViewerFrame"),
             ],
-            "👥 STAKEHOLDERS": [
+            "ðŸ‘¥ STAKEHOLDERS": [
                 MenuAction("Add Customer", "CustomerFrame"),
                 MenuAction("Add Site", "SiteFrame"),
                 MenuAction("Add Vendor", "VendorFrame"),
             ],
-            "📋 ESTIMATING": [
+            "ðŸ“‹ ESTIMATING": [
                 MenuAction("New Estimate", "EstimateEntryForm"),
                 MenuAction("Review Pipeline", "EstimateViewerFrame"),
                 MenuAction("Final Doc View", "EstimateDocView"),
             ],
-            "📋 PROJECT TRACKING": [
+            "ðŸ“‹ PROJECT TRACKING": [
                 MenuAction("Review Workorders", "WorkOrderViewerFrame"),
             ],
-            "📦 MATERIALS": [
+            "ðŸ“¦ MATERIALS": [
                 MenuAction("Materials Catalog", "MaterialFrame"),
                 MenuAction("Review RFQs", "RFQViewerFrame"),
                 MenuAction("Receive Goods", "ReceivingViewerFrame"),
             ],
-            "🛠️ EMPLOYEES": [
+            "ðŸ› ï¸ EMPLOYEES": [
                 MenuAction("Manage People", "EmployeeManagerFrame"),
                 MenuAction("Review Timesheets", "TimesheetManagerFrame"),
             ],
-            "🧾 INVOICING": [
+            "ðŸ§¾ INVOICING": [
                 MenuAction("Create Invoice", "InvoiceCreatorFrame"),
                 MenuAction("A/R & Tracking", "InvoiceViewerFrame"),
             ],
-            "💸 PAYABLES": [
+            "DOCUMENTS": [
+                MenuAction("Template & Document Control", "Template & Document Control"),
+            ],
+            "ðŸ’¸ PAYABLES": [
                 MenuAction("Enter Supplier Bill", "VendorInvoiceFrame"),
             ],
         }
@@ -116,7 +121,7 @@ class NeonMainWindow(QMainWindow):
         layout.addWidget(self.stack, 1)
 
         self._register_pages()
-        self.load_sub_menu("📈 METRICS")
+        self.load_sub_menu("ðŸ“ˆ METRICS")
         print(f"[startup] Cached pages after startup: {list(self.pages)}")
 
     def _build_sidebar(self) -> QWidget:
@@ -138,12 +143,12 @@ class NeonMainWindow(QMainWindow):
         title.setObjectName("sidebarTitle")
         cat_layout.addWidget(title)
 
-        tiber_button = QPushButton("⏱️ Tiber")
+        tiber_button = QPushButton("â±ï¸ Tiber")
         tiber_button.setObjectName("toolButton")
         tiber_button.clicked.connect(self.open_tiber)
         cat_layout.addWidget(tiber_button)
 
-        brain_button = QPushButton("🧠 Private Brain")
+        brain_button = QPushButton("ðŸ§  Private Brain")
         brain_button.setObjectName("toolButton")
         brain_button.clicked.connect(self.open_private_brain)
         cat_layout.addWidget(brain_button)
@@ -215,6 +220,7 @@ class NeonMainWindow(QMainWindow):
             "TimesheetManagerFrame": TimesheetManagerPage,
             "InvoiceCreatorFrame": InvoiceCreatorPage,
             "InvoiceViewerFrame": InvoiceViewerPage,
+            "Template & Document Control": DocumentControlPage,
             "VendorFrame": VendorPage,
             "VendorInvoiceFrame": VendorInvoicePage,
             "TimeEntryFrame": TimeEntryPage,

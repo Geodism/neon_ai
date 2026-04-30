@@ -8,6 +8,7 @@ from datetime import datetime
 
 from PySide6.QtWidgets import QApplication
 
+from neon_ai.bootstrap import build_container
 from neon_ai.ui.main_window import NeonMainWindow
 from neon_ai.database.automation import (
     sweep_for_aging_unsent_estimates,
@@ -94,7 +95,8 @@ def main() -> int:
 
         main_window_started_at = time.perf_counter()
         try:
-            window = NeonMainWindow()
+            container = build_container()
+            window = NeonMainWindow(container=container)
         finally:
             _perf_log("startup", "main_window_init", main_window_started_at)
 
