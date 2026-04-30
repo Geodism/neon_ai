@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QPushButton, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QTabWidget, QVBoxLayout, QWidget
 
 from neon_ai.ui.pages.document_studio_page import DocumentStudioPage
 from neon_ai.ui.pages.generated_documents_page import GeneratedDocumentsPage
@@ -12,6 +12,8 @@ class DocumentControlPage(QWidget):
         super().__init__(main_window)
         self.main_window = main_window
         self.container = getattr(main_window, "container", None)
+        self._generated_history_dialog: QDialog | None = None
+        self._generated_history_page: GeneratedDocumentsPage | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -21,55 +23,77 @@ class DocumentControlPage(QWidget):
         heading.setStyleSheet("font-size: 24px; font-weight: 700;")
         layout.addWidget(heading)
 
-        intro = QLabel(
-            "Use this area to manage document templates, file path rules, and generated-document history."
+        subtitle = QLabel(
+            "Manage templates and file path rules in one place. Generated history remains "
+            "available as a secondary debug/audit view."
         )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color: #444;")
-        layout.addWidget(intro)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #555;")
+        layout.addWidget(subtitle)
 
-        self.container_status_label = QLabel("")
-        self.container_status_label.setStyleSheet("color: #444;")
-        layout.addWidget(self.container_status_label)
-
-        self.catalog_status_label = QLabel("")
-        self.catalog_status_label.setStyleSheet("color: #444;")
-        layout.addWidget(self.catalog_status_label)
-
-        self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self.refresh)
-        layout.addWidget(self.refresh_button)
+        utility_row = QHBoxLayout()
+        utility_row.addStretch(1)
+        self.open_generated_history_button = QPushButton("Open Generated History (Debug)")
+        self.open_generated_history_button.setToolTip(
+            "Generated history remains available for audit/debug use, but is no longer a primary workspace tab."
+        )
+        self.open_generated_history_button.clicked.connect(self.open_generated_history_dialog)
+        utility_row.addWidget(self.open_generated_history_button)
+        layout.addLayout(utility_row)
 
         self.tabs = QTabWidget()
         self.templates_page = DocumentStudioPage(main_window)
         self.path_settings_page = PathSettingsPage(main_window)
-        self.generated_documents_page = GeneratedDocumentsPage(main_window)
         self.tabs.addTab(self.templates_page, "Templates")
         self.tabs.addTab(self.path_settings_page, "File Paths")
-        self.tabs.addTab(self.generated_documents_page, "Generated History")
+        self.tabs.setCurrentWidget(self.path_settings_page)
         layout.addWidget(self.tabs, 1)
 
     def refresh(self) -> None:
         self.container = getattr(self.main_window, "container", None)
-        if self.container is None:
-            self.container_status_label.setText("Container: unavailable")
-            self.catalog_status_label.setText("Document catalog service: unavailable")
-        else:
-            self.container_status_label.setText("Container: available")
-            catalog_service = getattr(self.container, "document_catalog_service", None)
-            if catalog_service is None:
-                self.catalog_status_label.setText("Document catalog service: unavailable")
-            else:
-                self.catalog_status_label.setText("Document catalog service: available")
-
-        for page in (
-            self.templates_page,
-            self.path_settings_page,
-            self.generated_documents_page,
-        ):
+        for page in (self.templates_page, self.path_settings_page):
             refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                refresh()
+        if self._generated_history_page is not None:
+            refresh = getattr(self._generated_history_page, "refresh", None)
             if callable(refresh):
                 refresh()
 
     def refresh_data(self) -> None:
         self.refresh()
+
+    def open_generated_history_dialog(self) -> None:
+        if self._generated_history_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Generated History")
+            dialog.resize(1200, 800)
+            dialog_layout = QVBoxLayout(dialog)
+            helper = QLabel(
+                "Generated document history remains available for audit/debug review. "
+                "Primary day-to-day document control now focuses on Templates and File Paths."
+            )
+            helper.setWordWrap(True)
+            helper.setStyleSheet("color: #555;")
+            dialog_layout.addWidget(helper)
+
+            self._generated_history_page = GeneratedDocumentsPage(self.main_window)
+            dialog_layout.addWidget(self._generated_history_page, 1)
+
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            footer = QHBoxLayout()
+            footer.addStretch(1)
+            footer.addWidget(close_button)
+            dialog_layout.addLayout(footer)
+
+            self._generated_history_dialog = dialog
+
+        if self._generated_history_page is not None:
+            refresh = getattr(self._generated_history_page, "refresh", None)
+            if callable(refresh):
+                refresh()
+
+        self._generated_history_dialog.show()
+        self._generated_history_dialog.raise_()
+        self._generated_history_dialog.activateWindow()

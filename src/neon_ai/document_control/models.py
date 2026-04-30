@@ -64,6 +64,17 @@ class DocumentTemplateVersion:
 
 
 @dataclass(frozen=True)
+class DocumentTemplateDefault:
+    template_default_id: int | None
+    document_type_code: str
+    kind: DocumentTemplateKind
+    usage_context: str
+    template_id: int
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
+
+@dataclass(frozen=True)
 class DocumentPathRule:
     path_rule_id: int | None
     document_type_code: str
@@ -75,6 +86,7 @@ class DocumentPathRule:
     output_format: DocumentOutputFormat = DocumentOutputFormat.HTML
     rule_name: str = "Default"
     is_active: bool = False
+    create_folder_if_missing: bool = True
     notes: str | None = None
     created_at: datetime | None = None
     created_by: str | None = None

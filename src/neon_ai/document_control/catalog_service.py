@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .models import DocumentTemplateVersion, DocumentTypeDefinition
+from .models import DocumentTemplateDefault, DocumentTemplateKind, DocumentTemplateVersion, DocumentTypeDefinition
 from .repository import DocumentControlRepository
 from .token_engine import extract_tokens
 
@@ -27,6 +27,44 @@ class DocumentCatalogService:
 
     def activate_template(self, template_id: int) -> None:
         self._repository.activate_template(template_id)
+
+    def list_template_defaults(
+        self,
+        document_type_code: str | None = None,
+        usage_context: str | None = None,
+    ) -> list[DocumentTemplateDefault]:
+        return self._repository.list_template_defaults(
+            document_type_code=document_type_code,
+            usage_context=usage_context,
+        )
+
+    def get_template_default(
+        self,
+        document_type_code: str,
+        template_kind: DocumentTemplateKind | str,
+        usage_context: str,
+    ) -> DocumentTemplateDefault | None:
+        return self._repository.get_template_default(
+            document_type_code=document_type_code,
+            template_kind=template_kind,
+            usage_context=usage_context,
+        )
+
+    def set_template_default(
+        self,
+        document_type_code: str,
+        template_kind: DocumentTemplateKind | str,
+        usage_context: str,
+        template_id: int,
+        updated_by: str = "UI",
+    ) -> DocumentTemplateDefault:
+        return self._repository.set_template_default(
+            document_type_code=document_type_code,
+            template_kind=template_kind,
+            usage_context=usage_context,
+            template_id=template_id,
+            updated_by=updated_by,
+        )
 
     def build_sample_context(self, document_type_code: str, seed: dict[str, object] | None = None) -> dict[str, object]:
         context = {

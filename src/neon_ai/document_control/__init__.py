@@ -5,6 +5,7 @@ from .generated_document_service import GeneratedDocumentService
 from .models import (
     DocumentOutputFormat,
     DocumentPathRule,
+    DocumentTemplateDefault,
     DocumentTemplateKind,
     DocumentTemplateSummary,
     DocumentTemplateVersion,
@@ -22,6 +23,7 @@ __all__ = [
     "DocumentOutputFormat",
     "DocumentPathRule",
     "DocumentPathRuleService",
+    "DocumentTemplateDefault",
     "DocumentRenderService",
     "DocumentTemplateKind",
     "DocumentTemplateSummary",

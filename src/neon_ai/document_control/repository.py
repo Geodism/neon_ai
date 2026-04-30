@@ -11,6 +11,7 @@ from neon_ai.database.connection import get_connection
 from .models import (
     DocumentOutputFormat,
     DocumentPathRule,
+    DocumentTemplateDefault,
     DocumentTemplateKind,
     DocumentTemplateSummary,
     DocumentTemplateVersion,
@@ -299,6 +300,160 @@ class DocumentControlRepository:
                 raise RuntimeError("Document control schema is not available. Apply database_schema.sql first.") from exc
             raise
 
+    def list_template_defaults(
+        self,
+        document_type_code: str | None = None,
+        usage_context: str | None = None,
+    ) -> list[DocumentTemplateDefault]:
+        query = """
+            SELECT
+                template_default_id,
+                document_type_code,
+                template_kind,
+                usage_context,
+                template_id,
+                updated_at,
+                updated_by
+            FROM public.app_document_template_default
+            WHERE (%s IS NULL OR document_type_code = %s)
+              AND (%s IS NULL OR usage_context = %s)
+            ORDER BY document_type_code, usage_context, template_kind
+        """
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        query,
+                        (document_type_code, document_type_code, usage_context, usage_context),
+                    )
+                    return [self._map_template_default(row) for row in cur.fetchall()]
+        except psycopg2.Error as exc:
+            if self._is_missing_schema_error(exc):
+                return []
+            raise
+
+    def get_template_default(
+        self,
+        document_type_code: str,
+        template_kind: DocumentTemplateKind | str,
+        usage_context: str,
+    ) -> DocumentTemplateDefault | None:
+        kind_value = (
+            template_kind.value if isinstance(template_kind, DocumentTemplateKind) else str(template_kind)
+        )
+        query = """
+            SELECT
+                template_default_id,
+                document_type_code,
+                template_kind,
+                usage_context,
+                template_id,
+                updated_at,
+                updated_by
+            FROM public.app_document_template_default
+            WHERE document_type_code = %s
+              AND template_kind = %s
+              AND usage_context = %s
+            LIMIT 1
+        """
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (document_type_code, kind_value, usage_context))
+                    row = cur.fetchone()
+                    return self._map_template_default(row) if row else None
+        except psycopg2.Error as exc:
+            if self._is_missing_schema_error(exc):
+                return None
+            raise
+
+    def set_template_default(
+        self,
+        document_type_code: str,
+        template_kind: DocumentTemplateKind | str,
+        usage_context: str,
+        template_id: int,
+        updated_by: str = "UI",
+    ) -> DocumentTemplateDefault:
+        kind_value = (
+            template_kind.value if isinstance(template_kind, DocumentTemplateKind) else str(template_kind)
+        )
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT document_type_code, template_kind
+                        FROM public.app_document_template
+                        WHERE template_id = %s
+                        """,
+                        (template_id,),
+                    )
+                    template_row = cur.fetchone()
+                    if not template_row:
+                        raise ValueError(f"Template #{template_id} was not found.")
+
+                    actual_document_type = str(template_row["document_type_code"])
+                    actual_kind = str(template_row["template_kind"])
+                    if actual_document_type != document_type_code:
+                        raise ValueError(
+                            f"Template #{template_id} belongs to {actual_document_type}, not {document_type_code}."
+                        )
+                    if actual_kind != kind_value:
+                        raise ValueError(
+                            f"Template #{template_id} has kind {actual_kind}, not {kind_value}."
+                        )
+
+                    cur.execute(
+                        """
+                        INSERT INTO public.app_document_template_default (
+                            document_type_code,
+                            template_kind,
+                            usage_context,
+                            template_id,
+                            updated_at,
+                            updated_by
+                        )
+                        VALUES (%s, %s, %s, %s, now(), %s)
+                        ON CONFLICT (document_type_code, template_kind, usage_context)
+                        DO UPDATE SET
+                            template_id = EXCLUDED.template_id,
+                            updated_at = now(),
+                            updated_by = EXCLUDED.updated_by
+                        RETURNING
+                            template_default_id,
+                            document_type_code,
+                            template_kind,
+                            usage_context,
+                            template_id,
+                            updated_at,
+                            updated_by
+                        """,
+                        (
+                            document_type_code,
+                            kind_value,
+                            usage_context,
+                            template_id,
+                            updated_by,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    if row:
+                        return self._map_template_default(row)
+                    return DocumentTemplateDefault(
+                        template_default_id=None,
+                        document_type_code=document_type_code,
+                        kind=DocumentTemplateKind(kind_value),
+                        usage_context=usage_context,
+                        template_id=template_id,
+                        updated_by=updated_by,
+                    )
+        except psycopg2.Error as exc:
+            if self._is_missing_schema_error(exc):
+                raise RuntimeError("Document control schema is not available. Apply database_schema.sql first.") from exc
+            raise
+
     def list_path_rules(self, document_type_code: str | None = None) -> list[DocumentPathRule]:
         query = """
             SELECT
@@ -312,6 +467,7 @@ class DocumentControlRepository:
                 output_format,
                 rule_name,
                 is_active,
+                create_folder_if_missing,
                 notes,
                 created_at,
                 created_by
@@ -342,6 +498,7 @@ class DocumentControlRepository:
                 output_format,
                 rule_name,
                 is_active,
+                create_folder_if_missing,
                 notes,
                 created_at,
                 created_by
@@ -379,10 +536,11 @@ class DocumentControlRepository:
                                 output_format,
                                 rule_name,
                                 is_active,
+                                create_folder_if_missing,
                                 notes,
                                 created_by
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING path_rule_id
                             """,
                             (
@@ -395,6 +553,7 @@ class DocumentControlRepository:
                                 rule.output_format.value,
                                 rule.rule_name,
                                 rule.is_active,
+                                rule.create_folder_if_missing,
                                 rule.notes,
                                 rule.created_by,
                             ),
@@ -414,6 +573,7 @@ class DocumentControlRepository:
                                 output_format = %s,
                                 rule_name = %s,
                                 is_active = %s,
+                                create_folder_if_missing = %s,
                                 notes = %s,
                                 created_by = COALESCE(%s, created_by)
                             WHERE path_rule_id = %s
@@ -428,6 +588,7 @@ class DocumentControlRepository:
                                 rule.output_format.value,
                                 rule.rule_name,
                                 rule.is_active,
+                                rule.create_folder_if_missing,
                                 rule.notes,
                                 rule.created_by,
                                 path_rule_id,
@@ -449,6 +610,7 @@ class DocumentControlRepository:
                         output_format=rule.output_format,
                         rule_name=rule.rule_name,
                         is_active=rule.is_active,
+                        create_folder_if_missing=rule.create_folder_if_missing,
                         notes=rule.notes,
                         created_by=rule.created_by,
                     )
@@ -639,6 +801,7 @@ class DocumentControlRepository:
                 output_format,
                 rule_name,
                 is_active,
+                create_folder_if_missing,
                 notes,
                 created_at,
                 created_by
@@ -736,9 +899,23 @@ class DocumentControlRepository:
             output_format=DocumentOutputFormat(str(row.get("output_format") or "html")),
             rule_name=str(row.get("rule_name") or "Default"),
             is_active=bool(row.get("is_active")),
+            create_folder_if_missing=bool(row.get("create_folder_if_missing", True)),
             notes=row.get("notes"),
             created_at=row.get("created_at"),
             created_by=row.get("created_by"),
+        )
+
+    def _map_template_default(self, row: dict) -> DocumentTemplateDefault:
+        return DocumentTemplateDefault(
+            template_default_id=(
+                int(row["template_default_id"]) if row.get("template_default_id") is not None else None
+            ),
+            document_type_code=str(row["document_type_code"]),
+            kind=DocumentTemplateKind(str(row["template_kind"])),
+            usage_context=str(row["usage_context"]),
+            template_id=int(row["template_id"]),
+            updated_at=row.get("updated_at"),
+            updated_by=row.get("updated_by"),
         )
 
     def _map_generated_document(self, row: dict) -> GeneratedDocumentRecord:

@@ -82,9 +82,25 @@ class DocumentPathRuleService:
             target_path = root_path / target_path
 
         if create_folders:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_target_folder(rule, target_path.parent)
 
         return target_path
+
+    def _ensure_target_folder(self, rule: DocumentPathRule, target_folder: Path) -> None:
+        if rule.create_folder_if_missing:
+            target_folder.mkdir(parents=True, exist_ok=True)
+            return
+
+        if target_folder.exists():
+            return
+
+        rule_name = (rule.rule_name or "Unnamed Rule").strip() or "Unnamed Rule"
+        raise ValueError(
+            "Target folder does not exist and this path rule is configured not to create it automatically.\n\n"
+            f"Rule: {rule_name}\n"
+            f"Document Type: {rule.document_type_code}\n"
+            f"Target Folder: {target_folder}"
+        )
 
     def _resolve_base_directory(
         self,
