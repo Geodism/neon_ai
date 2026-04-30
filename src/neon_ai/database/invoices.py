@@ -174,6 +174,10 @@ def _fetch_latest_invoice(wo_id: int, statuses=None):
         conn.close()
 
 
+def get_latest_invoice_for_workorder(wo_id: int, statuses=None):
+    return _fetch_latest_invoice(wo_id, statuses=statuses)
+
+
 def get_invoice_header_data(wo_id: int):
     ensure_invoice_schema()
     conn = get_connection()
@@ -208,9 +212,25 @@ def get_invoice_header_data(wo_id: int):
             JOIN "Site" s ON wo."SiteID" = s."SiteID"
             JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
             LEFT JOIN "Estimate" e ON e."EstimateID" = wo."SourceEstimateID"
-            LEFT JOIN "Invoice" inv
-              ON inv."WorkOrderID" = wo."WorkOrderID"
-             AND inv."InvoiceStatus" = 'Draft'
+            LEFT JOIN (
+                SELECT DISTINCT ON ("WorkOrderID")
+                    "WorkOrderID",
+                    "CustomerInvoiceId",
+                    "InvoiceStatus",
+                    "CustomerInvoiceAmount",
+                    "LaborPercent",
+                    "MaterialPercent",
+                    "LaborMilestoneNote",
+                    "MaterialMilestoneNote",
+                    "ScopeOfWork",
+                    "BillingMode",
+                    "CustomerInvoiceDate",
+                    "CustomerInvoiceDocPath",
+                    "CustomerInvoiceSentAt"
+                FROM "Invoice"
+                WHERE COALESCE("InvoiceStatus", '') != 'Retired'
+                ORDER BY "WorkOrderID", "CustomerInvoiceId" DESC
+            ) inv ON inv."WorkOrderID" = wo."WorkOrderID"
             WHERE wo."WorkOrderID" = %s
             ''',
             (wo_id,),
@@ -539,6 +559,48 @@ def mark_invoice_sent(invoice_id: int, doc_path: str = None):
             (doc_path, invoice_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_invoice_paid(invoice_id: int, manual_override: bool = False):
+    ensure_invoice_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                "CustomerInvoiceId",
+                COALESCE("InvoiceStatus", '') AS "InvoiceStatus",
+                "CustomerInvoiceDocPath",
+                "CustomerInvoiceSentAt"
+            FROM "Invoice"
+            WHERE "CustomerInvoiceId" = %s
+            ''',
+            (invoice_id,),
+        )
+        invoice = cur.fetchone()
+        if not invoice:
+            raise ValueError(f"Invoice #{invoice_id} could not be found.")
+        if invoice["InvoiceStatus"] == "Paid":
+            return invoice
+        if not manual_override:
+            if invoice["InvoiceStatus"] != "Sent" or not invoice.get("CustomerInvoiceSentAt") or not invoice.get("CustomerInvoiceDocPath"):
+                raise ValueError("Invoice cannot be marked paid until it has been sent.")
+        cur.execute(
+            '''
+            UPDATE "Invoice"
+            SET "InvoiceStatus" = 'Paid',
+                "InvDatePaid" = CURRENT_DATE::text
+            WHERE "CustomerInvoiceId" = %s
+            RETURNING *
+            ''',
+            (invoice_id,),
+        )
+        updated = cur.fetchone()
+        conn.commit()
+        return updated
     finally:
         conn.close()
 

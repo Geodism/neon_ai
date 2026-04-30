@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from neon_ai.database.connection import get_connection
-from neon_ai.database.invoices import get_accounts_receivable, get_invoice_detail, mark_invoice_sent
+from neon_ai.database.invoices import get_accounts_receivable, get_invoice_detail, mark_invoice_paid, mark_invoice_sent
 
 
 class InvoiceViewerPage(QWidget):
@@ -204,18 +204,12 @@ class InvoiceViewerPage(QWidget):
         confirmed = QMessageBox.question(self, "Confirm", f"Mark Invoice #{self.current_inv_id} as Paid?")
         if confirmed != QMessageBox.StandardButton.Yes:
             return
-        conn = get_connection()
-        cur = conn.cursor()
         try:
-            cur.execute(
-                'UPDATE "Invoice" SET "InvoiceStatus" = \'Paid\', "InvDatePaid" = CURRENT_DATE::text WHERE "CustomerInvoiceId" = %s',
-                (self.current_inv_id,),
-            )
-            conn.commit()
+            mark_invoice_paid(self.current_inv_id)
             QMessageBox.information(self, "Success", "Invoice marked as paid.")
             self.refresh_data()
-        finally:
-            conn.close()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Payment Blocked", str(exc))
 
     def _on_add_note(self) -> None:
         if not self.current_inv_id:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
 from neon_ai.database.invoices import (
     get_invoice_detail,
     get_invoice_header_data,
+    get_latest_invoice_for_workorder,
     get_unbilled_labor,
     get_unbilled_materials,
     get_unbilled_workorders,
@@ -433,8 +436,10 @@ class InvoiceCreatorPage(QWidget):
             header = get_invoice_header_data(self.current_wo_id)
             self.current_doc_path = generate_invoice_docx(header, self._current_mode())
             self.current_invoice_id = lock_and_export_invoice(self.current_wo_id, doc_path=self.current_doc_path)
+            detail = get_invoice_detail(self.current_invoice_id) or {}
+            invoice_row = detail.get("invoice") or {}
+            self.current_doc_path = invoice_row.get("CustomerInvoiceDocPath") or self.current_doc_path
             QMessageBox.information(self, "Export Success", f"Invoice saved to:\n{self.current_doc_path}")
-            self.refresh_data()
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
 
@@ -462,6 +467,11 @@ class InvoiceCreatorPage(QWidget):
             QMessageBox.critical(self, "Review Error", str(exc))
 
     def on_send_invoice(self) -> None:
+        if not self.current_invoice_id and self.current_wo_id:
+            latest = get_latest_invoice_for_workorder(self.current_wo_id)
+            if latest:
+                self.current_invoice_id = latest.get("CustomerInvoiceId")
+                self.current_doc_path = latest.get("CustomerInvoiceDocPath") or self.current_doc_path
         if not self.current_invoice_id:
             QMessageBox.warning(self, "Missing Invoice", "Export and lock the invoice before sending it.")
             return
@@ -469,8 +479,11 @@ class InvoiceCreatorPage(QWidget):
             from neon_ai.gateway import send_to_user
 
             detail = get_invoice_detail(self.current_invoice_id)
+            if not detail:
+                raise ValueError("This invoice could not be reloaded after export.")
             header = detail["header"]
-            doc_path = self.current_doc_path or header.get("CustomerInvoiceDocPath")
+            invoice_row = detail["invoice"] or {}
+            doc_path = self.current_doc_path or invoice_row.get("CustomerInvoiceDocPath") or header.get("CustomerInvoiceDocPath")
             recipient = header.get("CustomerEmail")
             if not recipient:
                 raise ValueError(
@@ -478,6 +491,8 @@ class InvoiceCreatorPage(QWidget):
                 )
             if not doc_path:
                 raise ValueError("Export the invoice document before sending it.")
+            if not os.path.exists(doc_path):
+                raise ValueError(f"The exported invoice document could not be found:\n{doc_path}")
             sent = send_to_user(
                 subject=f"Invoice #{self.current_invoice_id} - Work Order #{self.current_wo_id}",
                 content=(
@@ -491,6 +506,7 @@ class InvoiceCreatorPage(QWidget):
             if not sent:
                 raise RuntimeError("The email gateway did not confirm the send.")
             mark_invoice_sent(self.current_invoice_id, doc_path=doc_path)
+            self.current_doc_path = doc_path
             QMessageBox.information(self, "Invoice Sent", f"Invoice #{self.current_invoice_id} sent to {recipient}.")
             self.refresh_data()
         except Exception as exc:
