@@ -9,7 +9,6 @@ from datetime import datetime
 from PySide6.QtWidgets import QApplication
 
 from neon_ai.ui.main_window import NeonMainWindow
-from neon_ai.gateway import check_for_instructions
 from neon_ai.database.automation import (
     sweep_for_aging_unsent_estimates,
     sweep_for_completed_rfq_estimates,
@@ -34,6 +33,8 @@ def _perf_log(area: str, name: str, started_at: float) -> None:
 
 def run_gateway_loop() -> None:
     """Preserve the legacy background loop behavior from app/main.py."""
+    from neon_ai.gateway import check_for_instructions
+
     print("\n" + "=" * 40)
     print("\U0001F680 ARGON GATEWAY: Multi-Tasking Active")
     print("=" * 40)

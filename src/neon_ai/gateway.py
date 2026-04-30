@@ -15,7 +15,6 @@ from neon_ai.config import load_neon_env
 load_neon_env()
 
 # Core Imports
-from neon_ai.automation.local_brain import ArgonLocalAI
 from neon_ai.database.rfq import find_matching_rfq_for_email, process_inbound_vendor_rfq_email
 from neon_ai.database.rfq import extract_text_from_attachment
 from neon_ai.database.purchases import find_matching_po_for_email, process_inbound_vendor_po_email
@@ -53,13 +52,24 @@ from neon_ai.database.automation import (
     log_estimate_verification,
 )
 
-# 1. Initialize the AI once so it stays in memory
-public_router = ArgonLocalAI()
-
 # 2. Load Environment Variables
 EMAIL_ADDR = os.getenv("AGENT_EMAIL")
 EMAIL_PASS = os.getenv("AGENT_APP_PASSWORD")
 MY_EMAIL = os.getenv("PERSONAL_EMAIL")
+public_router = None
+
+NON_WORKFLOW_EMAIL_INDICATORS = (
+    "notifications@",
+    "no-reply@",
+    "noreply@",
+    "newsletter",
+    "marketing",
+    "unsubscribe",
+    "account.brilliant.org",
+    "brilliant",
+    "promotional",
+    "learning subscription",
+)
 
 
 def extract_latest_reply_text(email_body: str) -> str:
@@ -81,6 +91,27 @@ def extract_latest_reply_text(email_body: str) -> str:
             break
 
     return text
+
+
+def should_skip_non_workflow_email(sender_email, email_subject, email_body, header_text, matching_rfq_id=None):
+    """Skip obvious bulk/promotional mail before AI classification, but never skip matched RFQ replies."""
+    if matching_rfq_id:
+        return False
+
+    combined_text = "\n".join(
+        str(value or "")
+        for value in (sender_email, email_subject, email_body, header_text)
+    ).lower()
+    return any(indicator in combined_text for indicator in NON_WORKFLOW_EMAIL_INDICATORS)
+
+
+def get_public_router():
+    global public_router
+    if public_router is None:
+        from neon_ai.automation.local_brain import ArgonLocalAI
+
+        public_router = ArgonLocalAI()
+    return public_router
 
 def save_incoming_attachment(part):
     filename = part.get_filename()
@@ -197,7 +228,7 @@ def handle_owner_classification_feedback(sender_email, email_subject, email_body
         original_sender = pending.get("sender_email") or ""
         header_guess = original_sender.split("@")[0].replace(".", " ").title() if "@" in original_sender else "Customer"
         context_for_ai = f"Sender Name from Header: {header_guess}\n\nEmail Content:\n{pending.get('body') or ''}"
-        lead_packet = public_router.extract_lead_data(context_for_ai) or {}
+        lead_packet = get_public_router().extract_lead_data(context_for_ai) or {}
         lead_name = lead_packet.get("CustomerName")
         if not lead_name or str(lead_name).lower() in {"unknown", "null", "none"}:
             lead_name = header_guess
@@ -304,7 +335,7 @@ def try_backfill_customer_from_inbox(sender_email, customer_id, header_name=None
     if header_name:
         prompt_context = f"Header name: {header_name}\n\n{prompt_context}"
 
-    profile = public_router.extract_customer_profile(prompt_context)
+    profile = get_public_router().extract_customer_profile(prompt_context)
     if not profile:
         return {"updated_fields": [], "profile": None}
 
@@ -321,7 +352,7 @@ def process_customer_verification_reply(customer_id, email_subject, email_body):
     before_snapshot = get_estimate_verification_snapshot(estimate_id) if estimate_id else None
 
     latest_reply_text = extract_latest_reply_text(email_body)
-    profile = public_router.extract_customer_site_profile(
+    profile = get_public_router().extract_customer_site_profile(
         f"Subject: {email_subject}\n\nNewest Reply:\n{latest_reply_text or email_body}"
     )
     if not profile:
@@ -394,6 +425,7 @@ def check_for_instructions():
 
         raw_sender = str(msg.get("From"))
         email_subject = str(msg.get("Subject", ""))
+        header_text = "\n".join(f"{key}: {value}" for key, value in msg.items())
 
         if "<" in raw_sender:
             header_name = raw_sender.split("<")[0].strip().replace('"', '')
@@ -574,11 +606,21 @@ def check_for_instructions():
             else:
                 category = "JobUpdate"
         else:
+            if should_skip_non_workflow_email(
+                raw_sender_email,
+                email_subject,
+                email_body,
+                header_text,
+                matching_rfq_id=matching_rfq_id,
+            ):
+                print(f"[GATEWAY] Skipping non-workflow email from {raw_sender_email}: {email_subject}")
+                mail.store(latest_id, '+FLAGS', '\\Seen')
+                return "SkippedNonWorkflow"
             print("Handing off to Argon-Public for classification...")
             # --- THE FIX: Give the Classifier the Subject Line! ---
             full_classification_context = f"Subject: {email_subject}\n\nBody: {email_body}"
             corrected_examples = get_similar_feedback_examples(email_subject, email_body)
-            category = public_router.classify_inbound_email(full_classification_context, corrected_examples=corrected_examples)
+            category = get_public_router().classify_inbound_email(full_classification_context, corrected_examples=corrected_examples)
 
         if verification_result and (verification_result.get("customer_updated") or verification_result.get("site_updated")):
             if category in ("JobUpdate", "CustomerSchedulingContext", "Error") or not category:
@@ -588,7 +630,7 @@ def check_for_instructions():
             print(f"Action: New Lead Detected. Extracting payload...")
             
             context_for_ai = f"Sender Name from Header: {header_name}\n\nEmail Content:\n{email_body}"
-            lead_packet = public_router.extract_lead_data(context_for_ai)
+            lead_packet = get_public_router().extract_lead_data(context_for_ai)
             
             if not lead_packet: lead_packet = {}
 

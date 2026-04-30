@@ -6,6 +6,8 @@ import re
 from neon_ai.database.automation import get_project_memory, add_note_to_active_job, send_smart_discovery
 from neon_ai.database.read_model import build_chat_context, build_direct_answer, get_debug_summary
 
+_brain_instance = None
+
 class ArgonLocalAI:
     def __init__(self, workflow_json_path="ArgonLeadToCash.json"):
         try:
@@ -181,5 +183,8 @@ class ArgonLocalAI:
         except Exception:
             return None
 
-# --- EXPOSE GLOBAL INSTANCE FOR THE UI TO IMPORT ---
-brain_instance = ArgonLocalAI()
+def get_brain_instance():
+    global _brain_instance
+    if _brain_instance is None:
+        _brain_instance = ArgonLocalAI()
+    return _brain_instance

@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neon_ai.ui.dialogs.private_brain_dialog import PrivateBrainDialog
 from neon_ai.ui.dialogs.tiber_dialog import launch_tiber
 from neon_ai.ui.pages.customer_page import CustomerPage
 from neon_ai.ui.pages.dashboard_page import DashboardPage
@@ -288,5 +287,7 @@ class NeonMainWindow(QMainWindow):
         launch_tiber(self, on_time_logged_callback=dashboard.refresh_data)
 
     def open_private_brain(self) -> None:
+        from neon_ai.ui.dialogs.private_brain_dialog import PrivateBrainDialog
+
         dialog = PrivateBrainDialog(self)
         dialog.exec()
