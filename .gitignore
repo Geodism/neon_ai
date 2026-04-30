@@ -5,6 +5,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+logs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
+
+src/neon_ai/rfq_dispatch_log.json
+src/neon_ai/classification_feedback.json
+src/neon_ai/customer_invoice_memory.json
+src/neon_ai/po_dispatch_log.json
+src/neon_ai/vendor_invoice_memory.json
+
+audit_artifacts/
