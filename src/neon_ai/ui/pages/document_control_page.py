@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QPushButton, QPlainTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QPushButton, QTabWidget, QVBoxLayout, QWidget
+
+from neon_ai.ui.pages.document_studio_page import DocumentStudioPage
+from neon_ai.ui.pages.generated_documents_page import GeneratedDocumentsPage
+from neon_ai.ui.pages.path_settings_page import PathSettingsPage
 
 
 class DocumentControlPage(QWidget):
@@ -17,6 +21,13 @@ class DocumentControlPage(QWidget):
         heading.setStyleSheet("font-size: 24px; font-weight: 700;")
         layout.addWidget(heading)
 
+        intro = QLabel(
+            "Use this area to manage document templates, file path rules, and generated-document history."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #444;")
+        layout.addWidget(intro)
+
         self.container_status_label = QLabel("")
         self.container_status_label.setStyleSheet("color: #444;")
         layout.addWidget(self.container_status_label)
@@ -29,47 +40,36 @@ class DocumentControlPage(QWidget):
         self.refresh_button.clicked.connect(self.refresh)
         layout.addWidget(self.refresh_button)
 
-        self.token_help_text = QPlainTextEdit()
-        self.token_help_text.setReadOnly(True)
-        layout.addWidget(self.token_help_text, 1)
+        self.tabs = QTabWidget()
+        self.templates_page = DocumentStudioPage(main_window)
+        self.path_settings_page = PathSettingsPage(main_window)
+        self.generated_documents_page = GeneratedDocumentsPage(main_window)
+        self.tabs.addTab(self.templates_page, "Templates")
+        self.tabs.addTab(self.path_settings_page, "File Paths")
+        self.tabs.addTab(self.generated_documents_page, "Generated History")
+        layout.addWidget(self.tabs, 1)
 
     def refresh(self) -> None:
         self.container = getattr(self.main_window, "container", None)
         if self.container is None:
             self.container_status_label.setText("Container: unavailable")
             self.catalog_status_label.setText("Document catalog service: unavailable")
-            self.token_help_text.setPlainText(
-                "Template & Document Control is not wired to an app container yet."
-            )
-            return
+        else:
+            self.container_status_label.setText("Container: available")
+            catalog_service = getattr(self.container, "document_catalog_service", None)
+            if catalog_service is None:
+                self.catalog_status_label.setText("Document catalog service: unavailable")
+            else:
+                self.catalog_status_label.setText("Document catalog service: available")
 
-        self.container_status_label.setText("Container: available")
-        catalog_service = getattr(self.container, "document_catalog_service", None)
-        if catalog_service is None:
-            self.catalog_status_label.setText("Document catalog service: unavailable")
-            self.token_help_text.setPlainText(
-                "The app container is available, but document_catalog_service is missing."
-            )
-            return
-
-        self.catalog_status_label.setText("Document catalog service: available")
-        try:
-            token_help = catalog_service.get_token_help()
-            if not token_help:
-                self.token_help_text.setPlainText("No token help is available yet.")
-                return
-
-            lines = ["Available Tokens", ""]
-            for token_name, description in sorted(token_help.items()):
-                lines.append(token_name)
-                lines.append(f"  {description}")
-                lines.append("")
-            self.token_help_text.setPlainText("\n".join(lines).strip())
-        except Exception as exc:
-            self.catalog_status_label.setText("Document catalog service: error")
-            self.token_help_text.setPlainText(
-                f"Could not load token help right now.\n\nDetails: {exc}"
-            )
+        for page in (
+            self.templates_page,
+            self.path_settings_page,
+            self.generated_documents_page,
+        ):
+            refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                refresh()
 
     def refresh_data(self) -> None:
         self.refresh()
