@@ -434,4 +434,161 @@ ALTER TABLE public."PurchaseOrderReceiptItem"
     ADD CONSTRAINT "PurchaseOrderReceiptItem_POItemID_fkey"
     FOREIGN KEY ("POItemID") REFERENCES public."PurchaseOrderItem"("POItemID");
 
+CREATE TABLE IF NOT EXISTS public.app_document_type (
+    document_type_id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    document_type_code text NOT NULL,
+    display_name text NOT NULL,
+    description text,
+    default_output_format text NOT NULL DEFAULT 'html',
+    is_active boolean NOT NULL DEFAULT true,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT app_document_type_pkey PRIMARY KEY (document_type_id),
+    CONSTRAINT app_document_type_code_key UNIQUE (document_type_code)
+);
+
+CREATE TABLE IF NOT EXISTS public.app_document_template (
+    template_id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    document_type_code text NOT NULL,
+    template_kind text NOT NULL,
+    template_name text NOT NULL,
+    content_format text NOT NULL DEFAULT 'html',
+    current_version_number integer NOT NULL DEFAULT 0,
+    notes text,
+    is_active boolean NOT NULL DEFAULT false,
+    active_version_id bigint,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT app_document_template_pkey PRIMARY KEY (template_id),
+    CONSTRAINT app_document_template_type_fkey
+        FOREIGN KEY (document_type_code) REFERENCES public.app_document_type(document_type_code)
+);
+
+CREATE TABLE IF NOT EXISTS public.app_document_template_version (
+    template_version_id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    template_id bigint NOT NULL,
+    version_number integer NOT NULL,
+    subject_line text,
+    body_content text NOT NULL DEFAULT '',
+    content_format text NOT NULL DEFAULT 'html',
+    output_format text NOT NULL DEFAULT 'html',
+    token_schema jsonb NOT NULL DEFAULT '[]'::jsonb,
+    change_summary text,
+    notes text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    created_by text,
+    CONSTRAINT app_document_template_version_pkey PRIMARY KEY (template_version_id),
+    CONSTRAINT app_document_template_version_template_fkey
+        FOREIGN KEY (template_id) REFERENCES public.app_document_template(template_id) ON DELETE CASCADE,
+    CONSTRAINT app_document_template_version_number_key UNIQUE (template_id, version_number)
+);
+
+ALTER TABLE public.app_document_template
+    ADD COLUMN IF NOT EXISTS content_format text NOT NULL DEFAULT 'html';
+
+ALTER TABLE public.app_document_template
+    ADD COLUMN IF NOT EXISTS current_version_number integer NOT NULL DEFAULT 0;
+
+ALTER TABLE public.app_document_template
+    ADD COLUMN IF NOT EXISTS notes text;
+
+ALTER TABLE public.app_document_template_version
+    ADD COLUMN IF NOT EXISTS subject_line text;
+
+ALTER TABLE public.app_document_template_version
+    ADD COLUMN IF NOT EXISTS content_format text NOT NULL DEFAULT 'html';
+
+ALTER TABLE public.app_document_template_version
+    ADD COLUMN IF NOT EXISTS token_schema jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE public.app_document_template_version
+    ADD COLUMN IF NOT EXISTS change_summary text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'app_document_template_active_version_fkey'
+    ) THEN
+        ALTER TABLE public.app_document_template
+            ADD CONSTRAINT app_document_template_active_version_fkey
+            FOREIGN KEY (active_version_id) REFERENCES public.app_document_template_version(template_version_id);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'app_document_template_identity_key'
+    ) THEN
+        ALTER TABLE public.app_document_template
+            ADD CONSTRAINT app_document_template_identity_key
+            UNIQUE (document_type_code, template_kind, template_name);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.app_document_path_rule (
+    path_rule_id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    document_type_code text NOT NULL,
+    local_root text,
+    fallback_root text,
+    relative_pattern text NOT NULL,
+    filename_pattern text NOT NULL,
+    storage_bucket text NOT NULL DEFAULT '',
+    output_format text NOT NULL DEFAULT 'html',
+    rule_name text NOT NULL DEFAULT 'Default',
+    is_active boolean NOT NULL DEFAULT false,
+    notes text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    created_by text,
+    CONSTRAINT app_document_path_rule_pkey PRIMARY KEY (path_rule_id),
+    CONSTRAINT app_document_path_rule_type_fkey
+        FOREIGN KEY (document_type_code) REFERENCES public.app_document_type(document_type_code)
+);
+
+ALTER TABLE public.app_document_path_rule
+    ADD COLUMN IF NOT EXISTS local_root text;
+
+ALTER TABLE public.app_document_path_rule
+    ADD COLUMN IF NOT EXISTS fallback_root text;
+
+ALTER TABLE public.app_document_path_rule
+    ADD COLUMN IF NOT EXISTS storage_bucket text NOT NULL DEFAULT '';
+
+ALTER TABLE public.app_document_path_rule
+    ADD COLUMN IF NOT EXISTS notes text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'app_document_path_rule_identity_key'
+    ) THEN
+        ALTER TABLE public.app_document_path_rule
+            ADD CONSTRAINT app_document_path_rule_identity_key
+            UNIQUE (document_type_code, rule_name);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.app_generated_document (
+    generated_document_id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    document_type_code text NOT NULL,
+    output_format text NOT NULL DEFAULT 'html',
+    relative_path text NOT NULL,
+    absolute_path text NOT NULL,
+    rendered_filename text NOT NULL,
+    template_version_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    context_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+    source_record_type text,
+    source_record_id text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    created_by text,
+    CONSTRAINT app_generated_document_pkey PRIMARY KEY (generated_document_id),
+    CONSTRAINT app_generated_document_type_fkey
+        FOREIGN KEY (document_type_code) REFERENCES public.app_document_type(document_type_code)
+);
+
 COMMIT;

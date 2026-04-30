@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+from .models import DocumentOutputFormat, DocumentPathRule
+from .repository import DocumentControlRepository
+from .token_engine import render_tokens, sanitize_filename_part
+
+
+_PATH_SPLIT_PATTERN = re.compile(r"[\\/]+")
+_OUTPUT_SUFFIXES = {
+    DocumentOutputFormat.HTML: ".html",
+    DocumentOutputFormat.TEXT: ".txt",
+    DocumentOutputFormat.DOCX: ".docx",
+    DocumentOutputFormat.PDF: ".pdf",
+}
+
+
+class DocumentPathRuleService:
+    def __init__(self, repository: DocumentControlRepository) -> None:
+        self._repository = repository
+
+    def load_active_path_rule(self, document_type_code: str) -> DocumentPathRule | None:
+        return self._repository.get_active_path_rule(document_type_code)
+
+    def resolve_output_path(
+        self,
+        document_type_code: str,
+        context: dict[str, object],
+        output_format: DocumentOutputFormat | None = None,
+        create_folders: bool = False,
+        base_directory: Path | str | None = None,
+    ) -> Path:
+        rule = self.load_active_path_rule(document_type_code)
+        if rule is None:
+            raise ValueError(f"No active path rule is configured for document type '{document_type_code}'.")
+
+        resolved_output_format = output_format or rule.output_format
+        rendered_relative = render_tokens(rule.relative_pattern, context)
+        rendered_filename = render_tokens(rule.filename_pattern, context)
+
+        relative_parts = [
+            part
+            for part in (
+                sanitize_filename_part(segment)
+                for segment in _PATH_SPLIT_PATTERN.split(rendered_relative)
+            )
+            if part
+        ]
+        filename = sanitize_filename_part(rendered_filename) or sanitize_filename_part(document_type_code) or "document"
+        suffix = _OUTPUT_SUFFIXES[resolved_output_format]
+        if Path(filename).suffix.lower() != suffix:
+            filename = f"{filename}{suffix}"
+
+        target_path = Path(*relative_parts, filename) if relative_parts else Path(filename)
+        root_path = self._resolve_base_directory(rule, base_directory)
+        if root_path is not None:
+            target_path = root_path / target_path
+
+        if create_folders:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        return target_path
+
+    def _resolve_base_directory(
+        self,
+        rule: DocumentPathRule,
+        base_directory: Path | str | None,
+    ) -> Path | None:
+        if base_directory is not None:
+            return Path(base_directory)
+
+        preferred_root = (rule.local_root or "").strip()
+        fallback_root = (rule.fallback_root or "").strip()
+
+        if preferred_root:
+            preferred_path = Path(preferred_root)
+            drive = os.path.splitdrive(str(preferred_path))[0]
+            if not drive or Path(f"{drive}\\").exists():
+                return preferred_path
+
+        if fallback_root:
+            return Path(fallback_root)
+
+        return None
