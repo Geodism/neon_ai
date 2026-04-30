@@ -22,6 +22,9 @@ class DocumentPathRuleService:
     def __init__(self, repository: DocumentControlRepository) -> None:
         self._repository = repository
 
+    def list_path_rules(self, document_type_code: str | None = None) -> list[DocumentPathRule]:
+        return self._repository.list_path_rules(document_type_code=document_type_code)
+
     def load_active_path_rule(self, document_type_code: str) -> DocumentPathRule | None:
         return self._repository.get_active_path_rule(document_type_code)
 
@@ -36,6 +39,25 @@ class DocumentPathRuleService:
         rule = self.load_active_path_rule(document_type_code)
         if rule is None:
             raise ValueError(f"No active path rule is configured for document type '{document_type_code}'.")
+
+        return self.resolve_rule_path(
+            rule=rule,
+            context=context,
+            output_format=output_format,
+            create_folders=create_folders,
+            base_directory=base_directory,
+        )
+
+    def resolve_rule_path(
+        self,
+        rule: DocumentPathRule,
+        context: dict[str, object],
+        output_format: DocumentOutputFormat | None = None,
+        create_folders: bool = False,
+        base_directory: Path | str | None = None,
+    ) -> Path:
+        if rule is None:
+            raise ValueError("A document path rule is required.")
 
         resolved_output_format = output_format or rule.output_format
         rendered_relative = render_tokens(rule.relative_pattern, context)
