@@ -275,14 +275,24 @@ class DocumentControlRepository:
             raise
 
     def activate_template(self, template_id: int) -> None:
-        template_version = self.get_template_version(template_id=template_id)
-        if template_version is None or template_version.template_version_id is None:
-            raise ValueError(f"Template #{template_id} does not have an active version to activate.")
-
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
-                    self._activate_template_cursor(cur, template_id, template_version.template_version_id)
+                    cur.execute(
+                        """
+                        SELECT template_version_id
+                        FROM public.app_document_template_version
+                        WHERE template_id = %s
+                        ORDER BY version_number DESC, template_version_id DESC
+                        LIMIT 1
+                        """,
+                        (template_id,),
+                    )
+                    version_row = cur.fetchone()
+                    if not version_row or version_row.get("template_version_id") is None:
+                        raise ValueError(f"Template #{template_id} does not have a saved version to activate.")
+
+                    self._activate_template_cursor(cur, template_id, int(version_row["template_version_id"]))
                     conn.commit()
         except psycopg2.Error as exc:
             if self._is_missing_schema_error(exc):

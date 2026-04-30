@@ -19,6 +19,16 @@ class GeneratedDocumentService:
         self._render_service = render_service
         self._path_rule_service = path_rule_service
 
+    def list_generated_documents(
+        self,
+        document_type_code: str | None = None,
+        source_record_id: str | None = None,
+    ) -> list[GeneratedDocumentRecord]:
+        return self._repository.list_generated_documents(
+            document_type_code=document_type_code,
+            source_record_id=source_record_id,
+        )
+
     def generate_preview_file(
         self,
         document_type_code: str,
