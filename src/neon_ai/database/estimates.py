@@ -787,7 +787,6 @@ def on_estimate_select(self, event):
             self.existing_tree.delete(item)
             
         try:
-            from database.estimates import get_estimate_materials
             materials = get_estimate_materials(self.current_estimate_id)
             
             for mat in materials:
