@@ -737,17 +737,6 @@ class DocumentControlRepository:
         template_row = cur.fetchone()
         if not template_row:
             raise ValueError(f"Template #{template_id} was not found.")
-
-        cur.execute(
-            """
-            UPDATE public.app_document_template
-            SET is_active = FALSE,
-                updated_at = now()
-            WHERE document_type_code = %s
-              AND template_kind = %s
-            """,
-            (template_row["document_type_code"], template_row["template_kind"]),
-        )
         cur.execute(
             """
             SELECT version_number

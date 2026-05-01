@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,7 +30,6 @@ from PySide6.QtWidgets import (
 )
 
 from neon_ai.document_control.models import DocumentTemplateKind
-from neon_ai.document_control.seed import seed_document_control_defaults
 from neon_ai.database.automation import build_client_estimate_doc, get_client_estimate_doc_path
 from neon_ai.database.estimates import (
     get_dashboard_estimates,
@@ -41,11 +42,15 @@ from neon_ai.services.estimate_document_draft_service import (
     get_draft_for_display,
     get_or_create_active_draft,
     lock_draft,
+    record_exported_file_path,
     save_draft,
 )
+from neon_ai.services.estimate_document_send_service import can_send_estimate_document_draft
 from neon_ai.services.document_generation_service import (
+    export_estimate_document_draft,
     generate_estimate_document_record,
     preview_estimate_document,
+    render_estimate_document_from_template_selection,
 )
 from neon_ai.ui.widgets.rich_text_toolbar import RichTextToolbar
 
@@ -183,6 +188,13 @@ class EstimateDocViewPage(QWidget):
             DocumentTemplateKind.BODY.value: None,
             DocumentTemplateKind.FOOTER.value: None,
         }
+        self._suspend_template_selection_tracking = False
+        self._pending_template_selection_change = False
+        self._last_rendered_template_ids: dict[str, int | None] = {
+            "header_template_id": None,
+            "body_template_id": None,
+            "footer_template_id": None,
+        }
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -249,6 +261,9 @@ class EstimateDocViewPage(QWidget):
         self.header_template_combo = QComboBox()
         self.body_template_combo = QComboBox()
         self.footer_template_combo = QComboBox()
+        self.header_template_combo.currentIndexChanged.connect(self._on_template_selection_changed)
+        self.body_template_combo.currentIndexChanged.connect(self._on_template_selection_changed)
+        self.footer_template_combo.currentIndexChanged.connect(self._on_template_selection_changed)
 
         top_layout.addWidget(self._meta_label("Customer"), 0, 0)
         top_layout.addWidget(self.customer_value, 0, 1)
@@ -281,6 +296,10 @@ class EstimateDocViewPage(QWidget):
         self.btn_load_draft.setEnabled(False)
         top_layout.addWidget(self.btn_load_draft, 5, 3)
 
+        self.template_selection_status_label = self._make_meta_value_label("")
+        self.template_selection_status_label.setStyleSheet("color: #8a5a00; padding: 2px 0;")
+        top_layout.addWidget(self.template_selection_status_label, 6, 0, 1, 4)
+
         layout.addWidget(top_group)
 
         draft_group = QGroupBox("Estimate Document Draft")
@@ -310,22 +329,28 @@ class EstimateDocViewPage(QWidget):
         self.btn_lock_draft.setEnabled(False)
         primary_button_layout.addWidget(self.btn_lock_draft)
 
+        self.btn_render_templates = QPushButton("Render From Selected Templates")
+        self.btn_render_templates.clicked.connect(self.render_from_selected_templates)
+        self.btn_render_templates.setEnabled(False)
+        primary_button_layout.addWidget(self.btn_render_templates)
+
         self.btn_workspace_preview = QPushButton("Preview")
-        self.btn_workspace_preview.clicked.connect(self.preview_template_document)
+        self.btn_workspace_preview.clicked.connect(self.preview_current_draft_content)
         self.btn_workspace_preview.setEnabled(False)
         primary_button_layout.addWidget(self.btn_workspace_preview)
 
         self.btn_print = QPushButton("Print")
+        self.btn_print.clicked.connect(self.print_current_draft)
         self.btn_print.setEnabled(False)
-        self.btn_print.setToolTip("Print is staged and not wired yet.")
         primary_button_layout.addWidget(self.btn_print)
 
         self.btn_export = QPushButton("Export")
+        self.btn_export.clicked.connect(self.export_current_draft)
         self.btn_export.setEnabled(False)
-        self.btn_export.setToolTip("Export is staged and not wired yet.")
         primary_button_layout.addWidget(self.btn_export)
 
         self.btn_send_customer = QPushButton("Send to Customer")
+        self.btn_send_customer.clicked.connect(self.validate_send_to_customer)
         self.btn_send_customer.setEnabled(False)
         self.btn_send_customer.setToolTip("Send to Customer is not wired yet in this workspace slice.")
         primary_button_layout.addWidget(self.btn_send_customer)
@@ -581,6 +606,51 @@ class EstimateDocViewPage(QWidget):
             preview_html=str(result.get("preview_html") or ""),
         )
 
+    def preview_current_draft_content(self) -> None:
+        if not self.current_loaded_id:
+            QMessageBox.warning(self, "Warning", "Please select an estimate first.")
+            return
+
+        preview_html = self.draft_editor.toHtml().strip()
+        preview_text = self.draft_editor.toPlainText().strip()
+        if not preview_html and not preview_text:
+            QMessageBox.information(
+                self,
+                "No Draft Content",
+                "There is no draft content to preview yet. Render from selected templates or create draft content first.",
+            )
+            return
+
+        self._show_template_preview_dialog(
+            title=f"Estimate Draft Preview #{self.current_loaded_id}",
+            preview_html=preview_html or preview_text,
+        )
+
+    def render_from_selected_templates(self) -> None:
+        if not self.current_loaded_id:
+            QMessageBox.warning(self, "Warning", "Please select an estimate first.")
+            return
+        if not self.current_estimate_draft:
+            QMessageBox.warning(self, "No Draft", "Load or create a draft first.")
+            return
+
+        draft_status = str(self.current_estimate_draft.get("DraftStatus") or "")
+        if draft_status != "Draft":
+            QMessageBox.information(
+                self,
+                "Draft Is Read-Only",
+                f"This draft is {draft_status or 'not editable'} and cannot be re-rendered.",
+            )
+            return
+
+        if not self._confirm_render_overwrite_if_needed():
+            return
+
+        self._render_selected_templates_into_draft(
+            show_success=True,
+            preserve_existing_on_failure=True,
+        )
+
     def generate_template_document_record(self) -> None:
         if not self.current_loaded_id:
             QMessageBox.warning(self, "Warning", "Please select an estimate first.")
@@ -623,11 +693,17 @@ class EstimateDocViewPage(QWidget):
         )
 
     def save_current_draft(self) -> None:
-        if not self.current_estimate_draft:
-            QMessageBox.warning(self, "No Draft", "Load or create a draft first.")
+        if not self._save_current_draft_internal(show_success=True):
             return
 
+    def _save_current_draft_internal(self, *, show_success: bool) -> bool:
+        if not self.current_estimate_draft:
+            QMessageBox.warning(self, "No Draft", "Load or create a draft first.")
+            return False
+
         draft_id = int(self.current_estimate_draft["EstimateDocumentDraftID"])
+        pending_selection_before_save = self._pending_template_selection_change
+        rendered_template_ids_before_save = dict(self._last_rendered_template_ids)
         result = save_draft(
             draft_id=draft_id,
             editable_content=self.draft_editor.toHtml(),
@@ -642,16 +718,183 @@ class EstimateDocViewPage(QWidget):
                 "Save Refused",
                 str(result.get("error") or "Estimate document draft could not be saved."),
             )
-            return
+            return False
 
         self.current_estimate_draft = result.get("draft")
         self._apply_current_draft()
         self._apply_template_selection_from_draft()
-        QMessageBox.information(
-            self,
-            "Draft Saved",
-            f"Estimate document draft #{draft_id} was saved successfully.",
+        if pending_selection_before_save:
+            self._last_rendered_template_ids = rendered_template_ids_before_save
+            self._set_template_selection_pending(True)
+            self._update_button_states()
+        if show_success:
+            pending_note = ""
+            if pending_selection_before_save:
+                pending_note = (
+                    "\n\nTemplate selections were saved, but the draft still needs Render From Selected Templates "
+                    "to update the editor content."
+                )
+            QMessageBox.information(
+                self,
+                "Draft Saved",
+                f"Estimate document draft #{draft_id} was saved successfully.{pending_note}",
+            )
+        return True
+
+    def export_current_draft(self) -> None:
+        if not self.current_estimate_draft:
+            QMessageBox.warning(self, "No Draft", "Load or create a draft first.")
+            return
+
+        draft_status = str(self.current_estimate_draft.get("DraftStatus") or "")
+        if draft_status == "Draft" and self._draft_has_unsaved_editor_changes():
+            choice = QMessageBox.question(
+                self,
+                "Save Before Export?",
+                "The draft has unsaved changes. Save the current draft before exporting?",
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+            if not self._save_current_draft_internal(show_success=False):
+                return
+
+        result = export_estimate_document_draft(
+            self.current_estimate_draft,
+            html_content=self.draft_editor.toHtml(),
+            plain_text_content=self.draft_editor.toPlainText(),
+            created_by="UI",
         )
+        if not result.get("success"):
+            QMessageBox.warning(
+                self,
+                "Export Failed",
+                str(result.get("error") or "Estimate document draft export failed."),
+            )
+            return
+
+        path_update = record_exported_file_path(
+            draft_id=int(self.current_estimate_draft["EstimateDocumentDraftID"]),
+            final_file_path=str(result.get("absolute_path") or ""),
+        )
+        path_update_note = ""
+        if path_update.get("success"):
+            self.current_estimate_draft = path_update.get("draft")
+            self._apply_current_draft()
+            self._apply_template_selection_from_draft()
+        else:
+            path_update_note = (
+                "\n\nNote: the file exported successfully, but FinalFilePath could not be saved on the draft.\n"
+                f"Details: {path_update.get('error')}"
+            )
+
+        message = (
+            "Estimate document draft exported successfully.\n\n"
+            f"Path: {result.get('absolute_path')}\n"
+            f"GeneratedDocumentID: {result.get('generated_document_id')}"
+        )
+        export_note = str(result.get("export_note") or "").strip()
+        if export_note:
+            message += f"\n\nNote: {export_note}"
+        if path_update_note:
+            message += path_update_note
+        QMessageBox.information(self, "Draft Exported", message)
+
+    def print_current_draft(self) -> None:
+        if not self.current_loaded_id:
+            QMessageBox.warning(self, "No Estimate Selected", "Please select an estimate first.")
+            return
+        if not self.current_estimate_draft:
+            QMessageBox.warning(self, "No Draft", "Load or create a draft first.")
+            return
+
+        draft_status = str(self.current_estimate_draft.get("DraftStatus") or "")
+        use_unsaved_editor_content = False
+        if draft_status == "Draft" and self._draft_has_unsaved_editor_changes():
+            choice_box = QMessageBox(self)
+            choice_box.setIcon(QMessageBox.Icon.Question)
+            choice_box.setWindowTitle("Unsaved Changes")
+            choice_box.setText("This draft has unsaved changes.")
+            choice_box.setInformativeText("Choose whether to save before printing or print the current unsaved view.")
+            save_button = choice_box.addButton("Save Before Printing", QMessageBox.ButtonRole.AcceptRole)
+            print_unsaved_button = choice_box.addButton("Print Current Unsaved View", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_button = choice_box.addButton(QMessageBox.StandardButton.Cancel)
+            choice_box.setDefaultButton(save_button)
+            choice_box.exec()
+
+            clicked = choice_box.clickedButton()
+            if clicked == cancel_button:
+                QMessageBox.information(self, "Print Cancelled", "Printing was cancelled. The draft was not changed.")
+                return
+            if clicked == save_button:
+                if not self._save_current_draft_internal(show_success=False):
+                    return
+            elif clicked == print_unsaved_button:
+                use_unsaved_editor_content = True
+            else:
+                return
+
+        html_content, plain_text_content = self._current_print_source(
+            use_unsaved_editor_content=use_unsaved_editor_content
+        )
+        if not html_content.strip() and not plain_text_content.strip():
+            QMessageBox.warning(
+                self,
+                "No Draft Content",
+                "There is no draft content to print yet. Render or enter draft content first.",
+            )
+            return
+
+        try:
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Print Unavailable",
+                f"The print subsystem is unavailable.\n\n{exc}",
+            )
+            return
+
+        try:
+            dialog = QPrintDialog(printer, self)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Print Unavailable",
+                f"The print dialog could not be opened.\n\n{exc}",
+            )
+            return
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Print Cancelled", "Printing was cancelled.")
+            return
+
+        try:
+            document = QTextDocument(self)
+            if self._content_looks_like_html(html_content):
+                document.setHtml(html_content)
+            else:
+                document.setPlainText(plain_text_content or html_content)
+            document.print_(printer)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Print Failed",
+                f"The draft could not be printed.\n\n{exc}",
+            )
+            return
+
+        if use_unsaved_editor_content:
+            QMessageBox.information(
+                self,
+                "Printed Unsaved View",
+                "The current unsaved draft view was sent to the printer. The draft content was not saved.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Print Started",
+                "The current estimate document draft was sent to the printer.",
+            )
 
     def lock_current_draft(self) -> None:
         if not self.current_estimate_draft:
@@ -710,6 +953,12 @@ class EstimateDocViewPage(QWidget):
         self.draft_editor.clear()
         self.draft_editor.setReadOnly(True)
         self._set_toolbar_enabled(False)
+        self._last_rendered_template_ids = {
+            "header_template_id": None,
+            "body_template_id": None,
+            "footer_template_id": None,
+        }
+        self._set_template_selection_pending(False)
 
     def _apply_current_draft(self) -> None:
         draft = self.current_estimate_draft
@@ -728,6 +977,7 @@ class EstimateDocViewPage(QWidget):
         self._set_draft_editor_content(draft_content)
         self.draft_editor.setReadOnly(status != "Draft")
         self._set_toolbar_enabled(status == "Draft")
+        self._sync_template_tracking_from_draft()
         self._update_button_states()
 
     def _update_button_states(self) -> None:
@@ -748,7 +998,13 @@ class EstimateDocViewPage(QWidget):
         self.btn_load_draft.setEnabled(bool(has_selection))
         self.btn_save_draft.setEnabled(bool(draft_loaded and draft_is_editable))
         self.btn_lock_draft.setEnabled(bool(draft_loaded and draft_is_editable))
-        self.btn_workspace_preview.setEnabled(bool(has_selection))
+        has_renderable_template_selection = bool(
+            self._current_selected_template_id(self.body_template_combo) is not None
+        )
+        self.btn_render_templates.setEnabled(bool(draft_loaded and draft_is_editable and has_renderable_template_selection))
+        self.btn_workspace_preview.setEnabled(bool(draft_loaded and self.draft_editor.toPlainText().strip()))
+        self.btn_print.setEnabled(bool(draft_loaded and self._draft_has_any_content()))
+        self.btn_export.setEnabled(bool(draft_loaded and draft_status in {"Draft", "Locked", "Sent", "Retired"}))
         self.draft_editor.setReadOnly(not draft_is_editable)
         self._set_toolbar_enabled(draft_is_editable)
         template_selection_enabled = bool(has_selection and (not draft_loaded or draft_is_editable))
@@ -760,6 +1016,78 @@ class EstimateDocViewPage(QWidget):
         )
         self.footer_template_combo.setEnabled(
             bool(template_selection_enabled and self._current_selected_template_id(self.footer_template_combo) is not None)
+        )
+        self._update_send_button_state()
+
+    def _current_send_validation(self) -> tuple[bool, str, dict]:
+        if not self.current_estimate_draft:
+            return False, "No draft loaded.", {}
+
+        draft_status = str(self.current_estimate_draft.get("DraftStatus") or "").strip()
+        if draft_status == "Retired":
+            return False, "Draft is retired.", self._send_context_from_current_draft()
+        if draft_status == "Sent":
+            return False, "Draft has already been sent.", self._send_context_from_current_draft()
+        if draft_status == "Draft" and self._pending_template_selection_change:
+            return (
+                False,
+                "Render and save current template selections before sending.",
+                self._send_context_from_current_draft(),
+            )
+
+        draft_id = self.current_estimate_draft.get("EstimateDocumentDraftID")
+        try:
+            normalized_draft_id = int(draft_id) if draft_id is not None else None
+        except (TypeError, ValueError):
+            normalized_draft_id = None
+        if normalized_draft_id is None:
+            return False, "Draft was not found.", self._send_context_from_current_draft()
+
+        return can_send_estimate_document_draft(normalized_draft_id)
+
+    def _send_context_from_current_draft(self) -> dict:
+        draft = self.current_estimate_draft or {}
+        parent = (self.current_data or {}).get("parent") or {}
+        return {
+            "EstimateDocumentDraftID": draft.get("EstimateDocumentDraftID"),
+            "EstimateID": draft.get("EstimateID") or parent.get("EstimateID"),
+            "CustomerName": parent.get("CustomerName"),
+            "CustomerEmail": parent.get("Email"),
+            "FinalFilePath": draft.get("FinalFilePath"),
+            "DraftStatus": draft.get("DraftStatus"),
+        }
+
+    def _update_send_button_state(self) -> None:
+        can_send, reason, _context = self._current_send_validation()
+        self.btn_send_customer.setEnabled(can_send)
+        self.btn_send_customer.setToolTip(reason or "Send to Customer validation is unavailable.")
+
+    def validate_send_to_customer(self) -> None:
+        can_send, reason, context = self._current_send_validation()
+        if not can_send:
+            QMessageBox.information(
+                self,
+                "Send To Customer Unavailable",
+                reason or "This draft is not ready to send yet.",
+            )
+            return
+
+        customer_name = str(context.get("CustomerName") or "Unknown Customer")
+        customer_email = str(context.get("CustomerEmail") or "Not available")
+        estimate_id = context.get("EstimateID") or "Unknown"
+        draft_id = context.get("EstimateDocumentDraftID") or "Unknown"
+        attachment_path = str(context.get("FinalFilePath") or "Not available")
+
+        QMessageBox.information(
+            self,
+            "Send To Customer Validation",
+            "This draft passed send validation.\n\n"
+            f"Customer: {customer_name}\n"
+            f"Customer Email: {customer_email}\n"
+            f"Estimate ID: {estimate_id}\n"
+            f"Draft ID: {draft_id}\n"
+            f"Attachment Path: {attachment_path}\n\n"
+            "Sending is not wired in this validation slice.",
         )
 
     def _clear_metadata(self) -> None:
@@ -858,11 +1186,6 @@ class EstimateDocViewPage(QWidget):
         }
         catalog_service = self._get_document_catalog_service()
 
-        try:
-            seed_document_control_defaults()
-        except Exception:
-            pass
-
         summaries = []
         if catalog_service is not None:
             try:
@@ -906,38 +1229,80 @@ class EstimateDocViewPage(QWidget):
     def _populate_template_combo(self, combo: QComboBox, summaries: list[object], empty_label: str) -> None:
         combo.blockSignals(True)
         combo.clear()
-        if not summaries:
+        unique_summaries: list[object] = []
+        seen_template_ids: set[int] = set()
+        for summary in summaries:
+            template_id = getattr(summary, "template_id", None)
+            try:
+                normalized_template_id = int(template_id) if template_id is not None else None
+            except (TypeError, ValueError):
+                normalized_template_id = None
+            if normalized_template_id is not None and normalized_template_id in seen_template_ids:
+                continue
+            if normalized_template_id is not None:
+                seen_template_ids.add(normalized_template_id)
+            unique_summaries.append(summary)
+
+        if not unique_summaries:
             combo.addItem(empty_label, None)
             combo.setEnabled(False)
             combo.blockSignals(False)
             return
 
-        for summary in summaries:
-            label = str(summary.template_name)
-            if getattr(summary, "is_active", False):
-                label = f"{label} [ACTIVE]"
+        label_counts: dict[str, int] = {}
+        for summary in unique_summaries:
+            base_label = self._template_base_label(summary)
+            label_counts[base_label] = label_counts.get(base_label, 0) + 1
+
+        for summary in unique_summaries:
+            label = self._template_option_label(summary, label_counts)
             combo.addItem(label, int(summary.template_id))
         combo.setCurrentIndex(0)
         combo.setEnabled(True)
         combo.blockSignals(False)
 
+    def _template_base_label(self, summary: object) -> str:
+        template_name = str(getattr(summary, "template_name", "") or "").strip()
+        if template_name:
+            return template_name
+        display_name = str(getattr(summary, "display_name", "") or "").strip()
+        if display_name:
+            return display_name
+        template_code = str(getattr(summary, "template_code", "") or "").strip()
+        if template_code:
+            return template_code
+        template_id = getattr(summary, "template_id", None)
+        return f"Template #{template_id}" if template_id is not None else "Unnamed Template"
+
+    def _template_option_label(self, summary: object, label_counts: dict[str, int]) -> str:
+        base_label = self._template_base_label(summary)
+        if label_counts.get(base_label, 0) <= 1:
+            return base_label
+        template_id = getattr(summary, "template_id", None)
+        return f"{base_label} (Template #{template_id})" if template_id is not None else base_label
+
     def _apply_template_selection_from_draft(self) -> None:
         draft = self.current_estimate_draft or {}
-        self._select_template_combo_value(
-            self.header_template_combo,
-            draft.get("HeaderTemplateID"),
-            self._template_defaults_by_kind.get(DocumentTemplateKind.HEADER.value),
-        )
-        self._select_template_combo_value(
-            self.body_template_combo,
-            draft.get("BodyTemplateID"),
-            self._template_defaults_by_kind.get(DocumentTemplateKind.BODY.value),
-        )
-        self._select_template_combo_value(
-            self.footer_template_combo,
-            draft.get("FooterTemplateID"),
-            self._template_defaults_by_kind.get(DocumentTemplateKind.FOOTER.value),
-        )
+        self._suspend_template_selection_tracking = True
+        try:
+            self._select_template_combo_value(
+                self.header_template_combo,
+                draft.get("HeaderTemplateID"),
+                self._template_defaults_by_kind.get(DocumentTemplateKind.HEADER.value),
+            )
+            self._select_template_combo_value(
+                self.body_template_combo,
+                draft.get("BodyTemplateID"),
+                self._template_defaults_by_kind.get(DocumentTemplateKind.BODY.value),
+            )
+            self._select_template_combo_value(
+                self.footer_template_combo,
+                draft.get("FooterTemplateID"),
+                self._template_defaults_by_kind.get(DocumentTemplateKind.FOOTER.value),
+            )
+        finally:
+            self._suspend_template_selection_tracking = False
+        self._refresh_template_selection_pending_state()
 
     def _select_template_combo_value(self, combo: QComboBox, template_id, default_template_id: int | None = None) -> None:
         preferred_ids: list[int] = []
@@ -979,6 +1344,57 @@ class EstimateDocViewPage(QWidget):
             "footer_template_id": self._current_selected_template_id(self.footer_template_combo),
         }
 
+    def _draft_template_ids(self, draft: dict | None = None) -> dict[str, int | None]:
+        source = draft or self.current_estimate_draft or {}
+        resolved: dict[str, int | None] = {}
+        for draft_key, target_key in (
+            ("HeaderTemplateID", "header_template_id"),
+            ("BodyTemplateID", "body_template_id"),
+            ("FooterTemplateID", "footer_template_id"),
+        ):
+            value = source.get(draft_key)
+            try:
+                resolved[target_key] = int(value) if value is not None else None
+            except (TypeError, ValueError):
+                resolved[target_key] = None
+        return resolved
+
+    def _sync_template_tracking_from_draft(self) -> None:
+        self._last_rendered_template_ids = self._draft_template_ids(self.current_estimate_draft)
+        self._set_template_selection_pending(False)
+
+    def _current_template_selection_differs_from_rendered(self) -> bool:
+        current_ids = self._current_default_template_ids()
+        return any(
+            current_ids.get(key) != self._last_rendered_template_ids.get(key)
+            for key in ("header_template_id", "body_template_id", "footer_template_id")
+        )
+
+    def _set_template_selection_pending(self, pending: bool) -> None:
+        self._pending_template_selection_change = pending
+        if pending:
+            self.template_selection_status_label.setText(
+                "Template selection changed. Click Render From Selected Templates to update the draft."
+            )
+            self.btn_render_templates.setStyleSheet("font-weight: 700; border: 2px solid #c98a00;")
+        else:
+            self.template_selection_status_label.setText("")
+            self.btn_render_templates.setStyleSheet("")
+
+    def _refresh_template_selection_pending_state(self) -> None:
+        draft = self.current_estimate_draft or {}
+        if self._suspend_template_selection_tracking:
+            return
+        if str(draft.get("DraftStatus") or "") != "Draft":
+            self._set_template_selection_pending(False)
+            return
+        self._set_template_selection_pending(self._current_template_selection_differs_from_rendered())
+
+    def _on_template_selection_changed(self, index: int) -> None:
+        del index
+        self._refresh_template_selection_pending_state()
+        self._update_button_states()
+
     def _seed_draft_template_ids_from_dropdowns_if_needed(self) -> None:
         if not self.current_estimate_draft:
             return
@@ -1007,6 +1423,104 @@ class EstimateDocViewPage(QWidget):
         if result.get("success"):
             self.current_estimate_draft = result.get("draft")
 
+    def _render_selected_templates_into_draft(
+        self,
+        *,
+        show_success: bool,
+        preserve_existing_on_failure: bool,
+    ) -> bool:
+        if not self.current_loaded_id or not self.current_estimate_draft:
+            return False
+
+        header_template_id = self._current_selected_template_id(self.header_template_combo)
+        body_template_id = self._current_selected_template_id(self.body_template_combo)
+        footer_template_id = self._current_selected_template_id(self.footer_template_combo)
+        result = render_estimate_document_from_template_selection(
+            int(self.current_loaded_id),
+            header_template_id=header_template_id,
+            body_template_id=body_template_id,
+            footer_template_id=footer_template_id,
+        )
+        if not result.get("success"):
+            error_message = str(result.get("error") or "Selected templates could not be rendered.")
+            missing_tokens = result.get("missing_tokens") or []
+            if missing_tokens:
+                error_message += "\n\nMissing tokens:\n" + "\n".join(f"- {token}" for token in missing_tokens)
+            print(
+                f"[EstimateDocViewPage] Template render failed for EstimateID={self.current_loaded_id}: {error_message}"
+            )
+            if preserve_existing_on_failure:
+                QMessageBox.warning(self, "Render Failed", error_message)
+            return False
+
+        preview_html = str(result.get("preview_html") or "")
+        rendered_content = str(result.get("rendered_content") or preview_html or "")
+        if not rendered_content.strip():
+            QMessageBox.warning(
+                self,
+                "Render Failed",
+                "Selected templates rendered no usable content. Existing draft content was preserved.",
+            )
+            return False
+
+        self._set_draft_editor_content(rendered_content)
+        save_result = save_draft(
+            draft_id=int(self.current_estimate_draft["EstimateDocumentDraftID"]),
+            editable_content=self.draft_editor.toHtml(),
+            header_template_id=header_template_id,
+            body_template_id=body_template_id,
+            footer_template_id=footer_template_id,
+            rendered_preview_html=preview_html or self.draft_editor.toHtml(),
+        )
+        if not save_result.get("success"):
+            QMessageBox.warning(
+                self,
+                "Draft Save Failed",
+                str(save_result.get("error") or "Rendered draft content could not be saved."),
+            )
+            return False
+
+        self.current_estimate_draft = save_result.get("draft")
+        self._apply_current_draft()
+        self._apply_template_selection_from_draft()
+        rendered_templates = result.get("rendered_templates") or []
+        if rendered_templates:
+            for template_info in rendered_templates:
+                print(
+                    "[EstimateDocViewPage] Rendered "
+                    f"{template_info.get('template_kind')} template: "
+                    f"{template_info.get('template_name')} #{template_info.get('template_id')}, "
+                    f"version #{template_info.get('template_version_id')}"
+                )
+        if show_success:
+            render_details = ""
+            if rendered_templates:
+                detail_lines = [
+                    f"- {str(item.get('template_kind') or '').capitalize()}: "
+                    f"{item.get('template_name')} #{item.get('template_id')} "
+                    f"(version #{item.get('template_version_id')})"
+                    for item in rendered_templates
+                ]
+                render_details = "\n\nRendered from real Document Studio templates:\n" + "\n".join(detail_lines)
+            QMessageBox.information(
+                self,
+                "Draft Rendered",
+                "The selected header, estimate body, and footer templates were rendered into the draft editor."
+                + render_details,
+            )
+        return True
+
+    def _confirm_render_overwrite_if_needed(self) -> bool:
+        current_text = self.draft_editor.toPlainText().strip()
+        if not current_text:
+            return True
+        choice = QMessageBox.question(
+            self,
+            "Overwrite Draft Content?",
+            "Rendering from the selected templates may overwrite manual edits in this draft.\n\nProceed?",
+        )
+        return choice == QMessageBox.StandardButton.Yes
+
     def _reset_template_dropdowns(self) -> None:
         self._template_defaults_by_kind = {
             DocumentTemplateKind.HEADER.value: None,
@@ -1023,6 +1537,7 @@ class EstimateDocViewPage(QWidget):
             combo.addItem(text, None)
             combo.setEnabled(False)
             combo.blockSignals(False)
+        self._set_template_selection_pending(False)
 
     def _load_existing_draft_if_any(self) -> None:
         self.current_estimate_draft = None
@@ -1082,6 +1597,11 @@ class EstimateDocViewPage(QWidget):
 
         self.current_estimate_draft = result.get("draft")
         self._seed_draft_template_ids_from_dropdowns_if_needed()
+        if result.get("created"):
+            self._render_selected_templates_into_draft(
+                show_success=False,
+                preserve_existing_on_failure=True,
+            )
         self._apply_current_draft()
         self._apply_template_selection_from_draft()
 
@@ -1111,16 +1631,7 @@ class EstimateDocViewPage(QWidget):
 
     def _set_draft_editor_content(self, content: str) -> None:
         text = str(content or "")
-        lowered = text.strip().lower()
-        if (
-            lowered.startswith("<!doctype html")
-            or lowered.startswith("<html")
-            or "<p" in lowered
-            or "<div" in lowered
-            or "<section" in lowered
-            or "<ul" in lowered
-            or "<ol" in lowered
-        ):
+        if self._content_looks_like_html(text):
             self.draft_editor.setHtml(text)
         else:
             self.draft_editor.setPlainText(text)
@@ -1128,3 +1639,58 @@ class EstimateDocViewPage(QWidget):
     def _set_toolbar_enabled(self, enabled: bool) -> None:
         if hasattr(self, "draft_toolbar") and self.draft_toolbar is not None:
             self.draft_toolbar.setEnabled(enabled)
+
+    def _draft_has_unsaved_editor_changes(self) -> bool:
+        if not self.current_estimate_draft:
+            return False
+        stored_content = str(
+            self.current_estimate_draft.get("EditableContent")
+            or self.current_estimate_draft.get("RenderedPreviewHtml")
+            or ""
+        ).strip()
+        current_html = self.draft_editor.toHtml().strip()
+        current_plain = self.draft_editor.toPlainText().strip()
+        return bool(stored_content != current_html and stored_content != current_plain)
+
+    def _draft_has_any_content(self) -> bool:
+        if not self.current_estimate_draft:
+            return False
+        stored_content = str(
+            self.current_estimate_draft.get("EditableContent")
+            or self.current_estimate_draft.get("RenderedPreviewHtml")
+            or ""
+        ).strip()
+        current_html = self.draft_editor.toHtml().strip()
+        current_plain = self.draft_editor.toPlainText().strip()
+        return bool(stored_content or current_html or current_plain)
+
+    def _current_print_source(self, *, use_unsaved_editor_content: bool) -> tuple[str, str]:
+        draft_status = str(self.current_estimate_draft.get("DraftStatus") or "") if self.current_estimate_draft else ""
+        if use_unsaved_editor_content or draft_status == "Draft":
+            html_content = self.draft_editor.toHtml().strip()
+            plain_text_content = self.draft_editor.toPlainText().strip()
+            if html_content or plain_text_content:
+                return html_content, plain_text_content
+
+        saved_html = str(
+            self.current_estimate_draft.get("EditableContent")
+            or self.current_estimate_draft.get("RenderedPreviewHtml")
+            or ""
+        ).strip() if self.current_estimate_draft else ""
+        return saved_html, self.draft_editor.toPlainText().strip()
+
+    def _content_looks_like_html(self, content: str) -> bool:
+        lowered = str(content or "").strip().lower()
+        return bool(
+            lowered.startswith("<!doctype html")
+            or lowered.startswith("<html")
+            or "<p" in lowered
+            or "<div" in lowered
+            or "<section" in lowered
+            or "<ul" in lowered
+            or "<ol" in lowered
+            or "<table" in lowered
+            or "<h1" in lowered
+            or "<h2" in lowered
+            or "<body" in lowered
+        )

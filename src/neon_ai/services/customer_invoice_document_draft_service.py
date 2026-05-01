@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from neon_ai.database.estimate_document_drafts import (
-    create_estimate_document_draft,
-    ensure_estimate_document_draft_table,
-    get_active_estimate_document_draft,
-    get_estimate_document_draft,
-    lock_estimate_document_draft,
-    set_estimate_document_draft_final_file_path,
-    update_estimate_document_draft,
+from neon_ai.database.customer_invoice_document_drafts import (
+    create_customer_invoice_document_draft,
+    ensure_customer_invoice_document_draft_table,
+    get_active_customer_invoice_document_draft,
+    get_customer_invoice_document_draft,
+    lock_customer_invoice_document_draft,
+    record_exported_file_path,
+    update_customer_invoice_document_draft,
 )
-from neon_ai.services.document_generation_service import preview_estimate_document
+from neon_ai.database.invoices import get_invoice_detail
 from neon_ai.services.template_token_service import (
-    build_estimate_document_fallback_text,
-    get_estimate_document_tokens,
+    build_customer_invoice_plain_text_fallback,
+    get_customer_invoice_document_tokens,
 )
 
 
@@ -37,21 +37,14 @@ def _draft_has_content(draft: dict[str, Any] | None) -> bool:
     return bool(editable_content or preview_html)
 
 
-def _build_initial_draft_payload(estimate_id: int) -> dict[str, Any]:
-    preview_result = preview_estimate_document(estimate_id)
-    preview_html = str(preview_result.get("preview_html") or "").strip()
-    preview_tokens = preview_result.get("tokens") or {}
+def _invoice_header(invoice_id: int) -> dict[str, Any]:
+    detail = get_invoice_detail(invoice_id) or {}
+    return (detail.get("header") or {}) if isinstance(detail, dict) else {}
 
-    if preview_html:
-        return {
-            "editable_content": preview_html,
-            "rendered_preview_html": preview_html,
-            "content_source": "template_preview",
-            "tokens": preview_tokens,
-        }
 
-    tokens = preview_tokens or get_estimate_document_tokens(estimate_id)
-    fallback_text = build_estimate_document_fallback_text(tokens=tokens)
+def _build_initial_draft_payload(invoice_id: int) -> dict[str, Any]:
+    tokens = get_customer_invoice_document_tokens(invoice_id)
+    fallback_text = build_customer_invoice_plain_text_fallback(tokens)
     return {
         "editable_content": fallback_text,
         "rendered_preview_html": None,
@@ -68,14 +61,16 @@ def _hydrate_existing_draft_if_needed(draft: dict[str, Any]) -> tuple[dict[str, 
     if _draft_has_content(draft):
         return draft, False, None
 
-    estimate_id = int(draft["EstimateID"])
-    payload = _build_initial_draft_payload(estimate_id)
-    hydrated = update_estimate_document_draft(
-        draft_id=int(draft["EstimateDocumentDraftID"]),
+    invoice_id = int(draft["CustomerInvoiceId"])
+    payload = _build_initial_draft_payload(invoice_id)
+    hydrated = update_customer_invoice_document_draft(
+        draft_id=int(draft["CustomerInvoiceDocumentDraftID"]),
         editable_content=payload["editable_content"],
         header_template_id=draft.get("HeaderTemplateID"),
         body_template_id=draft.get("BodyTemplateID"),
         footer_template_id=draft.get("FooterTemplateID"),
+        workorder_id=draft.get("WorkOrderID"),
+        invoice_type=draft.get("InvoiceType"),
         rendered_preview_html=payload["rendered_preview_html"],
         draft_title=draft.get("DraftTitle"),
         final_file_path=draft.get("FinalFilePath"),
@@ -105,28 +100,30 @@ def _apply_default_template_ids_if_missing(
     ):
         return draft
 
-    return update_estimate_document_draft(
-        draft_id=int(draft["EstimateDocumentDraftID"]),
+    return update_customer_invoice_document_draft(
+        draft_id=int(draft["CustomerInvoiceDocumentDraftID"]),
         editable_content=str(draft.get("EditableContent") or ""),
         header_template_id=resolved_header,
         body_template_id=resolved_body,
         footer_template_id=resolved_footer,
+        workorder_id=draft.get("WorkOrderID"),
+        invoice_type=draft.get("InvoiceType"),
         rendered_preview_html=draft.get("RenderedPreviewHtml"),
         draft_title=draft.get("DraftTitle"),
         final_file_path=draft.get("FinalFilePath"),
     )
 
 
-def get_or_create_active_draft(
-    estimate_id: int,
+def get_or_create_active_invoice_draft(
+    invoice_id: int,
     *,
     header_template_id: int | None = None,
     body_template_id: int | None = None,
     footer_template_id: int | None = None,
 ) -> dict[str, Any]:
     try:
-        ensure_estimate_document_draft_table()
-        current = get_active_estimate_document_draft(estimate_id)
+        ensure_customer_invoice_document_draft_table()
+        current = get_active_customer_invoice_document_draft(invoice_id)
         if current:
             current = _apply_default_template_ids_if_missing(
                 current,
@@ -140,14 +137,18 @@ def get_or_create_active_draft(
             response["content_source"] = content_source
             return response
 
-        payload = _build_initial_draft_payload(estimate_id)
-
-        created = create_estimate_document_draft(
-            estimate_id=estimate_id,
-            draft_title=f"Estimate #{estimate_id} Customer Draft",
+        payload = _build_initial_draft_payload(invoice_id)
+        header = _invoice_header(invoice_id)
+        draft_title = f"Invoice #{invoice_id} Customer Draft"
+        workorder_id = header.get("WorkOrderID")
+        created = create_customer_invoice_document_draft(
+            customer_invoice_id=invoice_id,
+            workorder_id=int(workorder_id) if workorder_id is not None else None,
             header_template_id=header_template_id,
             body_template_id=body_template_id,
             footer_template_id=footer_template_id,
+            invoice_type=str(payload["tokens"].get("InvoiceType") or "Manual"),
+            draft_title=draft_title,
             draft_status="Draft",
             editable_content=payload["editable_content"],
             rendered_preview_html=payload["rendered_preview_html"],
@@ -166,39 +167,59 @@ def get_or_create_active_draft(
         }
 
 
-def save_draft(
+def get_invoice_draft_for_display(invoice_id: int) -> dict[str, Any]:
+    try:
+        ensure_customer_invoice_document_draft_table()
+        draft = get_active_customer_invoice_document_draft(invoice_id)
+        if not draft:
+            return {
+                "success": False,
+                "error": f"No active CustomerInvoiceDocumentDraft was found for invoice #{invoice_id}.",
+                "draft": None,
+                "is_editable": False,
+            }
+        hydrated, hydrated_now, content_source = _hydrate_existing_draft_if_needed(draft)
+        response = _draft_response(hydrated, created=False)
+        response["hydrated"] = hydrated_now
+        response["content_source"] = content_source
+        return response
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "draft": None,
+            "is_editable": False,
+        }
+
+
+def save_invoice_draft(
     draft_id: int,
     editable_content: str,
-    header_template_id: int | None,
-    body_template_id: int | None,
-    footer_template_id: int | None,
+    header_template_id: int | None = None,
+    body_template_id: int | None = None,
+    footer_template_id: int | None = None,
     rendered_preview_html: str | None = None,
 ) -> dict[str, Any]:
     try:
-        ensure_estimate_document_draft_table()
-        current = get_estimate_document_draft(draft_id)
+        ensure_customer_invoice_document_draft_table()
+        current = get_customer_invoice_document_draft(draft_id)
         if not current:
             return {
                 "success": False,
-                "error": f"EstimateDocumentDraft #{draft_id} was not found.",
+                "error": f"CustomerInvoiceDocumentDraft #{draft_id} was not found.",
                 "draft": None,
                 "is_editable": False,
             }
 
-        resolved_header = current.get("HeaderTemplateID") if header_template_id is None else header_template_id
-        resolved_body = current.get("BodyTemplateID") if body_template_id is None else body_template_id
-        resolved_footer = current.get("FooterTemplateID") if footer_template_id is None else footer_template_id
-        resolved_preview = (
-            current.get("RenderedPreviewHtml") if rendered_preview_html is None else rendered_preview_html
-        )
-
-        updated = update_estimate_document_draft(
+        updated = update_customer_invoice_document_draft(
             draft_id=draft_id,
             editable_content=editable_content,
-            header_template_id=resolved_header,
-            body_template_id=resolved_body,
-            footer_template_id=resolved_footer,
-            rendered_preview_html=resolved_preview,
+            header_template_id=current.get("HeaderTemplateID") if header_template_id is None else header_template_id,
+            body_template_id=current.get("BodyTemplateID") if body_template_id is None else body_template_id,
+            footer_template_id=current.get("FooterTemplateID") if footer_template_id is None else footer_template_id,
+            workorder_id=current.get("WorkOrderID"),
+            invoice_type=current.get("InvoiceType"),
+            rendered_preview_html=current.get("RenderedPreviewHtml") if rendered_preview_html is None else rendered_preview_html,
             draft_title=current.get("DraftTitle"),
             final_file_path=current.get("FinalFilePath"),
         )
@@ -212,10 +233,10 @@ def save_draft(
         }
 
 
-def lock_draft(draft_id: int, locked_by: str = "UI") -> dict[str, Any]:
+def lock_invoice_draft(draft_id: int, locked_by: str = "UI") -> dict[str, Any]:
     try:
-        ensure_estimate_document_draft_table()
-        locked = lock_estimate_document_draft(draft_id=draft_id, locked_by=locked_by)
+        ensure_customer_invoice_document_draft_table()
+        locked = lock_customer_invoice_document_draft(draft_id=draft_id, locked_by=locked_by)
         return _draft_response(locked, created=False)
     except Exception as exc:
         return {
@@ -226,39 +247,14 @@ def lock_draft(draft_id: int, locked_by: str = "UI") -> dict[str, Any]:
         }
 
 
-def record_exported_file_path(draft_id: int, final_file_path: str) -> dict[str, Any]:
+def record_invoice_draft_exported_file(draft_id: int, final_file_path: str) -> dict[str, Any]:
     try:
-        ensure_estimate_document_draft_table()
-        updated = set_estimate_document_draft_final_file_path(
+        ensure_customer_invoice_document_draft_table()
+        updated = record_exported_file_path(
             draft_id=draft_id,
             final_file_path=final_file_path,
         )
         return _draft_response(updated, created=False)
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": str(exc),
-            "draft": None,
-            "is_editable": False,
-        }
-
-
-def get_draft_for_display(estimate_id: int) -> dict[str, Any]:
-    try:
-        ensure_estimate_document_draft_table()
-        draft = get_active_estimate_document_draft(estimate_id)
-        if not draft:
-            return {
-                "success": False,
-                "error": f"No active EstimateDocumentDraft was found for estimate #{estimate_id}.",
-                "draft": None,
-                "is_editable": False,
-            }
-        hydrated, hydrated_now, content_source = _hydrate_existing_draft_if_needed(draft)
-        response = _draft_response(hydrated, created=False)
-        response["hydrated"] = hydrated_now
-        response["content_source"] = content_source
-        return response
     except Exception as exc:
         return {
             "success": False,

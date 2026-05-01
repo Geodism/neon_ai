@@ -27,6 +27,86 @@ def seed_document_control_defaults() -> None:
   <p><strong>Total Amount:</strong> {TotalAmount}</p>
 </section>
 """.strip()
+    customer_invoice_usage_context = "CUSTOMER_INVOICE_DRAFT_WORKSPACE"
+    customer_invoice_header_token_names = [
+        "CompanyName",
+        "DocumentTitle",
+        "InvoiceNumber",
+        "InvoiceDate",
+        "CustomerName",
+        "SiteAddress",
+    ]
+    customer_invoice_header_content = """
+<header>
+  <h1>{CompanyName}</h1>
+  <h2>{DocumentTitle}</h2>
+  <p><strong>Invoice Number:</strong> {InvoiceNumber}</p>
+  <p><strong>Invoice Date:</strong> {InvoiceDate}</p>
+  <p><strong>Bill To:</strong> {CustomerName}</p>
+  <p><strong>Project Site:</strong> {SiteAddress}</p>
+</header>
+""".strip()
+    customer_invoice_body_token_names = [
+        "DocumentTitle",
+        "CustomerName",
+        "CustomerEmail",
+        "SiteAddress",
+        "WorkOrderID",
+        "InvoiceNumber",
+        "InvoiceDate",
+        "DueDate",
+        "InvoiceType",
+        "CustomerPO",
+        "ScopeOfWork",
+        "LineItemsHtml",
+        "LaborAmountFormatted",
+        "MaterialAmountFormatted",
+        "SubtotalFormatted",
+        "TaxAmountFormatted",
+        "InvoiceTotalFormatted",
+        "PercentOfContract",
+        "BillingMilestone",
+        "PaymentTerms",
+    ]
+    customer_invoice_body_content = """
+<section>
+  <h2>{DocumentTitle}</h2>
+  <p><strong>Customer:</strong> {CustomerName}</p>
+  <p><strong>Customer Email:</strong> {CustomerEmail}</p>
+  <p><strong>Project Site:</strong> {SiteAddress}</p>
+  <p><strong>Work Order:</strong> {WorkOrderID}</p>
+  <p><strong>Invoice Number:</strong> {InvoiceNumber}</p>
+  <p><strong>Invoice Date:</strong> {InvoiceDate}</p>
+  <p><strong>Due Date:</strong> {DueDate}</p>
+  <p><strong>Invoice Type:</strong> {InvoiceType}</p>
+  <p><strong>Customer PO:</strong> {CustomerPO}</p>
+  <h3>Scope of Work</h3>
+  <p>{ScopeOfWork}</p>
+  <h3>Line Items</h3>
+  {LineItemsHtml}
+  <p><strong>Labor:</strong> {LaborAmountFormatted}</p>
+  <p><strong>Materials:</strong> {MaterialAmountFormatted}</p>
+  <p><strong>Subtotal:</strong> {SubtotalFormatted}</p>
+  <p><strong>Tax:</strong> {TaxAmountFormatted}</p>
+  <p><strong>Invoice Total:</strong> {InvoiceTotalFormatted}</p>
+  <p><strong>Percent of Contract:</strong> {PercentOfContract}%</p>
+  <p><strong>Billing Milestone:</strong> {BillingMilestone}</p>
+  <h3>Payment Terms</h3>
+  <p>{PaymentTerms}</p>
+</section>
+""".strip()
+    customer_invoice_footer_token_names = [
+        "PaymentTerms",
+        "CompanyName",
+        "OwnerName",
+    ]
+    customer_invoice_footer_content = """
+<footer>
+  <hr>
+  <p>{PaymentTerms}</p>
+  <p><strong>{CompanyName}</strong><br>{OwnerName}</p>
+</footer>
+""".strip()
     estimate_token_names = [
         "EstimateID",
         "EstimateDate",
@@ -70,6 +150,48 @@ def seed_document_control_defaults() -> None:
   <h3>Terms</h3>
   <p>{Terms}</p>
   <p><strong>{CompanyName}</strong><br>{OwnerName}</p>
+</section>
+""".strip()
+    standard_estimate_body_content = """
+<section>
+  <h2>{DocumentTitle}</h2>
+  <p><strong>Customer:</strong> {CustomerName}</p>
+  <p><strong>Project Site:</strong> {SiteName}<br>{SiteAddress}</p>
+  <p><strong>Estimate Date:</strong> {EstimateDate}</p>
+  <h3>Scope of Work</h3>
+  <p>{ScopeOfWork}</p>
+  <h3>Estimate Summary</h3>
+  <p><strong>Labor:</strong> {LaborSubtotalFormatted}</p>
+  <p><strong>Materials:</strong> {MaterialSubtotalFormatted}</p>
+  <p><strong>Subtotal:</strong> {EstimateSubtotalFormatted}</p>
+  <p><strong>Total Estimated Project Price:</strong> {EstimateTotalFormatted}</p>
+</section>
+""".strip()
+    detailed_estimate_token_names = estimate_token_names + [
+        "LineItemsHtml",
+        "LaborLineItemsText",
+        "MaterialLineItemsText",
+    ]
+    detailed_estimate_body_content = """
+<section>
+  <h2>{DocumentTitle}</h2>
+  <p><strong>Customer:</strong> {CustomerName}</p>
+  <p><strong>Customer Email:</strong> {CustomerEmail}</p>
+  <p><strong>Project Site:</strong> {SiteName}<br>{SiteAddress}</p>
+  <p><strong>Estimate Date:</strong> {EstimateDate}</p>
+  <h3>Scope of Work</h3>
+  <p>{ScopeOfWork}</p>
+  <h3>Detailed Estimate Items</h3>
+  {LineItemsHtml}
+  <h3>Labor Detail</h3>
+  <pre>{LaborLineItemsText}</pre>
+  <h3>Material Detail</h3>
+  <pre>{MaterialLineItemsText}</pre>
+  <p><strong>Labor Subtotal:</strong> {LaborSubtotalFormatted}</p>
+  <p><strong>Material Subtotal:</strong> {MaterialSubtotalFormatted}</p>
+  <p><strong>Estimate Subtotal:</strong> {EstimateSubtotalFormatted}</p>
+  <p><strong>Tax:</strong> {TaxAmountFormatted}</p>
+  <p><strong>Total Estimated Project Price:</strong> {EstimateTotalFormatted}</p>
 </section>
 """.strip()
     estimate_header_token_names = [
@@ -218,22 +340,6 @@ def seed_document_control_defaults() -> None:
 
                 cur.execute(
                     """
-                    UPDATE public.app_document_template
-                    SET is_active = FALSE,
-                        updated_at = now()
-                    WHERE document_type_code = %s
-                      AND template_kind = %s
-                      AND template_id <> %s
-                    """,
-                    (
-                        "CUSTOMER_INVOICE",
-                        DocumentTemplateKind.BODY.value,
-                        template_id,
-                    ),
-                )
-
-                cur.execute(
-                    """
                     INSERT INTO public.app_document_path_rule (
                         document_type_code,
                         local_root,
@@ -296,6 +402,342 @@ def seed_document_control_defaults() -> None:
                     WHERE path_rule_id = %s
                     """,
                     (path_rule_id,),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template (
+                        document_type_code,
+                        template_kind,
+                        template_name,
+                        content_format,
+                        current_version_number,
+                        notes,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (document_type_code, template_kind, template_name)
+                    DO UPDATE SET
+                        content_format = EXCLUDED.content_format,
+                        current_version_number = EXCLUDED.current_version_number,
+                        notes = EXCLUDED.notes,
+                        is_active = TRUE,
+                        updated_at = now()
+                    RETURNING template_id
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.HEADER.value,
+                        "CustomerInvoiceHeader",
+                        "html",
+                        1,
+                        "Seeded default customer invoice header template for the invoice draft workspace.",
+                    ),
+                )
+                customer_invoice_header_template_id = int(cur.fetchone()["template_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_version (
+                        template_id,
+                        version_number,
+                        subject_line,
+                        body_content,
+                        content_format,
+                        output_format,
+                        token_schema,
+                        change_summary,
+                        notes,
+                        created_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, version_number)
+                    DO UPDATE SET
+                        subject_line = EXCLUDED.subject_line,
+                        body_content = EXCLUDED.body_content,
+                        content_format = EXCLUDED.content_format,
+                        output_format = EXCLUDED.output_format,
+                        token_schema = EXCLUDED.token_schema,
+                        change_summary = EXCLUDED.change_summary,
+                        notes = EXCLUDED.notes,
+                        created_by = EXCLUDED.created_by
+                    RETURNING template_version_id
+                    """,
+                    (
+                        customer_invoice_header_template_id,
+                        1,
+                        None,
+                        customer_invoice_header_content,
+                        "html",
+                        DocumentOutputFormat.HTML.value,
+                        Json(customer_invoice_header_token_names),
+                        "Initial seeded customer invoice header template",
+                        "Customer invoice draft workspace header",
+                        "seed",
+                    ),
+                )
+                customer_invoice_header_template_version_id = int(cur.fetchone()["template_version_id"])
+
+                cur.execute(
+                    """
+                    UPDATE public.app_document_template
+                    SET active_version_id = %s,
+                        current_version_number = 1,
+                        is_active = TRUE,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (customer_invoice_header_template_version_id, customer_invoice_header_template_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template (
+                        document_type_code,
+                        template_kind,
+                        template_name,
+                        content_format,
+                        current_version_number,
+                        notes,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (document_type_code, template_kind, template_name)
+                    DO UPDATE SET
+                        content_format = EXCLUDED.content_format,
+                        current_version_number = EXCLUDED.current_version_number,
+                        notes = EXCLUDED.notes,
+                        is_active = TRUE,
+                        updated_at = now()
+                    RETURNING template_id
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.BODY.value,
+                        "CustomerInvoiceBody",
+                        "html",
+                        1,
+                        "Seeded default customer invoice body template for the invoice draft workspace.",
+                    ),
+                )
+                customer_invoice_body_template_id = int(cur.fetchone()["template_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_version (
+                        template_id,
+                        version_number,
+                        subject_line,
+                        body_content,
+                        content_format,
+                        output_format,
+                        token_schema,
+                        change_summary,
+                        notes,
+                        created_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, version_number)
+                    DO UPDATE SET
+                        subject_line = EXCLUDED.subject_line,
+                        body_content = EXCLUDED.body_content,
+                        content_format = EXCLUDED.content_format,
+                        output_format = EXCLUDED.output_format,
+                        token_schema = EXCLUDED.token_schema,
+                        change_summary = EXCLUDED.change_summary,
+                        notes = EXCLUDED.notes,
+                        created_by = EXCLUDED.created_by
+                    RETURNING template_version_id
+                    """,
+                    (
+                        customer_invoice_body_template_id,
+                        1,
+                        subject_line,
+                        customer_invoice_body_content,
+                        "html",
+                        DocumentOutputFormat.HTML.value,
+                        Json(customer_invoice_body_token_names),
+                        "Initial seeded customer invoice body template",
+                        "Customer invoice draft workspace body",
+                        "seed",
+                    ),
+                )
+                customer_invoice_body_template_version_id = int(cur.fetchone()["template_version_id"])
+
+                cur.execute(
+                    """
+                    UPDATE public.app_document_template
+                    SET active_version_id = %s,
+                        current_version_number = 1,
+                        is_active = TRUE,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (customer_invoice_body_template_version_id, customer_invoice_body_template_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template (
+                        document_type_code,
+                        template_kind,
+                        template_name,
+                        content_format,
+                        current_version_number,
+                        notes,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (document_type_code, template_kind, template_name)
+                    DO UPDATE SET
+                        content_format = EXCLUDED.content_format,
+                        current_version_number = EXCLUDED.current_version_number,
+                        notes = EXCLUDED.notes,
+                        is_active = TRUE,
+                        updated_at = now()
+                    RETURNING template_id
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.FOOTER.value,
+                        "CustomerInvoiceFooter",
+                        "html",
+                        1,
+                        "Seeded default customer invoice footer template for the invoice draft workspace.",
+                    ),
+                )
+                customer_invoice_footer_template_id = int(cur.fetchone()["template_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_version (
+                        template_id,
+                        version_number,
+                        subject_line,
+                        body_content,
+                        content_format,
+                        output_format,
+                        token_schema,
+                        change_summary,
+                        notes,
+                        created_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, version_number)
+                    DO UPDATE SET
+                        subject_line = EXCLUDED.subject_line,
+                        body_content = EXCLUDED.body_content,
+                        content_format = EXCLUDED.content_format,
+                        output_format = EXCLUDED.output_format,
+                        token_schema = EXCLUDED.token_schema,
+                        change_summary = EXCLUDED.change_summary,
+                        notes = EXCLUDED.notes,
+                        created_by = EXCLUDED.created_by
+                    RETURNING template_version_id
+                    """,
+                    (
+                        customer_invoice_footer_template_id,
+                        1,
+                        None,
+                        customer_invoice_footer_content,
+                        "html",
+                        DocumentOutputFormat.HTML.value,
+                        Json(customer_invoice_footer_token_names),
+                        "Initial seeded customer invoice footer template",
+                        "Customer invoice draft workspace footer",
+                        "seed",
+                    ),
+                )
+                customer_invoice_footer_template_version_id = int(cur.fetchone()["template_version_id"])
+
+                cur.execute(
+                    """
+                    UPDATE public.app_document_template
+                    SET active_version_id = %s,
+                        current_version_number = 1,
+                        is_active = TRUE,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (customer_invoice_footer_template_version_id, customer_invoice_footer_template_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_default (
+                        document_type_code,
+                        template_kind,
+                        usage_context,
+                        template_id,
+                        updated_at,
+                        updated_by
+                    )
+                    VALUES (%s, %s, %s, %s, now(), %s)
+                    ON CONFLICT (document_type_code, template_kind, usage_context)
+                    DO UPDATE SET
+                        template_id = EXCLUDED.template_id,
+                        updated_at = now(),
+                        updated_by = EXCLUDED.updated_by
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.HEADER.value,
+                        customer_invoice_usage_context,
+                        customer_invoice_header_template_id,
+                        "seed",
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_default (
+                        document_type_code,
+                        template_kind,
+                        usage_context,
+                        template_id,
+                        updated_at,
+                        updated_by
+                    )
+                    VALUES (%s, %s, %s, %s, now(), %s)
+                    ON CONFLICT (document_type_code, template_kind, usage_context)
+                    DO UPDATE SET
+                        template_id = EXCLUDED.template_id,
+                        updated_at = now(),
+                        updated_by = EXCLUDED.updated_by
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.BODY.value,
+                        customer_invoice_usage_context,
+                        customer_invoice_body_template_id,
+                        "seed",
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_default (
+                        document_type_code,
+                        template_kind,
+                        usage_context,
+                        template_id,
+                        updated_at,
+                        updated_by
+                    )
+                    VALUES (%s, %s, %s, %s, now(), %s)
+                    ON CONFLICT (document_type_code, template_kind, usage_context)
+                    DO UPDATE SET
+                        template_id = EXCLUDED.template_id,
+                        updated_at = now(),
+                        updated_by = EXCLUDED.updated_by
+                    """,
+                    (
+                        "CUSTOMER_INVOICE",
+                        DocumentTemplateKind.FOOTER.value,
+                        customer_invoice_usage_context,
+                        customer_invoice_footer_template_id,
+                        "seed",
+                    ),
                 )
 
                 # Mapping convention for workflow integration:
@@ -416,17 +858,176 @@ def seed_document_control_defaults() -> None:
 
                 cur.execute(
                     """
-                    UPDATE public.app_document_template
-                    SET is_active = FALSE,
+                    INSERT INTO public.app_document_template (
+                        document_type_code,
+                        template_kind,
+                        template_name,
+                        content_format,
+                        current_version_number,
+                        notes,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (document_type_code, template_kind, template_name)
+                    DO UPDATE SET
+                        content_format = EXCLUDED.content_format,
+                        current_version_number = EXCLUDED.current_version_number,
+                        notes = EXCLUDED.notes,
+                        is_active = TRUE,
                         updated_at = now()
-                    WHERE document_type_code = %s
-                      AND template_kind = %s
-                      AND template_id <> %s
+                    RETURNING template_id
                     """,
                     (
                         "ESTIMATE_DOCUMENT",
                         DocumentTemplateKind.BODY.value,
-                        estimate_template_id,
+                        "Standard Estimate Body",
+                        "html",
+                        1,
+                        "Seeded selectable estimate body template for Final Doc View.",
+                    ),
+                )
+                standard_estimate_template_id = int(cur.fetchone()["template_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_version (
+                        template_id,
+                        version_number,
+                        subject_line,
+                        body_content,
+                        content_format,
+                        output_format,
+                        token_schema,
+                        change_summary,
+                        notes,
+                        created_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, version_number)
+                    DO UPDATE SET
+                        subject_line = EXCLUDED.subject_line,
+                        body_content = EXCLUDED.body_content,
+                        content_format = EXCLUDED.content_format,
+                        output_format = EXCLUDED.output_format,
+                        token_schema = EXCLUDED.token_schema,
+                        change_summary = EXCLUDED.change_summary,
+                        notes = EXCLUDED.notes,
+                        created_by = EXCLUDED.created_by
+                    RETURNING template_version_id
+                    """,
+                    (
+                        standard_estimate_template_id,
+                        1,
+                        "Estimate {EstimateID}",
+                        standard_estimate_body_content,
+                        "html",
+                        DocumentOutputFormat.HTML.value,
+                        Json(estimate_token_names),
+                        "Initial seeded standard estimate body template",
+                        "Estimate draft workspace standard body",
+                        "seed",
+                    ),
+                )
+                standard_estimate_template_version_id = int(cur.fetchone()["template_version_id"])
+
+                cur.execute(
+                    """
+                    UPDATE public.app_document_template
+                    SET active_version_id = %s,
+                        current_version_number = 1,
+                        is_active = TRUE,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (standard_estimate_template_version_id, standard_estimate_template_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template (
+                        document_type_code,
+                        template_kind,
+                        template_name,
+                        content_format,
+                        current_version_number,
+                        notes,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (document_type_code, template_kind, template_name)
+                    DO UPDATE SET
+                        content_format = EXCLUDED.content_format,
+                        current_version_number = EXCLUDED.current_version_number,
+                        notes = EXCLUDED.notes,
+                        is_active = TRUE,
+                        updated_at = now()
+                    RETURNING template_id
+                    """,
+                    (
+                        "ESTIMATE_DOCUMENT",
+                        DocumentTemplateKind.BODY.value,
+                        "Detailed Estimate Body",
+                        "html",
+                        1,
+                        "Seeded selectable detailed estimate body template for Final Doc View.",
+                    ),
+                )
+                detailed_estimate_template_id = int(cur.fetchone()["template_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.app_document_template_version (
+                        template_id,
+                        version_number,
+                        subject_line,
+                        body_content,
+                        content_format,
+                        output_format,
+                        token_schema,
+                        change_summary,
+                        notes,
+                        created_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, version_number)
+                    DO UPDATE SET
+                        subject_line = EXCLUDED.subject_line,
+                        body_content = EXCLUDED.body_content,
+                        content_format = EXCLUDED.content_format,
+                        output_format = EXCLUDED.output_format,
+                        token_schema = EXCLUDED.token_schema,
+                        change_summary = EXCLUDED.change_summary,
+                        notes = EXCLUDED.notes,
+                        created_by = EXCLUDED.created_by
+                    RETURNING template_version_id
+                    """,
+                    (
+                        detailed_estimate_template_id,
+                        1,
+                        "Detailed Estimate {EstimateID}",
+                        detailed_estimate_body_content,
+                        "html",
+                        DocumentOutputFormat.HTML.value,
+                        Json(detailed_estimate_token_names),
+                        "Initial seeded detailed estimate body template",
+                        "Estimate draft workspace detailed body",
+                        "seed",
+                    ),
+                )
+                detailed_estimate_template_version_id = int(cur.fetchone()["template_version_id"])
+
+                cur.execute(
+                    """
+                    UPDATE public.app_document_template
+                    SET active_version_id = %s,
+                        current_version_number = 1,
+                        is_active = TRUE,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (
+                        detailed_estimate_template_version_id,
+                        detailed_estimate_template_id,
                     ),
                 )
 
@@ -518,22 +1119,6 @@ def seed_document_control_defaults() -> None:
 
                 cur.execute(
                     """
-                    UPDATE public.app_document_template
-                    SET is_active = FALSE,
-                        updated_at = now()
-                    WHERE document_type_code = %s
-                      AND template_kind = %s
-                      AND template_id <> %s
-                    """,
-                    (
-                        "ESTIMATE_DOCUMENT",
-                        DocumentTemplateKind.HEADER.value,
-                        estimate_header_template_id,
-                    ),
-                )
-
-                cur.execute(
-                    """
                     INSERT INTO public.app_document_template (
                         document_type_code,
                         template_kind,
@@ -620,22 +1205,6 @@ def seed_document_control_defaults() -> None:
 
                 cur.execute(
                     """
-                    UPDATE public.app_document_template
-                    SET is_active = FALSE,
-                        updated_at = now()
-                    WHERE document_type_code = %s
-                      AND template_kind = %s
-                      AND template_id <> %s
-                    """,
-                    (
-                        "ESTIMATE_DOCUMENT",
-                        DocumentTemplateKind.FOOTER.value,
-                        estimate_footer_template_id,
-                    ),
-                )
-
-                cur.execute(
-                    """
                     INSERT INTO public.app_document_template_default (
                         document_type_code,
                         template_kind,
@@ -681,7 +1250,7 @@ def seed_document_control_defaults() -> None:
                         "ESTIMATE_DOCUMENT",
                         DocumentTemplateKind.BODY.value,
                         estimate_usage_context,
-                        estimate_template_id,
+                        standard_estimate_template_id,
                         "seed",
                     ),
                 )

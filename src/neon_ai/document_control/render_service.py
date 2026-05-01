@@ -20,15 +20,35 @@ class DocumentRenderService:
 
     def get_active_templates(self, document_type_code: str) -> list[DocumentTemplateVersion]:
         summaries = self._repository.list_templates(document_type_code=document_type_code)
-        versions: list[DocumentTemplateVersion] = []
+        default_template_ids_by_kind: dict[DocumentTemplateKind, int] = {}
+        try:
+            for default_mapping in self._repository.list_template_defaults(document_type_code=document_type_code):
+                default_template_ids_by_kind.setdefault(default_mapping.kind, int(default_mapping.template_id))
+        except Exception:
+            default_template_ids_by_kind = {}
+
+        candidates_by_kind: dict[DocumentTemplateKind, list[DocumentTemplateVersion]] = {}
         for summary in summaries:
             if not summary.is_active or summary.active_version_id is None:
                 continue
             version = self._repository.get_template_version(version_id=summary.active_version_id)
             if version is not None:
-                versions.append(version)
-        versions.sort(key=lambda item: _TEMPLATE_KIND_ORDER.get(item.kind, 999))
-        return versions
+                candidates_by_kind.setdefault(version.kind, []).append(version)
+
+        selected_versions: list[DocumentTemplateVersion] = []
+        for kind, versions in candidates_by_kind.items():
+            versions.sort(
+                key=lambda item: (
+                    0 if item.template_id == default_template_ids_by_kind.get(kind) else 1,
+                    -(item.version_number or 0),
+                    str(item.template_name or "").lower(),
+                    item.template_id or 0,
+                )
+            )
+            selected_versions.append(versions[0])
+
+        selected_versions.sort(key=lambda item: _TEMPLATE_KIND_ORDER.get(item.kind, 999))
+        return selected_versions
 
     def render_preview_html(self, document_type_code: str, context: dict[str, object]) -> str:
         templates = self.get_active_templates(document_type_code)

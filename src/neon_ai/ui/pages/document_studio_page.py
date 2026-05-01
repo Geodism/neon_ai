@@ -43,6 +43,7 @@ class DocumentStudioPage(QWidget):
         self._is_dirty = False
         self._token_help_map: dict[str, str] = {}
         self._estimate_default_usage_context = "ESTIMATE_DRAFT_WORKSPACE"
+        self._invoice_default_usage_context = "CUSTOMER_INVOICE_DRAFT_WORKSPACE"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -205,7 +206,7 @@ class DocumentStudioPage(QWidget):
         editor_layout.addWidget(self.rich_text_toolbar)
         editor_layout.addWidget(self.body_content_edit, 1)
 
-        self.default_template_label = QLabel("Estimate draft default: not applicable for this template.")
+        self.default_template_label = QLabel("Workspace default: not applicable for this template.")
         self.default_template_label.setWordWrap(True)
         self.default_template_label.setStyleSheet("color: #555;")
         self.default_template_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -218,8 +219,8 @@ class DocumentStudioPage(QWidget):
         self.activate_button = QPushButton("Activate")
         self.activate_button.clicked.connect(self._on_activate_selected)
         action_row.addWidget(self.activate_button)
-        self.set_default_button = QPushButton("Set as Default for Estimate Draft Workspace")
-        self.set_default_button.clicked.connect(self._on_set_estimate_default)
+        self.set_default_button = QPushButton("Set as Default for Draft Workspace")
+        self.set_default_button.clicked.connect(self._on_set_workspace_default)
         self.set_default_button.setEnabled(False)
         action_row.addWidget(self.set_default_button)
         self.preview_button = QPushButton("Preview Active Document")
@@ -495,7 +496,9 @@ class DocumentStudioPage(QWidget):
 
         prompt = (
             f"Activate '{template_name}' for the selected document type and template kind?\n\n"
-            "This will deactivate any other active template in the same document type and kind."
+            "Active means the template stays selectable in workflow dropdowns. "
+            "This will keep other active templates available and only mark this template's latest saved version "
+            "as the current active version for this template."
         )
         if self._is_dirty:
             prompt += "\n\nUnsaved edits are not included. Save a new version first if you want those changes activated."
@@ -514,11 +517,36 @@ class DocumentStudioPage(QWidget):
         self._refresh_templates_for_current_type()
         self._reselect_template(template_id)
         self._set_status_message(
-            f"Activated '{template_name}' for the selected document type and template kind."
+            f"Activated '{template_name}'. It remains selectable without hiding other active templates of the same kind."
         )
         self._update_default_template_controls()
 
-    def _on_set_estimate_default(self) -> None:
+    def _default_workspace_config(
+        self,
+        document_type_code: str,
+        kind: DocumentTemplateKind,
+    ) -> dict[str, str] | None:
+        if kind not in {DocumentTemplateKind.HEADER, DocumentTemplateKind.BODY, DocumentTemplateKind.FOOTER}:
+            return None
+        if document_type_code == "ESTIMATE_DOCUMENT":
+            return {
+                "document_type_code": "ESTIMATE_DOCUMENT",
+                "usage_context": self._estimate_default_usage_context,
+                "button_prefix": "Estimate",
+                "label_prefix": "Estimate draft",
+                "workspace_label": "estimate draft workspace",
+            }
+        if document_type_code == "CUSTOMER_INVOICE":
+            return {
+                "document_type_code": "CUSTOMER_INVOICE",
+                "usage_context": self._invoice_default_usage_context,
+                "button_prefix": "Invoice",
+                "label_prefix": "Invoice draft",
+                "workspace_label": "invoice draft workspace",
+            }
+        return None
+
+    def _on_set_workspace_default(self) -> None:
         catalog_service = getattr(self.container, "document_catalog_service", None) if self.container else None
         if catalog_service is None:
             self._set_status_message("Document catalog service unavailable. Default could not be updated.", is_error=True)
@@ -527,21 +555,16 @@ class DocumentStudioPage(QWidget):
         template_id = self._current_template_id
         document_type_code = str(self.document_type_combo.currentData() or "")
         kind = self._current_template_kind()
-        if template_id is None or document_type_code != "ESTIMATE_DOCUMENT":
+        config = self._default_workspace_config(document_type_code, kind)
+        if template_id is None or config is None:
             self._set_status_message(
-                "Select a saved ESTIMATE_DOCUMENT template before setting an estimate draft default.",
-                is_error=True,
-            )
-            return
-        if kind not in {DocumentTemplateKind.HEADER, DocumentTemplateKind.BODY, DocumentTemplateKind.FOOTER}:
-            self._set_status_message(
-                "Only estimate header, body, and footer templates can be marked as estimate draft defaults.",
+                "Select a saved estimate or customer invoice header/body/footer template before setting a workspace default.",
                 is_error=True,
             )
             return
         if not self._current_template_is_active:
             self._set_status_message(
-                "Activate this template before marking it as the estimate draft default.",
+                f"Activate this template before marking it as the {config['workspace_label']} default.",
                 is_error=True,
             )
             return
@@ -556,13 +579,13 @@ class DocumentStudioPage(QWidget):
             catalog_service.set_template_default(
                 document_type_code=document_type_code,
                 template_kind=kind,
-                usage_context=self._estimate_default_usage_context,
+                usage_context=config["usage_context"],
                 template_id=int(template_id),
                 updated_by="UI",
             )
         except Exception as exc:
             self._set_status_message(
-                f"Estimate draft default could not be updated. Details: {exc}",
+                f"{config['label_prefix']} default could not be updated. Details: {exc}",
                 is_error=True,
             )
             return
@@ -571,10 +594,10 @@ class DocumentStudioPage(QWidget):
             self,
             "Default Template Updated",
             f"'{self.template_name_edit.text().strip() or 'Selected template'}' is now the default "
-            f"{kind.value} template for the estimate draft workspace.",
+            f"{kind.value} template for the {config['workspace_label']}.",
         )
         self._set_status_message(
-            f"Updated the default {kind.value} template for the estimate draft workspace."
+            f"Updated the default {kind.value} template for the {config['workspace_label']}."
         )
         self._update_default_template_controls()
 
@@ -844,10 +867,10 @@ class DocumentStudioPage(QWidget):
 
     def _set_template_status(self, is_active: bool) -> None:
         if is_active:
-            self.template_status_value.setText("Active")
+            self.template_status_value.setText("Active (available in workflow dropdowns)")
             self.template_status_value.setStyleSheet("color: #2e7d32; font-weight: 700;")
         else:
-            self.template_status_value.setText("Inactive")
+            self.template_status_value.setText("Inactive (hidden from workflow dropdowns)")
             self.template_status_value.setStyleSheet("color: #555; font-weight: 600;")
 
     def _set_status_message(self, message: str, is_error: bool = False) -> None:
@@ -864,42 +887,39 @@ class DocumentStudioPage(QWidget):
         template_id = self._current_template_id
         document_type_code = str(self.document_type_combo.currentData() or "")
         kind = self._current_template_kind()
-        applicable = (
-            template_id is not None
-            and document_type_code == "ESTIMATE_DOCUMENT"
-            and kind in {DocumentTemplateKind.HEADER, DocumentTemplateKind.BODY, DocumentTemplateKind.FOOTER}
-        )
+        config = self._default_workspace_config(document_type_code, kind)
+        applicable = template_id is not None and config is not None
 
         if not applicable:
-            self.set_default_button.setText("Set as Default for Estimate Draft Workspace")
+            self.set_default_button.setText("Set as Default for Draft Workspace")
             self.set_default_button.setEnabled(False)
-            self.default_template_label.setText("Estimate draft default: not applicable for this template.")
+            self.default_template_label.setText("Workspace default: not applicable for this template.")
             return
 
         kind_label = kind.value.capitalize()
-        self.set_default_button.setText(f"Set as Default Estimate {kind_label}")
+        self.set_default_button.setText(f"Set as Default {config['button_prefix']} {kind_label}")
         self.set_default_button.setEnabled(bool(self._current_template_is_active and not self._is_dirty))
 
-        default_text = f"Estimate draft default {kind.value}: not set."
+        default_text = f"{config['label_prefix']} default {kind.value}: not set."
         if catalog_service is not None:
             try:
                 default_mapping = catalog_service.get_template_default(
-                    document_type_code="ESTIMATE_DOCUMENT",
+                    document_type_code=config["document_type_code"],
                     template_kind=kind,
-                    usage_context=self._estimate_default_usage_context,
+                    usage_context=config["usage_context"],
                 )
                 if default_mapping is not None:
                     matching_summary = self._template_summaries_by_id.get(int(default_mapping.template_id))
                     if matching_summary is not None:
-                        default_text = f"Estimate draft default {kind.value}: {matching_summary.template_name}"
+                        default_text = f"{config['label_prefix']} default {kind.value}: {matching_summary.template_name}"
                     else:
                         default_text = (
-                            f"Estimate draft default {kind.value}: template #{default_mapping.template_id}"
+                            f"{config['label_prefix']} default {kind.value}: template #{default_mapping.template_id}"
                         )
                     if int(default_mapping.template_id) == int(template_id):
                         default_text += " [CURRENT]"
             except Exception as exc:
-                default_text = f"Estimate draft default {kind.value}: unavailable ({exc})"
+                default_text = f"{config['label_prefix']} default {kind.value}: unavailable ({exc})"
 
         self.default_template_label.setText(default_text)
 

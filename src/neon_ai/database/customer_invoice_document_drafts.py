@@ -9,7 +9,16 @@ _DRAFT_SCHEMA_READY = False
 _ALLOWED_DRAFT_STATUSES = {"Draft", "Locked", "Sent", "Retired"}
 
 
-def ensure_estimate_document_draft_table() -> None:
+def _normalize_is_active(value: bool | int | None) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    try:
+        return 1 if int(value or 0) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def ensure_customer_invoice_document_draft_table() -> None:
     global _DRAFT_SCHEMA_READY
     if _DRAFT_SCHEMA_READY:
         return
@@ -19,12 +28,14 @@ def ensure_estimate_document_draft_table() -> None:
     try:
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS public."EstimateDocumentDraft" (
-                "EstimateDocumentDraftID" integer GENERATED ALWAYS AS IDENTITY NOT NULL,
-                "EstimateID" integer NOT NULL REFERENCES public."Estimate"("EstimateID"),
+            CREATE TABLE IF NOT EXISTS public."CustomerInvoiceDocumentDraft" (
+                "CustomerInvoiceDocumentDraftID" integer GENERATED ALWAYS AS IDENTITY NOT NULL,
+                "CustomerInvoiceId" integer NOT NULL REFERENCES public."Invoice"("CustomerInvoiceId"),
+                "WorkOrderID" integer,
                 "HeaderTemplateID" bigint,
                 "BodyTemplateID" bigint,
                 "FooterTemplateID" bigint,
+                "InvoiceType" text,
                 "DraftTitle" text,
                 "DraftStatus" text NOT NULL DEFAULT 'Draft',
                 "EditableContent" text,
@@ -35,22 +46,22 @@ def ensure_estimate_document_draft_table() -> None:
                 "LockedAt" timestamptz,
                 "SentAt" timestamptz,
                 "LockedBy" text,
-                "IsActive" boolean NOT NULL DEFAULT TRUE,
+                "IsActive" integer NOT NULL DEFAULT 1,
                 "VersionNumber" integer NOT NULL DEFAULT 1,
-                PRIMARY KEY ("EstimateDocumentDraftID")
+                PRIMARY KEY ("CustomerInvoiceDocumentDraftID")
             )
             """
         )
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS "idx_EstimateDocumentDraft_EstimateID"
-            ON public."EstimateDocumentDraft" ("EstimateID")
+            CREATE INDEX IF NOT EXISTS "idx_CustomerInvoiceDocumentDraft_InvoiceID"
+            ON public."CustomerInvoiceDocumentDraft" ("CustomerInvoiceId")
             """
         )
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS "idx_EstimateDocumentDraft_Active"
-            ON public."EstimateDocumentDraft" ("EstimateID", "IsActive", "DraftStatus")
+            CREATE INDEX IF NOT EXISTS "idx_CustomerInvoiceDocumentDraft_Active"
+            ON public."CustomerInvoiceDocumentDraft" ("CustomerInvoiceId", "IsActive", "DraftStatus")
             """
         )
         conn.commit()
@@ -63,21 +74,21 @@ def _validate_draft_status(draft_status: str) -> str:
     value = str(draft_status or "Draft").strip() or "Draft"
     if value not in _ALLOWED_DRAFT_STATUSES:
         raise ValueError(
-            f"Unsupported EstimateDocumentDraft status '{value}'. Allowed values: {sorted(_ALLOWED_DRAFT_STATUSES)}"
+            f"Unsupported CustomerInvoiceDocumentDraft status '{value}'. Allowed values: {sorted(_ALLOWED_DRAFT_STATUSES)}"
         )
     return value
 
 
-def get_estimate_document_draft(draft_id: int) -> dict[str, Any] | None:
-    ensure_estimate_document_draft_table()
+def get_customer_invoice_document_draft(draft_id: int) -> dict[str, Any] | None:
+    ensure_customer_invoice_document_draft_table()
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateDocumentDraftID" = %s
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             LIMIT 1
             """,
             (draft_id,),
@@ -87,53 +98,56 @@ def get_estimate_document_draft(draft_id: int) -> dict[str, Any] | None:
         conn.close()
 
 
-def get_active_estimate_document_draft(estimate_id: int) -> dict[str, Any] | None:
-    ensure_estimate_document_draft_table()
+def get_active_customer_invoice_document_draft(invoice_id: int) -> dict[str, Any] | None:
+    ensure_customer_invoice_document_draft_table()
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateID" = %s
-              AND "IsActive" = TRUE
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceId" = %s
+              AND "IsActive" = 1
               AND "DraftStatus" <> 'Retired'
-            ORDER BY "VersionNumber" DESC, "EstimateDocumentDraftID" DESC
+            ORDER BY "VersionNumber" DESC, "CustomerInvoiceDocumentDraftID" DESC
             LIMIT 1
             """,
-            (estimate_id,),
+            (invoice_id,),
         )
         return cur.fetchone()
     finally:
         conn.close()
 
 
-def list_estimate_document_drafts(estimate_id: int) -> list[dict[str, Any]]:
-    ensure_estimate_document_draft_table()
+def list_customer_invoice_document_drafts(invoice_id: int) -> list[dict[str, Any]]:
+    ensure_customer_invoice_document_draft_table()
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateID" = %s
-            ORDER BY "VersionNumber" DESC, "EstimateDocumentDraftID" DESC
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceId" = %s
+            ORDER BY "VersionNumber" DESC, "CustomerInvoiceDocumentDraftID" DESC
             """,
-            (estimate_id,),
+            (invoice_id,),
         )
         return list(cur.fetchall())
     finally:
         conn.close()
 
 
-def create_estimate_document_draft(
-    estimate_id: int,
-    draft_title: str | None = None,
+def create_customer_invoice_document_draft(
+    customer_invoice_id: int,
+    *,
+    workorder_id: int | None = None,
     header_template_id: int | None = None,
     body_template_id: int | None = None,
     footer_template_id: int | None = None,
+    invoice_type: str | None = None,
+    draft_title: str | None = None,
     editable_content: str | None = None,
     rendered_preview_html: str | None = None,
     final_file_path: str | None = None,
@@ -141,8 +155,9 @@ def create_estimate_document_draft(
     is_active: bool = True,
     version_number: int | None = None,
 ) -> dict[str, Any]:
-    ensure_estimate_document_draft_table()
+    ensure_customer_invoice_document_draft_table()
     status = _validate_draft_status(draft_status)
+    normalized_is_active = _normalize_is_active(is_active)
 
     conn = get_connection()
     cur = conn.cursor()
@@ -151,32 +166,34 @@ def create_estimate_document_draft(
             cur.execute(
                 """
                 SELECT COALESCE(MAX("VersionNumber"), 0) + 1 AS "NextVersion"
-                FROM public."EstimateDocumentDraft"
-                WHERE "EstimateID" = %s
+                FROM public."CustomerInvoiceDocumentDraft"
+                WHERE "CustomerInvoiceId" = %s
                 """,
-                (estimate_id,),
+                (customer_invoice_id,),
             )
             version_number = int((cur.fetchone() or {}).get("NextVersion") or 1)
 
-        if is_active:
+        if normalized_is_active == 1:
             cur.execute(
                 """
-                UPDATE public."EstimateDocumentDraft"
-                SET "IsActive" = FALSE,
+                UPDATE public."CustomerInvoiceDocumentDraft"
+                SET "IsActive" = 0,
                     "UpdatedAt" = NOW()
-                WHERE "EstimateID" = %s
-                  AND "IsActive" = TRUE
+                WHERE "CustomerInvoiceId" = %s
+                  AND "IsActive" = 1
                 """,
-                (estimate_id,),
+                (customer_invoice_id,),
             )
 
         cur.execute(
             """
-            INSERT INTO public."EstimateDocumentDraft" (
-                "EstimateID",
+            INSERT INTO public."CustomerInvoiceDocumentDraft" (
+                "CustomerInvoiceId",
+                "WorkOrderID",
                 "HeaderTemplateID",
                 "BodyTemplateID",
                 "FooterTemplateID",
+                "InvoiceType",
                 "DraftTitle",
                 "DraftStatus",
                 "EditableContent",
@@ -185,20 +202,22 @@ def create_estimate_document_draft(
                 "IsActive",
                 "VersionNumber"
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
-                estimate_id,
+                customer_invoice_id,
+                workorder_id,
                 header_template_id,
                 body_template_id,
                 footer_template_id,
+                invoice_type,
                 draft_title,
                 status,
                 editable_content,
                 rendered_preview_html,
                 final_file_path,
-                is_active,
+                normalized_is_active,
                 version_number,
             ),
         )
@@ -212,17 +231,20 @@ def create_estimate_document_draft(
         conn.close()
 
 
-def update_estimate_document_draft(
+def update_customer_invoice_document_draft(
     draft_id: int,
+    *,
     editable_content: str | None,
     header_template_id: int | None,
     body_template_id: int | None,
     footer_template_id: int | None,
+    workorder_id: int | None = None,
+    invoice_type: str | None = None,
     rendered_preview_html: str | None = None,
     draft_title: str | None = None,
     final_file_path: str | None = None,
 ) -> dict[str, Any]:
-    ensure_estimate_document_draft_table()
+    ensure_customer_invoice_document_draft_table()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -230,36 +252,40 @@ def update_estimate_document_draft(
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateDocumentDraftID" = %s
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             FOR UPDATE
             """,
             (draft_id,),
         )
         current = cur.fetchone()
         if not current:
-            raise ValueError(f"EstimateDocumentDraft #{draft_id} was not found.")
+            raise ValueError(f"CustomerInvoiceDocumentDraft #{draft_id} was not found.")
         if str(current.get("DraftStatus") or "") != "Draft":
             raise ValueError("Only drafts in Draft status can be updated.")
 
         cur.execute(
             """
-            UPDATE public."EstimateDocumentDraft"
-            SET "HeaderTemplateID" = %s,
+            UPDATE public."CustomerInvoiceDocumentDraft"
+            SET "WorkOrderID" = %s,
+                "HeaderTemplateID" = %s,
                 "BodyTemplateID" = %s,
                 "FooterTemplateID" = %s,
+                "InvoiceType" = %s,
                 "DraftTitle" = %s,
                 "EditableContent" = %s,
                 "RenderedPreviewHtml" = %s,
                 "FinalFilePath" = %s,
                 "UpdatedAt" = NOW()
-            WHERE "EstimateDocumentDraftID" = %s
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             RETURNING *
             """,
             (
+                workorder_id,
                 header_template_id,
                 body_template_id,
                 footer_template_id,
+                invoice_type,
                 draft_title,
                 editable_content,
                 rendered_preview_html,
@@ -277,11 +303,11 @@ def update_estimate_document_draft(
         conn.close()
 
 
-def set_estimate_document_draft_final_file_path(
+def record_exported_file_path(
     draft_id: int,
     final_file_path: str | None,
 ) -> dict[str, Any]:
-    ensure_estimate_document_draft_table()
+    ensure_customer_invoice_document_draft_table()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -289,22 +315,22 @@ def set_estimate_document_draft_final_file_path(
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateDocumentDraftID" = %s
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             FOR UPDATE
             """,
             (draft_id,),
         )
         current = cur.fetchone()
         if not current:
-            raise ValueError(f"EstimateDocumentDraft #{draft_id} was not found.")
+            raise ValueError(f"CustomerInvoiceDocumentDraft #{draft_id} was not found.")
 
         cur.execute(
             """
-            UPDATE public."EstimateDocumentDraft"
+            UPDATE public."CustomerInvoiceDocumentDraft"
             SET "FinalFilePath" = %s,
                 "UpdatedAt" = NOW()
-            WHERE "EstimateDocumentDraftID" = %s
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             RETURNING *
             """,
             (final_file_path, draft_id),
@@ -319,12 +345,13 @@ def set_estimate_document_draft_final_file_path(
         conn.close()
 
 
-def lock_estimate_document_draft(
+def lock_customer_invoice_document_draft(
     draft_id: int,
+    *,
     locked_by: str = "UI",
     final_file_path: str | None = None,
 ) -> dict[str, Any]:
-    ensure_estimate_document_draft_table()
+    ensure_customer_invoice_document_draft_table()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -332,32 +359,32 @@ def lock_estimate_document_draft(
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateDocumentDraftID" = %s
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             FOR UPDATE
             """,
             (draft_id,),
         )
         current = cur.fetchone()
         if not current:
-            raise ValueError(f"EstimateDocumentDraft #{draft_id} was not found.")
+            raise ValueError(f"CustomerInvoiceDocumentDraft #{draft_id} was not found.")
 
         current_status = str(current.get("DraftStatus") or "")
         if current_status in {"Locked", "Sent", "Retired"}:
             raise ValueError(
-                f"EstimateDocumentDraft #{draft_id} cannot be locked because it is already {current_status}."
+                f"CustomerInvoiceDocumentDraft #{draft_id} cannot be locked because it is already {current_status}."
             )
 
         cur.execute(
             """
-            UPDATE public."EstimateDocumentDraft"
+            UPDATE public."CustomerInvoiceDocumentDraft"
             SET "DraftStatus" = 'Locked',
                 "LockedAt" = NOW(),
                 "LockedBy" = %s,
                 "FinalFilePath" = COALESCE(%s, "FinalFilePath"),
                 "UpdatedAt" = NOW(),
-                "IsActive" = TRUE
-            WHERE "EstimateDocumentDraftID" = %s
+                "IsActive" = 1
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             RETURNING *
             """,
             (locked_by, final_file_path, draft_id),
@@ -372,8 +399,8 @@ def lock_estimate_document_draft(
         conn.close()
 
 
-def retire_estimate_document_draft(draft_id: int) -> dict[str, Any]:
-    ensure_estimate_document_draft_table()
+def retire_customer_invoice_document_draft(draft_id: int) -> dict[str, Any]:
+    ensure_customer_invoice_document_draft_table()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -381,23 +408,23 @@ def retire_estimate_document_draft(draft_id: int) -> dict[str, Any]:
         cur.execute(
             """
             SELECT *
-            FROM public."EstimateDocumentDraft"
-            WHERE "EstimateDocumentDraftID" = %s
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             FOR UPDATE
             """,
             (draft_id,),
         )
         current = cur.fetchone()
         if not current:
-            raise ValueError(f"EstimateDocumentDraft #{draft_id} was not found.")
+            raise ValueError(f"CustomerInvoiceDocumentDraft #{draft_id} was not found.")
 
         cur.execute(
             """
-            UPDATE public."EstimateDocumentDraft"
+            UPDATE public."CustomerInvoiceDocumentDraft"
             SET "DraftStatus" = 'Retired',
-                "IsActive" = FALSE,
+                "IsActive" = 0,
                 "UpdatedAt" = NOW()
-            WHERE "EstimateDocumentDraftID" = %s
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
             RETURNING *
             """,
             (draft_id,),
