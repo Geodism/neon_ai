@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
 from neon_ai.database.customers import get_all_customers, get_sites_for_customer
 from neon_ai.database.estimates import (
     get_all_estimate_summaries,
+    get_dashboard_estimates,
     get_detailed_estimate_data,
     insert_full_estimate,
     sync_estimate_pricing_from_sources,
@@ -50,6 +52,7 @@ class EstimateEntryPage(QWidget):
         self.current_estimate_id: int | None = None
         self.is_loading = False
         self.form_locked = False
+        self._suspend_estimate_selection_sync = False
 
         self.customer_dict: dict[str, int] = {}
         self.site_dict: dict[str, int] = {}
@@ -62,12 +65,93 @@ class EstimateEntryPage(QWidget):
         self.material_search_timer.timeout.connect(self._perform_material_search)
 
         self._build_ui()
-        self.load_customers()
+        self.refresh_data()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 5, 10, 15)
-        layout.setSpacing(5)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+        splitter.addWidget(self._build_pipeline_panel())
+        splitter.addWidget(self._build_crafting_workspace())
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+
+    def _build_pipeline_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        title = QLabel("Estimate Pipeline")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(title)
+
+        helper = QLabel("Select an estimate to load it into the crafting workspace, or start from scratch with Create New.")
+        helper.setWordWrap(True)
+        helper.setStyleSheet("color: #555;")
+        layout.addWidget(helper)
+
+        self.pipeline_table = QTableWidget(0, 6)
+        self.pipeline_table.setHorizontalHeaderLabels(["Est #", "Customer", "Site", "Status", "Value", "Created"])
+        self.pipeline_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.pipeline_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.pipeline_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pipeline_table.verticalHeader().setVisible(False)
+        self.pipeline_table.setColumnWidth(0, 60)
+        self.pipeline_table.setColumnWidth(1, 160)
+        self.pipeline_table.setColumnWidth(2, 150)
+        self.pipeline_table.setColumnWidth(3, 90)
+        self.pipeline_table.setColumnWidth(4, 100)
+        self.pipeline_table.horizontalHeader().setStretchLastSection(True)
+        self.pipeline_table.itemSelectionChanged.connect(self.on_pipeline_select)
+        layout.addWidget(self.pipeline_table, 1)
+        return panel
+
+    def _build_crafting_workspace(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        title = QLabel("Crafting Workspace")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(title)
+
+        helper = QLabel("Use the familiar estimate-entry form here. The pipeline is now the primary way to choose an estimate to edit.")
+        helper.setWordWrap(True)
+        helper.setStyleSheet("color: #555;")
+        layout.addWidget(helper)
+
+        self.workspace_status_label = QLabel("New estimate mode.")
+        self.workspace_status_label.setWordWrap(True)
+        self.workspace_status_label.setStyleSheet("color: #5f6368;")
+        layout.addWidget(self.workspace_status_label)
+
+        quick_row = QFrame()
+        quick_layout = QHBoxLayout(quick_row)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.addWidget(QLabel("Quick Load (secondary):"))
+        self.draft_combo = QComboBox()
+        self.draft_combo.setMinimumWidth(260)
+        self.draft_combo.currentTextChanged.connect(self.load_selected_draft)
+        quick_layout.addWidget(self.draft_combo)
+        quick_hint = QLabel("Estimate Pipeline is the primary selection path.")
+        quick_hint.setStyleSheet("color: #777;")
+        quick_layout.addWidget(quick_hint)
+        quick_layout.addStretch(1)
+        layout.addWidget(quick_row)
+
+        layout.addWidget(self._build_estimate_form_panel(), 1)
+        return panel
+
+    def _build_estimate_form_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         header_frame = QFrame()
         header_layout = QHBoxLayout(header_frame)
@@ -76,15 +160,10 @@ class EstimateEntryPage(QWidget):
         self.header_label.setStyleSheet("font-size: 16px; font-weight: 700; color: blue;")
         header_layout.addWidget(self.header_label)
         header_layout.addStretch(1)
-        load_row = QFrame()
-        load_layout = QHBoxLayout(load_row)
-        load_layout.setContentsMargins(0, 0, 0, 0)
-        load_layout.addWidget(QLabel("Load Draft:"))
-        self.draft_combo = QComboBox()
-        self.draft_combo.setMinimumWidth(260)
-        self.draft_combo.currentTextChanged.connect(self.load_selected_draft)
-        load_layout.addWidget(self.draft_combo)
-        header_layout.addWidget(load_row)
+        self.create_new_button = QPushButton("Create New")
+        self.create_new_button.setStyleSheet("font-weight: 700; padding: 6px 14px;")
+        self.create_new_button.clicked.connect(self.create_new_estimate)
+        header_layout.addWidget(self.create_new_button)
         layout.addWidget(header_frame)
 
         id_group = QGroupBox("Job Identification")
@@ -226,10 +305,21 @@ class EstimateEntryPage(QWidget):
         self.clear_button.clicked.connect(self.clear_form)
         footer_layout.addWidget(self.clear_button)
         layout.addWidget(footer)
+        return panel
+
+    def _set_workspace_status(self, message: str, level: str = "info") -> None:
+        styles = {
+            "info": "color: #5f6368;",
+            "success": "color: #1b5e20; font-weight: 600;",
+            "warning": "color: #8a5a00; font-weight: 600;",
+        }
+        self.workspace_status_label.setText(message)
+        self.workspace_status_label.setStyleSheet(styles.get(level, styles["info"]))
 
     def refresh_data(self) -> None:
         self.load_customers()
         self.refresh_draft_list()
+        self.refresh_pipeline(preserve_estimate_id=self.current_estimate_id)
         self.role_data_dict.clear()
         roles = get_standard_roles()
         for row in roles:
@@ -237,6 +327,100 @@ class EstimateEntryPage(QWidget):
             self.role_data_dict[row["RoleName"]] = burdened_rate
         self.l_role.clear()
         self.l_role.addItems(self.role_data_dict.keys())
+        self._refresh_mode_status()
+
+    def refresh_pipeline(self, preserve_estimate_id: int | None = None) -> None:
+        records = get_dashboard_estimates()
+        self.pipeline_table.blockSignals(True)
+        self.pipeline_table.setRowCount(0)
+        for record in records:
+            row = self.pipeline_table.rowCount()
+            self.pipeline_table.insertRow(row)
+            total_value = float(record.get("TotalValue") or 0)
+            values = [
+                str(record.get("EstimateID") or ""),
+                str(record.get("CustomerName") or ""),
+                str(record.get("SiteName") or ""),
+                str(record.get("Status") or "Draft"),
+                f"${total_value:,.2f}",
+                str(record.get("CreatedDate") or "N/A"),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(record.get("EstimateID") or 0))
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 4:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.pipeline_table.setItem(row, column, item)
+        self.pipeline_table.blockSignals(False)
+        print(f"[EstimateEntryPage] Estimate pipeline rows loaded: {len(records)}")
+
+        target_id = preserve_estimate_id if preserve_estimate_id is not None else self.current_estimate_id
+        if target_id is not None:
+            self._reselect_pipeline_estimate(int(target_id))
+
+    def _reselect_pipeline_estimate(self, estimate_id: int) -> bool:
+        self.pipeline_table.blockSignals(True)
+        try:
+            for row in range(self.pipeline_table.rowCount()):
+                item = self.pipeline_table.item(row, 0)
+                if not item:
+                    continue
+                row_estimate_id = item.data(Qt.ItemDataRole.UserRole)
+                if int(row_estimate_id or 0) == estimate_id:
+                    self.pipeline_table.clearSelection()
+                    self.pipeline_table.selectRow(row)
+                    self.pipeline_table.setCurrentCell(row, 0)
+                    break
+            else:
+                return False
+        finally:
+            self.pipeline_table.blockSignals(False)
+        return True
+
+    def on_pipeline_select(self) -> None:
+        if self._suspend_estimate_selection_sync:
+            return
+        selection = self.pipeline_table.selectedItems()
+        if not selection:
+            return
+        row = self.pipeline_table.row(selection[0])
+        item = self.pipeline_table.item(row, 0)
+        if item is None:
+            return
+        estimate_id = item.data(Qt.ItemDataRole.UserRole)
+        if not estimate_id:
+            return
+        self.load_estimate_by_id(int(estimate_id), source="pipeline")
+
+    def load_estimate_by_id(self, estimate_id: int, *, source: str = "selection") -> None:
+        label = next((text for text, est_id in self.draft_dict.items() if est_id == estimate_id), None)
+        if label is None:
+            QMessageBox.warning(self, "Estimate Not Found", f"Estimate #{estimate_id} is no longer available to load.")
+            return
+        self._suspend_estimate_selection_sync = True
+        try:
+            self.current_estimate_id = estimate_id
+            self.draft_combo.blockSignals(True)
+            self.draft_combo.setCurrentText(label)
+            self.draft_combo.blockSignals(False)
+            if not self._reselect_pipeline_estimate(estimate_id):
+                self.refresh_pipeline(preserve_estimate_id=estimate_id)
+            self._load_estimate_label(label, source=source)
+        finally:
+            self._suspend_estimate_selection_sync = False
+
+    def _refresh_mode_status(self, *, source: str | None = None) -> None:
+        if self.current_estimate_id:
+            if source == "pipeline":
+                self._set_workspace_status(f"Estimate loaded from pipeline. Editing estimate #{self.current_estimate_id}.", "success")
+            elif source == "quick_load":
+                self._set_workspace_status(f"Editing estimate #{self.current_estimate_id}.", "success")
+            else:
+                self._set_workspace_status(f"Editing estimate #{self.current_estimate_id}.", "success")
+        else:
+            self._set_workspace_status("New estimate mode.", "info")
 
     def on_material_search(self, _text: str) -> None:
         self.m_desc.current_item_id = None
@@ -306,6 +490,13 @@ class EstimateEntryPage(QWidget):
         self.draft_combo.blockSignals(False)
 
     def load_selected_draft(self, selection: str) -> None:
+        if self._suspend_estimate_selection_sync:
+            return
+        if selection not in self.draft_dict:
+            return
+        self.load_estimate_by_id(int(self.draft_dict[selection]), source="quick_load")
+
+    def _load_estimate_label(self, selection: str, *, source: str = "selection") -> None:
         if selection not in self.draft_dict:
             return
 
@@ -372,6 +563,7 @@ class EstimateEntryPage(QWidget):
                 self.header_label.setStyleSheet("font-size: 16px; font-weight: 700; color: orange;")
         finally:
             self.is_loading = False
+            self._refresh_mode_status(source=source)
 
     def toggle_form_lock(self, lock: bool = True) -> None:
         self.form_locked = lock
@@ -647,7 +839,8 @@ class EstimateEntryPage(QWidget):
                 saved_estimate_id = new_id
 
             self.refresh_draft_list()
-            self.load_saved_estimate(saved_estimate_id)
+            self.refresh_pipeline(preserve_estimate_id=saved_estimate_id)
+            self.load_estimate_by_id(saved_estimate_id, source="pipeline")
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", f"Failed to save: {exc}")
             print(f"CRITICAL SAVE ERROR: {exc}")
@@ -657,18 +850,36 @@ class EstimateEntryPage(QWidget):
         self.mat_table.setRowCount(0)
         self.customer_combo.setCurrentText("")
         self.site_combo.setCurrentText("")
+        self.billing_combo.setCurrentIndex(0)
         self.scope_text.setPlainText("")
         self.mat_markup_edit.setText("20.0")
         self.lab_markup_edit.setText("20.0")
+        self.l_hours.setText("")
+        self.l_rate.setText("")
+        self.m_desc.setCurrentText("")
+        self.m_qty.setText("")
+        self.m_cost.setText("")
+        self.m_desc.current_item_id = None
+        self.m_desc.current_part_no = None
         self.update_grand_total()
         self.current_estimate_id = None
         self.header_label.setText("NEW ESTIMATE ENTRY")
         self.header_label.setStyleSheet("font-size: 16px; font-weight: 700; color: blue;")
         self.toggle_form_lock(False)
+        self._refresh_mode_status()
+
+    def create_new_estimate(self) -> None:
+        self._suspend_estimate_selection_sync = True
+        try:
+            self.pipeline_table.clearSelection()
+            self.draft_combo.blockSignals(True)
+            self.draft_combo.setCurrentIndex(-1)
+            self.draft_combo.setCurrentText("")
+            self.draft_combo.blockSignals(False)
+        finally:
+            self._suspend_estimate_selection_sync = False
+        self.clear_form()
+        self._set_workspace_status("New estimate mode. Start entering estimate data.", "info")
 
     def load_saved_estimate(self, estimate_id: int) -> None:
-        for label, est_id in self.draft_dict.items():
-            if est_id == estimate_id:
-                self.draft_combo.setCurrentText(label)
-                self.load_selected_draft(label)
-                return
+        self.load_estimate_by_id(estimate_id, source="selection")

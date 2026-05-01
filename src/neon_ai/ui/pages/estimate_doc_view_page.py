@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -37,7 +38,12 @@ from neon_ai.database.estimates import (
     recalculate_estimate_totals,
     update_estimate_status,
 )
-from neon_ai.database.rfq import create_and_send_rfq_batch, get_estimate_rfq_status, get_vendor_choices
+from neon_ai.database.rfq import (
+    create_and_send_rfq_batch,
+    create_rfq_batch_without_sending,
+    get_estimate_rfq_status,
+    get_vendor_choices,
+)
 from neon_ai.services.estimate_document_draft_service import (
     get_draft_for_display,
     get_or_create_active_draft,
@@ -45,7 +51,12 @@ from neon_ai.services.estimate_document_draft_service import (
     record_exported_file_path,
     save_draft,
 )
-from neon_ai.services.estimate_document_send_service import can_send_estimate_document_draft
+from neon_ai.services.estimate_document_send_service import (
+    can_send_estimate_document_draft,
+    prepare_estimate_delivery_message,
+    send_estimate_document_draft,
+)
+from neon_ai.services.rfq_send_service import prepare_rfq_batch_preview
 from neon_ai.services.document_generation_service import (
     export_estimate_document_draft,
     generate_estimate_document_record,
@@ -78,14 +89,17 @@ def save_rfq_email_memory(memory: dict) -> None:
 
 
 class CreateRFQDialog(QDialog):
-    def __init__(self, parent, vendors: list[dict]) -> None:
+    def __init__(self, parent, estimate_id: int, vendors: list[dict]) -> None:
         super().__init__(parent)
         self.setWindowTitle("Create RFQ")
         self.setModal(True)
         self.result: dict | None = None
+        self.estimate_id = int(estimate_id)
         self.vendors = vendors or []
         self.vendor_widgets: dict[int, tuple[QCheckBox, QLineEdit, str]] = {}
         self.email_memory = load_rfq_email_memory()
+        self.prepared_batch_rows: list[dict] = []
+        self.prepared_batch_signature: tuple | None = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -134,12 +148,28 @@ class CreateRFQDialog(QDialog):
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
         footer_layout.addWidget(cancel_button)
-        submit_button = QPushButton("Create & Send RFQs")
-        submit_button.clicked.connect(self.on_submit)
-        footer_layout.addWidget(submit_button)
+        preview_button = QPushButton("Preview RFQ Batch")
+        preview_button.clicked.connect(self.on_preview_batch)
+        footer_layout.addWidget(preview_button)
+        self.submit_button = QPushButton("Create & Send RFQs")
+        self.submit_button.clicked.connect(self.on_submit)
+        footer_layout.addWidget(self.submit_button)
         layout.addWidget(footer)
 
-    def on_submit(self) -> None:
+    def _selection_signature(self, selected: list[dict], due_date: str) -> tuple:
+        normalized = tuple(
+            sorted(
+                (
+                    int(vendor["vendor_id"]),
+                    str(vendor["vendor_name"] or "").strip(),
+                    str(vendor["recipient_email"] or "").strip().lower(),
+                )
+                for vendor in selected
+            )
+        )
+        return (str(due_date or "").strip(), normalized)
+
+    def _collect_selected_vendors(self) -> list[dict]:
         selected: list[dict] = []
         for vendor_id, (enabled, email_field, vendor_name) in self.vendor_widgets.items():
             if enabled.isChecked():
@@ -156,18 +186,161 @@ class CreateRFQDialog(QDialog):
                 )
 
         if not selected:
-            QMessageBox.warning(self, "No Vendors Selected", "Select at least one wholesaler to create RFQs.")
+            raise ValueError("Select at least one wholesaler to create RFQs.")
+
+        return selected
+
+    def _remember_selected_vendor_emails(self, selected: list[dict]) -> None:
+        updated_memory = dict(self.email_memory)
+        for vendor in selected:
+            updated_memory[str(vendor["vendor_id"])] = vendor["recipient_email"]
+            updated_memory[vendor["vendor_name"]] = vendor["recipient_email"]
+        save_rfq_email_memory(updated_memory)
+
+    def _show_batch_preview_dialog(self, preview: dict) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview RFQ Batch")
+        dialog.resize(980, 620)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        summary = QLabel(
+            "Preview only. No email is sent in this workflow.\n"
+            f"Prepared RFQ drafts: {len(preview.get('Rows') or [])} | "
+            f"Ready: {preview.get('ReadyCount') or 0} | "
+            f"Errors: {preview.get('ErrorCount') or 0}"
+        )
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color: #8a5a00; font-weight: 600;")
+        layout.addWidget(summary)
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["RFQ", "Vendor", "Email", "Status", "Attachment", "Subject"])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.setColumnWidth(0, 70)
+        table.setColumnWidth(1, 180)
+        table.setColumnWidth(2, 220)
+        table.setColumnWidth(3, 110)
+        table.setColumnWidth(4, 260)
+        table.setColumnWidth(5, 240)
+
+        rows = preview.get("Rows") or []
+        for row_data in rows:
+            row = table.rowCount()
+            table.insertRow(row)
+            values = [
+                str(row_data.get("PriceRequestID") or row_data.get("RFQID") or ""),
+                str(row_data.get("VendorName") or ""),
+                str(row_data.get("ResolvedRecipientEmail") or row_data.get("VendorEmail") or ""),
+                "Ready" if row_data.get("PreviewReady") else "Blocked",
+                str(row_data.get("AttachmentPath") or ""),
+                str(row_data.get("Subject") or ""),
+            ]
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(value))
+        layout.addWidget(table, 1)
+
+        body_label = QLabel("Body Preview / Validation Detail")
+        layout.addWidget(body_label)
+        body_box = QPlainTextEdit()
+        body_box.setReadOnly(True)
+        layout.addWidget(body_box, 1)
+
+        def refresh_detail() -> None:
+            selected_row = table.currentRow()
+            if selected_row < 0 or selected_row >= len(rows):
+                body_box.setPlainText("")
+                return
+            row_data = rows[selected_row]
+            body_box.setPlainText(
+                f"Vendor: {row_data.get('VendorName') or ''}\n"
+                f"RFQ ID: {row_data.get('PriceRequestID') or row_data.get('RFQID') or ''}\n"
+                f"Status: {'Ready' if row_data.get('PreviewReady') else 'Blocked'}\n"
+                f"Reason: {row_data.get('PreviewReason') or ''}\n"
+                f"Attachment: {row_data.get('AttachmentPath') or ''}\n\n"
+                f"{row_data.get('Body') or ''}"
+            )
+
+        table.itemSelectionChanged.connect(refresh_detail)
+        if rows:
+            table.selectRow(0)
+            refresh_detail()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
+
+    def on_preview_batch(self) -> None:
+        try:
+            selected = self._collect_selected_vendors()
+        except ValueError as exc:
+            QMessageBox.warning(self, "No Vendors Selected", str(exc))
+            return
+
+        due_date = self.due_date_field.text().strip()
+        signature = self._selection_signature(selected, due_date)
+        if self.prepared_batch_signature and signature != self.prepared_batch_signature:
+            QMessageBox.warning(
+                self,
+                "Batch Already Prepared",
+                "This dialog has already prepared an RFQ batch preview.\n"
+                "Close it and reopen the batch dialog before previewing a different vendor selection."
+                "\n\nThis prevents duplicate RFQ drafts from being created accidentally.",
+            )
+            return
+
+        try:
+            if not self.prepared_batch_rows:
+                self.prepared_batch_rows = create_rfq_batch_without_sending(
+                    self.estimate_id,
+                    selected,
+                    due_date or None,
+                )
+                self.prepared_batch_signature = signature
+                self._remember_selected_vendor_emails(selected)
+
+            preview = prepare_rfq_batch_preview([row["rfq_id"] for row in self.prepared_batch_rows])
+            if not preview.get("success"):
+                QMessageBox.warning(
+                    self,
+                    "Preview Unavailable",
+                    str(preview.get("reason") or "RFQ batch preview could not be prepared."),
+                )
+                return
+            self._show_batch_preview_dialog(preview)
+        except Exception as exc:
+            QMessageBox.critical(self, "Batch Preview Error", str(exc))
+
+    def on_submit(self) -> None:
+        if self.prepared_batch_rows:
+            QMessageBox.information(
+                self,
+                "Legacy Batch Send Blocked After Preview",
+                "This RFQ batch has already been prepared for preview.\n"
+                "No email was sent, and the draft RFQs were created successfully."
+                "\n\nClose this dialog and continue from the RFQ workspace to review the created RFQs."
+                "\nLegacy create-and-send is blocked after preview to avoid duplicate RFQ drafts or duplicate vendor sends.",
+            )
+            return
+
+        try:
+            selected = self._collect_selected_vendors()
+        except ValueError as exc:
+            QMessageBox.warning(self, "No Vendors Selected", str(exc))
             return
 
         self.result = {
             "due_date": self.due_date_field.text().strip(),
             "vendors": selected,
         }
-        updated_memory = dict(self.email_memory)
-        for vendor in selected:
-            updated_memory[str(vendor["vendor_id"])] = vendor["recipient_email"]
-            updated_memory[vendor["vendor_name"]] = vendor["recipient_email"]
-        save_rfq_email_memory(updated_memory)
+        self._remember_selected_vendor_emails(selected)
         self.accept()
 
 
@@ -352,7 +525,7 @@ class EstimateDocViewPage(QWidget):
         self.btn_send_customer = QPushButton("Send to Customer")
         self.btn_send_customer.clicked.connect(self.validate_send_to_customer)
         self.btn_send_customer.setEnabled(False)
-        self.btn_send_customer.setToolTip("Send to Customer is not wired yet in this workspace slice.")
+        self.btn_send_customer.setToolTip("Send to Customer validation is unavailable.")
         primary_button_layout.addWidget(self.btn_send_customer)
         primary_button_layout.addStretch(1)
         layout.addWidget(primary_button_row)
@@ -548,7 +721,7 @@ class EstimateDocViewPage(QWidget):
             QMessageBox.warning(self, "No Vendors", "No wholesalers are set up yet in the vendor list.")
             return
 
-        dialog = CreateRFQDialog(self, vendors)
+        dialog = CreateRFQDialog(self, self.current_loaded_id, vendors)
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result:
             return
 
@@ -1060,7 +1233,12 @@ class EstimateDocViewPage(QWidget):
     def _update_send_button_state(self) -> None:
         can_send, reason, _context = self._current_send_validation()
         self.btn_send_customer.setEnabled(can_send)
-        self.btn_send_customer.setToolTip(reason or "Send to Customer validation is unavailable.")
+        if can_send:
+            self.btn_send_customer.setToolTip(
+                "Draft is send-ready. Review and confirm to send the locked/exported estimate draft."
+            )
+        else:
+            self.btn_send_customer.setToolTip(reason or "Send to Customer validation is unavailable.")
 
     def validate_send_to_customer(self) -> None:
         can_send, reason, context = self._current_send_validation()
@@ -1072,23 +1250,183 @@ class EstimateDocViewPage(QWidget):
             )
             return
 
-        customer_name = str(context.get("CustomerName") or "Unknown Customer")
-        customer_email = str(context.get("CustomerEmail") or "Not available")
-        estimate_id = context.get("EstimateID") or "Unknown"
-        draft_id = context.get("EstimateDocumentDraftID") or "Unknown"
-        attachment_path = str(context.get("FinalFilePath") or "Not available")
+        draft_id = context.get("EstimateDocumentDraftID")
+        try:
+            normalized_draft_id = int(draft_id) if draft_id is not None else None
+        except (TypeError, ValueError):
+            normalized_draft_id = None
+        if normalized_draft_id is None:
+            QMessageBox.warning(
+                self,
+                "Estimate Send Preview Unavailable",
+                "Estimate document draft was not found.",
+            )
+            return
 
+        preview = prepare_estimate_delivery_message(normalized_draft_id)
+        if not preview.get("success"):
+            QMessageBox.warning(
+                self,
+                "Estimate Send Preview Unavailable",
+                str(preview.get("reason") or "Estimate send preview could not be prepared."),
+            )
+            return
+
+        confirmation = self._show_send_confirmation_dialog(preview)
+        if not confirmation:
+            return
+
+        send_result = send_estimate_document_draft(
+            normalized_draft_id,
+            sent_by="UI",
+            override_recipient=confirmation.get("override_recipient"),
+        )
+        if not send_result.get("success"):
+            delivery_confirmed = bool(send_result.get("DeliveryConfirmed"))
+            failure_message = str(send_result.get("reason") or "Estimate send failed.")
+            if delivery_confirmed:
+                failure_message += (
+                    "\n\nThe email gateway appears to have accepted the send, but draft or estimate status updates did not complete."
+                    "\nReview the outbound log before retrying to avoid a duplicate delivery."
+                )
+            message_box = QMessageBox(self)
+            message_box.setWindowTitle("Estimate Send Failed")
+            message_box.setText(failure_message)
+            message_box.setIcon(
+                QMessageBox.Icon.Warning if delivery_confirmed else QMessageBox.Icon.Critical
+            )
+            message_box.exec()
+            return
+
+        preserved_estimate_id = int(self.current_loaded_id) if self.current_loaded_id else None
+        self.refresh_data()
+        if preserved_estimate_id is not None:
+            for row in range(self.tree.rowCount()):
+                item = self.tree.item(row, 0)
+                if item and int(item.text()) == preserved_estimate_id:
+                    self.tree.selectRow(row)
+                    self.on_select()
+                    break
+
+        resolved_recipient = str(
+            send_result.get("ResolvedRecipientEmail") or preview.get("CustomerEmail") or ""
+        ).strip()
         QMessageBox.information(
             self,
-            "Send To Customer Validation",
-            "This draft passed send validation.\n\n"
-            f"Customer: {customer_name}\n"
-            f"Customer Email: {customer_email}\n"
-            f"Estimate ID: {estimate_id}\n"
-            f"Draft ID: {draft_id}\n"
-            f"Attachment Path: {attachment_path}\n\n"
-            "Sending is not wired in this validation slice.",
+            "Estimate Sent",
+            "The locked/exported estimate draft was sent successfully."
+            f"\n\nRecipient: {resolved_recipient}"
+            f"\nAttachment: {send_result.get('FinalFilePath') or send_result.get('AttachmentPath') or 'Unknown'}",
         )
+
+    def _show_send_confirmation_dialog(self, preview: dict) -> dict | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confirm Estimate Send")
+        dialog.resize(780, 700)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "This will send the locked/exported estimate draft attachment.\n"
+            "It will mark the estimate draft as Sent if successful.\n"
+            "It will update estimate sent state only after success."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8a5a00; font-weight: 600;")
+        layout.addWidget(intro)
+
+        meta = QLabel(
+            f"Customer: {str(preview.get('CustomerName') or 'Unknown Customer')}\n"
+            f"Estimate ID: {preview.get('EstimateID') or 'Unknown'}\n"
+            f"Draft ID: {preview.get('EstimateDocumentDraftID') or 'Unknown'}"
+        )
+        meta.setWordWrap(True)
+        layout.addWidget(meta)
+
+        to_label = QLabel("To")
+        layout.addWidget(to_label)
+        to_field = QLineEdit(str(preview.get("CustomerEmail") or ""))
+        to_field.setReadOnly(True)
+        layout.addWidget(to_field)
+
+        override_label = QLabel("Test Recipient Override (optional)")
+        layout.addWidget(override_label)
+        override_field = QLineEdit("")
+        override_field.setPlaceholderText("Leave blank to send to the customer email above.")
+        layout.addWidget(override_field)
+
+        original_label = QLabel("Original Customer Email")
+        layout.addWidget(original_label)
+        original_field = QLineEdit(str(preview.get("CustomerEmail") or ""))
+        original_field.setReadOnly(True)
+        layout.addWidget(original_field)
+
+        subject_label = QLabel("Subject")
+        layout.addWidget(subject_label)
+        subject_field = QLineEdit(str(preview.get("Subject") or ""))
+        subject_field.setReadOnly(True)
+        layout.addWidget(subject_field)
+
+        attachment_label = QLabel("Attachment Path")
+        layout.addWidget(attachment_label)
+        attachment_field = QLineEdit(str(preview.get("FinalFilePath") or ""))
+        attachment_field.setReadOnly(True)
+        layout.addWidget(attachment_field)
+
+        template_used = preview.get("TemplateUsed")
+        template_id = preview.get("TemplateID")
+        template_version_id = preview.get("TemplateVersionID")
+        template_note = (
+            f"Template used: {template_used} #{template_id} / version #{template_version_id}"
+            if template_used and template_id is not None and template_version_id is not None
+            else (
+                f"Template used: {template_used}"
+                if template_used
+                else "Template used: fallback"
+            )
+        )
+        template_label = QLabel(template_note)
+        template_label.setWordWrap(True)
+        template_label.setStyleSheet("color: #5f6368;")
+        layout.addWidget(template_label)
+
+        body_label = QLabel("Body")
+        layout.addWidget(body_label)
+        body_view = QPlainTextEdit()
+        body_view.setReadOnly(True)
+        body_view.setPlainText(str(preview.get("Body") or ""))
+        layout.addWidget(body_view, 1)
+
+        result: dict[str, str | None] = {"override_recipient": None}
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(dialog.reject)
+        footer.addWidget(cancel_button)
+        send_button = QPushButton("Send Estimate")
+
+        def _confirm_send() -> None:
+            override_text = str(override_field.text() or "").strip()
+            if override_text and ("@" not in override_text or "." not in override_text.rsplit("@", 1)[-1]):
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid Override Recipient",
+                    "Enter a valid test recipient email or leave the override blank.",
+                )
+                return
+            result["override_recipient"] = override_text or None
+            dialog.accept()
+
+        send_button.clicked.connect(_confirm_send)
+        footer.addWidget(send_button)
+        layout.addLayout(footer)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return result
 
     def _clear_metadata(self) -> None:
         for label in (

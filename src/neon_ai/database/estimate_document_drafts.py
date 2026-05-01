@@ -372,6 +372,53 @@ def lock_estimate_document_draft(
         conn.close()
 
 
+def mark_estimate_document_draft_sent(draft_id: int) -> dict[str, Any]:
+    ensure_estimate_document_draft_table()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT *
+            FROM public."EstimateDocumentDraft"
+            WHERE "EstimateDocumentDraftID" = %s
+            FOR UPDATE
+            """,
+            (draft_id,),
+        )
+        current = cur.fetchone()
+        if not current:
+            raise ValueError(f"EstimateDocumentDraft #{draft_id} was not found.")
+
+        current_status = str(current.get("DraftStatus") or "").strip()
+        if current_status != "Locked":
+            raise ValueError(
+                f"EstimateDocumentDraft #{draft_id} cannot be marked sent because it is {current_status or 'not locked'}."
+            )
+
+        cur.execute(
+            """
+            UPDATE public."EstimateDocumentDraft"
+            SET "DraftStatus" = 'Sent',
+                "SentAt" = NOW(),
+                "UpdatedAt" = NOW(),
+                "IsActive" = TRUE
+            WHERE "EstimateDocumentDraftID" = %s
+            RETURNING *
+            """,
+            (draft_id,),
+        )
+        sent_draft = cur.fetchone()
+        conn.commit()
+        return sent_draft
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def retire_estimate_document_draft(draft_id: int) -> dict[str, Any]:
     ensure_estimate_document_draft_table()
 

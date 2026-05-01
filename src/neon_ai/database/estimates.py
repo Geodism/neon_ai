@@ -465,7 +465,7 @@ def get_dashboard_estimates():
             cur.execute("""
                 SELECT 
                     e."EstimateID", 
-                    COALESCE(e."CreatedDate"::text, 'N/A'), 
+                    COALESCE(e."CreatedDate"::text, 'N/A') AS "CreatedDate", 
                     c."CustomerName", 
                     s."SiteName", 
                     COALESCE(e."Status", 'Draft') AS "Status",
@@ -605,6 +605,34 @@ def update_estimate_status(estimate_id: int, new_status: str):
         return False
     finally:
         conn.close()
+
+
+def mark_estimate_sent(estimate_id: int):
+    """Marks an estimate as sent and stamps SubmitDate using the legacy estimate convention."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE "Estimate"
+            SET "Status" = %s,
+                "SubmitDate" = CURRENT_DATE
+            WHERE "EstimateID" = %s
+            RETURNING *
+            """,
+            (normalize_estimate_status("Sent"), estimate_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Estimate #{estimate_id} was not found.")
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def get_draft_estimates():
     """Fetches a list of open drafts for the dropdown."""

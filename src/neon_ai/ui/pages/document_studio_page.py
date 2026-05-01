@@ -44,6 +44,7 @@ class DocumentStudioPage(QWidget):
         self._token_help_map: dict[str, str] = {}
         self._estimate_default_usage_context = "ESTIMATE_DRAFT_WORKSPACE"
         self._invoice_default_usage_context = "CUSTOMER_INVOICE_DRAFT_WORKSPACE"
+        self._invoice_delivery_default_usage_context = "CUSTOMER_INVOICE_SEND"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -543,6 +544,14 @@ class DocumentStudioPage(QWidget):
                 "button_prefix": "Invoice",
                 "label_prefix": "Invoice draft",
                 "workspace_label": "invoice draft workspace",
+            }
+        if document_type_code == "CUSTOMER_INVOICE_DELIVERY" and kind == DocumentTemplateKind.BODY:
+            return {
+                "document_type_code": "CUSTOMER_INVOICE_DELIVERY",
+                "usage_context": self._invoice_delivery_default_usage_context,
+                "button_prefix": "Invoice Delivery",
+                "label_prefix": "Invoice delivery",
+                "workspace_label": "invoice send preview workflow",
             }
         return None
 

@@ -437,3 +437,52 @@ def retire_customer_invoice_document_draft(draft_id: int) -> dict[str, Any]:
         raise
     finally:
         conn.close()
+
+
+def mark_customer_invoice_document_draft_sent(
+    draft_id: int,
+) -> dict[str, Any]:
+    ensure_customer_invoice_document_draft_table()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT *
+            FROM public."CustomerInvoiceDocumentDraft"
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
+            FOR UPDATE
+            """,
+            (draft_id,),
+        )
+        current = cur.fetchone()
+        if not current:
+            raise ValueError(f"CustomerInvoiceDocumentDraft #{draft_id} was not found.")
+
+        current_status = str(current.get("DraftStatus") or "").strip()
+        if current_status == "Sent":
+            return current
+        if current_status != "Locked":
+            raise ValueError("Only locked invoice document drafts can be marked sent.")
+
+        cur.execute(
+            """
+            UPDATE public."CustomerInvoiceDocumentDraft"
+            SET "DraftStatus" = 'Sent',
+                "SentAt" = NOW(),
+                "UpdatedAt" = NOW(),
+                "IsActive" = 1
+            WHERE "CustomerInvoiceDocumentDraftID" = %s
+            RETURNING *
+            """,
+            (draft_id,),
+        )
+        sent = cur.fetchone()
+        conn.commit()
+        return sent
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

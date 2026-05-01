@@ -644,6 +644,321 @@ def get_unbilled_workorders():
     return results
 
 
+def get_invoice_pipeline_candidates():
+    ensure_invoice_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            WITH latest_invoice AS (
+                SELECT DISTINCT ON (i."WorkOrderID")
+                    i."WorkOrderID",
+                    i."CustomerInvoiceId",
+                    COALESCE(i."InvoiceStatus", '') AS "InvoiceStatus",
+                    i."CustomerInvoiceAmount",
+                    i."CustomerInvoiceDate",
+                    i."CustomerInvoiceDocPath"
+                FROM "Invoice" i
+                WHERE COALESCE(i."InvoiceStatus", '') != 'Retired'
+                ORDER BY i."WorkOrderID", i."CustomerInvoiceId" DESC
+            ),
+            latest_document_draft AS (
+                SELECT DISTINCT ON (d."CustomerInvoiceId")
+                    d."CustomerInvoiceId",
+                    d."CustomerInvoiceDocumentDraftID",
+                    COALESCE(d."DraftStatus", '') AS "DraftStatus",
+                    d."FinalFilePath",
+                    d."IsActive"
+                FROM public."CustomerInvoiceDocumentDraft" d
+                WHERE d."IsActive" = 1
+                  AND COALESCE(d."DraftStatus", '') != 'Retired'
+                ORDER BY d."CustomerInvoiceId", d."VersionNumber" DESC, d."CustomerInvoiceDocumentDraftID" DESC
+            )
+            SELECT
+                wo."WorkOrderID",
+                COALESCE(wo."IsClosed", FALSE) AS "IsClosed",
+                wo."BillingType",
+                c."CustomerName",
+                s."SiteName",
+                li."CustomerInvoiceId",
+                li."InvoiceStatus",
+                li."CustomerInvoiceAmount",
+                li."CustomerInvoiceDate",
+                li."CustomerInvoiceDocPath",
+                ld."CustomerInvoiceDocumentDraftID",
+                ld."DraftStatus" AS "DocumentDraftStatus",
+                ld."FinalFilePath"
+            FROM "WorkOrder" wo
+            JOIN "Site" s ON wo."SiteID" = s."SiteID"
+            JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+            LEFT JOIN latest_invoice li
+                ON li."WorkOrderID" = wo."WorkOrderID"
+            LEFT JOIN latest_document_draft ld
+                ON ld."CustomerInvoiceId" = li."CustomerInvoiceId"
+            ORDER BY wo."WorkOrderID" DESC
+            '''
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    included: list[dict] = []
+    excluded: list[dict[str, object]] = []
+
+    for row in rows:
+        work_order_id = int(row["WorkOrderID"])
+        is_closed = bool(row.get("IsClosed"))
+        customer_invoice_id = row.get("CustomerInvoiceId")
+        invoice_status = str(row.get("InvoiceStatus") or "").strip()
+        draft_id = row.get("CustomerInvoiceDocumentDraftID")
+        draft_status = str(row.get("DocumentDraftStatus") or "").strip()
+        has_invoice = customer_invoice_id is not None
+        has_document_draft = draft_id is not None
+        has_exported_draft_file = bool(str(row.get("FinalFilePath") or "").strip())
+        has_legacy_doc_path = bool(str(row.get("CustomerInvoiceDocPath") or "").strip())
+
+        include = (not is_closed) or has_invoice or has_document_draft
+        if not include:
+            excluded.append(
+                {
+                    "WorkOrderID": work_order_id,
+                    "reason": "closed with no invoice or document activity",
+                }
+            )
+            continue
+
+        if not has_invoice:
+            invoice_state = "No invoice record"
+        elif invoice_status:
+            invoice_state = invoice_status
+        else:
+            invoice_state = "Needs attention"
+
+        row["WorkOrderStatus"] = "CLOSED" if is_closed else "OPEN"
+
+        if not has_invoice:
+            document_state = "Create/save invoice data first"
+        elif has_document_draft:
+            if draft_status == "Locked" and has_exported_draft_file:
+                document_state = "Document locked / exported"
+            elif draft_status == "Locked":
+                document_state = "Document locked"
+            elif draft_status == "Sent":
+                document_state = "Document sent"
+            elif draft_status == "Draft":
+                document_state = "Invoice document draft exists"
+            else:
+                document_state = draft_status or "Invoice document draft exists"
+        elif has_legacy_doc_path:
+            document_state = "Legacy exported only"
+        else:
+            document_state = "No document draft"
+
+        row["InvoiceState"] = invoice_state
+        row["DocumentState"] = document_state
+        included.append(row)
+
+    print(
+        "[InvoicePipeline] "
+        f"total_work_orders_considered={len(rows)} | "
+        f"rows_included={len(included)} | "
+        f"rows_excluded={len(excluded)}"
+    )
+    if excluded:
+        excluded_preview = ", ".join(
+            f"WO #{item['WorkOrderID']}: {item['reason']}" for item in excluded[:10]
+        )
+        print(f"[InvoicePipeline] excluded_rows_preview={excluded_preview}")
+
+    return included
+
+
+def list_invoices_and_drafts_for_work_order(wo_id: int):
+    ensure_invoice_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            WITH active_document_drafts AS (
+                SELECT DISTINCT ON (d."CustomerInvoiceId")
+                    d."CustomerInvoiceId",
+                    d."CustomerInvoiceDocumentDraftID",
+                    COALESCE(d."DraftStatus", '') AS "DocumentDraftStatus",
+                    d."FinalFilePath",
+                    d."SentAt"
+                FROM public."CustomerInvoiceDocumentDraft" d
+                WHERE d."IsActive" = 1
+                  AND COALESCE(d."DraftStatus", '') != 'Retired'
+                ORDER BY d."CustomerInvoiceId", d."VersionNumber" DESC, d."CustomerInvoiceDocumentDraftID" DESC
+            )
+            SELECT
+                i."CustomerInvoiceId",
+                i."WorkOrderID",
+                COALESCE(i."InvoiceStatus", '') AS "InvoiceStatus",
+                i."CustomerInvoiceAmount",
+                i."CustomerInvoiceDate",
+                i."CustomerInvoiceDocPath",
+                i."CustomerInvoiceSentAt",
+                d."CustomerInvoiceDocumentDraftID",
+                COALESCE(d."DocumentDraftStatus", '') AS "DocumentDraftStatus",
+                d."FinalFilePath",
+                d."SentAt" AS "DocumentDraftSentAt"
+            FROM "Invoice" i
+            LEFT JOIN active_document_drafts d
+                ON d."CustomerInvoiceId" = i."CustomerInvoiceId"
+            WHERE i."WorkOrderID" = %s
+              AND COALESCE(i."InvoiceStatus", '') != 'Retired'
+            ORDER BY i."CustomerInvoiceId" DESC
+            ''',
+            (wo_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    results = []
+    for row in rows:
+        invoice_status = str(row.get("InvoiceStatus") or "").strip()
+        document_draft_status = str(row.get("DocumentDraftStatus") or "").strip()
+        legacy_doc_path = str(row.get("CustomerInvoiceDocPath") or "").strip()
+        final_file_path = str(row.get("FinalFilePath") or "").strip()
+        has_export = bool(final_file_path or legacy_doc_path)
+        sent_marker = row.get("DocumentDraftSentAt") or row.get("CustomerInvoiceSentAt")
+
+        if document_draft_status:
+            document_state = document_draft_status
+        elif legacy_doc_path:
+            document_state = "Legacy exported only"
+        else:
+            document_state = "No document draft"
+
+        row["DocumentState"] = document_state
+        row["HasExport"] = "Yes" if has_export else "No"
+        row["SentStatus"] = "Sent" if sent_marker or invoice_status in {"Sent", "Paid"} else ""
+        results.append(row)
+
+    print(
+        "[InvoicePipelineDetail] "
+        f"WorkOrderID={wo_id} | invoice_rows_loaded={len(results)}"
+    )
+    return results
+
+
+def get_work_order_invoice_financial_summary(work_order_id: int) -> dict:
+    ensure_invoice_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                wo."WorkOrderID",
+                wo."SourceEstimateID",
+                wo."BillingType",
+                e."TotalAmount" AS "EstimateTotal"
+            FROM "WorkOrder" wo
+            LEFT JOIN "Estimate" e ON e."EstimateID" = wo."SourceEstimateID"
+            WHERE wo."WorkOrderID" = %s
+            ''',
+            (work_order_id,),
+        )
+        work_order_row = cur.fetchone()
+        if not work_order_row:
+            raise ValueError(f"Work Order #{work_order_id} could not be found.")
+
+        cur.execute(
+            '''
+            SELECT
+                COALESCE(SUM("CustomerInvoiceAmount"::numeric), 0) AS "PreviouslyInvoicedAmount",
+                COUNT(*) FILTER (WHERE COALESCE("InvoiceStatus", '') = 'Draft') AS "DraftInvoiceCount"
+            FROM "Invoice"
+            WHERE "WorkOrderID" = %s
+              AND COALESCE("InvoiceStatus", '') IN ('Exported', 'Sent', 'Paid', 'Draft')
+            ''',
+            (work_order_id,),
+        )
+        invoice_totals = cur.fetchone() or {}
+
+        cur.execute(
+            '''
+            SELECT
+                COALESCE(
+                    SUM(
+                        COALESCE(t."HoursWorked", 0) *
+                        (
+                            COALESCE(NULLIF(t."HourlyRate", 0), NULLIF(e."EmployeeRate", 0), 0) *
+                            (1 + (COALESCE(e."EmployeeBurden", 0) / 100.0))
+                        )
+                    ),
+                    0
+                ) AS "LabourCostToDate"
+            FROM "Time" t
+            LEFT JOIN "Employee" e ON t."WorkerID" = e."EmployeeID"
+            WHERE t."WorkOrderID" = %s
+              AND COALESCE(t."Status", '') != 'Retired'
+            ''',
+            (work_order_id,),
+        )
+        labour_totals = cur.fetchone() or {}
+
+        cur.execute(
+            '''
+            SELECT
+                COALESCE(SUM(COALESCE(po."PurchaseOrderTotal", 0)::numeric), 0) AS "ApprovedPurchaseOrderCost"
+            FROM "PurchaseOrder" po
+            WHERE po."WorkOrderID" = %s
+              AND COALESCE(po."Status", '') NOT IN ('Draft', 'Retired')
+            ''',
+            (work_order_id,),
+        )
+        po_totals = cur.fetchone() or {}
+    finally:
+        conn.close()
+
+    total_estimate_amount = float(work_order_row.get("EstimateTotal") or 0)
+    previously_invoiced_amount = float(invoice_totals.get("PreviouslyInvoicedAmount") or 0)
+    labour_cost_to_date = float(labour_totals.get("LabourCostToDate") or 0)
+    approved_purchase_order_cost = float(po_totals.get("ApprovedPurchaseOrderCost") or 0)
+    committed_cost = labour_cost_to_date + approved_purchase_order_cost
+    amount_still_to_invoice = total_estimate_amount - previously_invoiced_amount
+    billing_position_amount = previously_invoiced_amount - committed_cost
+    estimate_position_amount = total_estimate_amount - committed_cost
+
+    notes: list[str] = []
+    if not work_order_row.get("SourceEstimateID"):
+        notes.append("No source estimate is linked to this work order.")
+    if total_estimate_amount <= 0:
+        notes.append("Total Estimate is unavailable, so estimate-based positions may be incomplete.")
+
+    draft_invoice_count = int(invoice_totals.get("DraftInvoiceCount") or 0)
+    if draft_invoice_count:
+        notes.append(
+            f"Draft invoices are excluded from Previously Invoiced ({draft_invoice_count} draft invoice(s) found)."
+        )
+
+    notes.append(
+        "Committed Cost includes labour cost to date plus purchase orders whose status is not Draft or Retired."
+    )
+
+    return {
+        "WorkOrderID": int(work_order_row["WorkOrderID"]),
+        "SourceEstimateID": work_order_row.get("SourceEstimateID"),
+        "TotalEstimateAmount": total_estimate_amount,
+        "PreviouslyInvoicedAmount": previously_invoiced_amount,
+        "AmountStillToInvoice": amount_still_to_invoice,
+        "LabourCostToDate": labour_cost_to_date,
+        "ApprovedPurchaseOrderCost": approved_purchase_order_cost,
+        "CommittedCost": committed_cost,
+        "BillingPositionAmount": billing_position_amount,
+        "BillingPositionLabel": "In the Black" if billing_position_amount >= 0 else "In the Red",
+        "EstimatePositionAmount": estimate_position_amount,
+        "EstimatePositionLabel": "Within Estimate" if estimate_position_amount >= 0 else "Over Estimate",
+        "Notes": notes,
+    }
+
+
 def get_accounts_receivable():
     ensure_invoice_schema()
     conn = get_connection()

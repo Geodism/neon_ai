@@ -11,11 +11,17 @@ from psycopg2.extras import RealDictCursor
 # sweeper queries still work without excluding historical purchase orders.
 AUTOMATION_MIN_DATE = datetime.date(1900, 1, 1)
 PO_DISPATCH_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "po_dispatch_log.json")
+LEGACY_PO_AUTO_SEND_ENV = "NEON_ENABLE_LEGACY_PO_AUTO_SEND"
+BACKGROUND_VENDOR_PO_FOLLOWUPS_ENV = "NEON_ENABLE_BACKGROUND_VENDOR_PO_FOLLOWUPS"
 
 
 def _perf_log(area: str, name: str, started_at: float) -> None:
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
+
+
+def _background_vendor_po_followups_enabled() -> bool:
+    return str(os.getenv(BACKGROUND_VENDOR_PO_FOLLOWUPS_ENV, "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def ensure_purchase_schema():
@@ -1328,19 +1334,26 @@ def sweep_for_backordered_purchase_orders():
                 last_vendor_followup = None
 
         if recipient_email and (last_vendor_followup is None or today >= last_vendor_followup.date() + datetime.timedelta(days=7)):
-            sent = send_to_user(
-                subject=f"Backorder ETA Request: PO #{po_id}",
-                content=(
-                    f"Hello {po['VendorName']},\n\n"
-                    f"We have received the first delivery for Purchase Order #{po_id}, but there are still outstanding backordered items for {po.get('SiteName') or 'the project'}.\n\n"
-                    "Please let us know the expected arrival date for the remaining material and advise if there are any supply issues we should plan around.\n\n"
-                    "Thank you,\nArgon Electrical"
-                ),
-                recipient=recipient_email,
-                cc_recipients=[MY_EMAIL]
-            )
-            if sent:
-                update_payload["last_backorder_vendor_followup_at"] = datetime.datetime.now().isoformat()
+            if not _background_vendor_po_followups_enabled():
+                print(
+                    "PO Sweeper: Background vendor follow-up is disabled. "
+                    "Use manual PO follow-up/send workflow. "
+                    f"PO #{po_id} for {po['VendorName']} needs manual backorder follow-up."
+                )
+            else:
+                sent = send_to_user(
+                    subject=f"Backorder ETA Request: PO #{po_id}",
+                    content=(
+                        f"Hello {po['VendorName']},\n\n"
+                        f"We have received the first delivery for Purchase Order #{po_id}, but there are still outstanding backordered items for {po.get('SiteName') or 'the project'}.\n\n"
+                        "Please let us know the expected arrival date for the remaining material and advise if there are any supply issues we should plan around.\n\n"
+                        "Thank you,\nArgon Electrical"
+                    ),
+                    recipient=recipient_email,
+                    cc_recipients=[MY_EMAIL]
+                )
+                if sent:
+                    update_payload["last_backorder_vendor_followup_at"] = datetime.datetime.now().isoformat()
 
         upsert_po_dispatch_record(po_id, update_payload)
 
@@ -1353,8 +1366,12 @@ def sweep_for_backordered_purchase_orders():
                 "Purchase Order"
             )
 
-def sweep_for_locked_purchase_orders():
-    """Converts locked PO DOCX files to PDF and emails them to the vendor once."""
+def _legacy_po_auto_send_enabled() -> bool:
+    return str(os.getenv(LEGACY_PO_AUTO_SEND_ENV, "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _run_legacy_locked_purchase_order_auto_send():
+    """Legacy vendor-send behavior retained only behind an explicit env gate."""
     from neon_ai.gateway import MY_EMAIL, send_to_user
     from neon_ai.database.automation import log_estimate_action
     from neon_ai.purchase_order_generator import convert_docx_to_pdf
@@ -1417,6 +1434,28 @@ def sweep_for_locked_purchase_orders():
             )
 
 
+def sweep_for_locked_purchase_orders():
+    """Fence legacy PO auto-send so locked purchase orders require explicit manual send."""
+    if _legacy_po_auto_send_enabled():
+        print(
+            f"PO Sweeper: {LEGACY_PO_AUTO_SEND_ENV}=1 detected. "
+            "Running legacy PO auto-send behavior."
+        )
+        _run_legacy_locked_purchase_order_auto_send()
+        return
+
+    pending = get_purchase_orders_ready_to_send()
+    if not pending:
+        print("PO Sweeper: No locked purchase orders ready to send.")
+        return
+
+    print(
+        "PO Sweeper: Legacy PO auto-send is disabled. "
+        "Use manual PO send/approval workflow. "
+        f"Locked purchase orders pending manual send: {len(pending)}."
+    )
+
+
 def send_purchase_order_now(po_id: int):
     """Archives the DOCX if needed and sends the PO email immediately."""
     from neon_ai.gateway import MY_EMAIL, send_to_user
@@ -1460,24 +1499,16 @@ def send_purchase_order_now(po_id: int):
     if not sent:
         raise RuntimeError(f"Purchase Order #{po_id} could not be sent through the email gateway.")
 
-    upsert_po_dispatch_record(po_id, {
-        "recipient_email": recipient_email.lower(),
-        "vendor_name": po_data.get("VendorName"),
-        "estimate_id": po_data.get("EstimateID"),
-        "site_name": po_data.get("SiteName"),
-        "sent_at": datetime.datetime.now().isoformat(),
-        "status": "Sent",
-        "docx_path": docx_path,
-        "pdf_path": pdf_path,
-    })
-    update_purchase_order_status(po_id, "Sent")
-    estimate_id = po_data.get("EstimateID")
-    if estimate_id:
-        log_estimate_action(
-            estimate_id,
-            f"Purchase Order #{po_id} emailed to {po_data.get('VendorName')} at {recipient_email}. Attachment: {attachment_path}",
-            "Purchase Order"
-        )
+    mark_purchase_order_sent(
+        po_id,
+        recipient_email=recipient_email,
+        vendor_name=po_data.get("VendorName"),
+        estimate_id=po_data.get("EstimateID"),
+        site_name=po_data.get("SiteName"),
+        docx_path=docx_path,
+        pdf_path=pdf_path,
+        attachment_path=attachment_path,
+    )
 
     return {
         "po_id": po_id,
@@ -1487,6 +1518,38 @@ def send_purchase_order_now(po_id: int):
         "attachment_path": attachment_path,
         "status": "Sent",
     }
+
+
+def mark_purchase_order_sent(
+    po_id: int,
+    *,
+    recipient_email: str,
+    vendor_name: str | None,
+    estimate_id: int | None,
+    site_name: str | None,
+    docx_path: str | None,
+    pdf_path: str | None,
+    attachment_path: str | None,
+) -> None:
+    from neon_ai.database.automation import log_estimate_action
+
+    upsert_po_dispatch_record(po_id, {
+        "recipient_email": str(recipient_email or "").strip().lower(),
+        "vendor_name": vendor_name,
+        "estimate_id": estimate_id,
+        "site_name": site_name,
+        "sent_at": datetime.datetime.now().isoformat(),
+        "status": "Sent",
+        "docx_path": docx_path,
+        "pdf_path": pdf_path,
+    })
+    update_purchase_order_status(po_id, "Sent")
+    if estimate_id:
+        log_estimate_action(
+            estimate_id,
+            f"Purchase Order #{po_id} emailed to {vendor_name or 'Vendor'} at {recipient_email}. Attachment: {attachment_path}",
+            "Purchase Order"
+        )
 
 
 def process_inbound_vendor_po_email(po_id: int, sender_email: str, subject: str, body: str, attachment_path: str = None, received_at=None):
@@ -1711,25 +1774,32 @@ def sweep_for_po_eta_followups():
                     last_weekly = None
 
             if last_weekly is None or today >= last_weekly.date() + datetime.timedelta(days=7):
-                sent = send_to_user(
-                    subject=f"Weekly Check-In: PO #{po_id}",
-                    content=(
-                        f"Hello {po_data.get('VendorName')},\n\n"
-                        f"We are checking in on Purchase Order #{po_id} for {po_data.get('SiteName')}.\n\n"
-                        "Please confirm the parts remain on order and share any updated ETA or shipment details.\n\n"
-                        "Thank you,\nArgon Electrical"
-                    ),
-                    recipient=recipient_email,
-                    cc_recipients=[MY_EMAIL]
-                )
-                if sent:
-                    record["last_weekly_followup_sent_at"] = datetime.datetime.now().isoformat()
-                    if estimate_id:
-                        log_estimate_action(
-                            estimate_id,
-                            f"Weekly long-lead vendor follow-up sent for PO #{po_id} to {po_data.get('VendorName')}.",
-                            "Purchase Order"
-                        )
+                if not _background_vendor_po_followups_enabled():
+                    print(
+                        "PO Sweeper: Background vendor follow-up is disabled. "
+                        "Use manual PO follow-up/send workflow. "
+                        f"PO #{po_id} for {po_data.get('VendorName')} needs manual weekly follow-up."
+                    )
+                else:
+                    sent = send_to_user(
+                        subject=f"Weekly Check-In: PO #{po_id}",
+                        content=(
+                            f"Hello {po_data.get('VendorName')},\n\n"
+                            f"We are checking in on Purchase Order #{po_id} for {po_data.get('SiteName')}.\n\n"
+                            "Please confirm the parts remain on order and share any updated ETA or shipment details.\n\n"
+                            "Thank you,\nArgon Electrical"
+                        ),
+                        recipient=recipient_email,
+                        cc_recipients=[MY_EMAIL]
+                    )
+                    if sent:
+                        record["last_weekly_followup_sent_at"] = datetime.datetime.now().isoformat()
+                        if estimate_id:
+                            log_estimate_action(
+                                estimate_id,
+                                f"Weekly long-lead vendor follow-up sent for PO #{po_id} to {po_data.get('VendorName')}.",
+                                "Purchase Order"
+                            )
 
         upsert_po_dispatch_record(po_id, record)
 

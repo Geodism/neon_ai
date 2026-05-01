@@ -17,6 +17,7 @@ MASTER_DRIVE = "D:/Projects"
 # Automation is now fully ungated; keep a very early cutoff so the existing
 # sweeper queries still work without excluding historical records.
 AUTOMATION_MIN_DATE = datetime.date(1900, 1, 1)
+LEGACY_ESTIMATE_AUTO_SEND_ENV = "NEON_ENABLE_LEGACY_ESTIMATE_AUTO_SEND"
 
 def clean_name(name):
     """Removes illegal Windows characters."""
@@ -1642,58 +1643,91 @@ def _deprecated_legacy_sweep_locked_estimates_to_drafts():
     finally: conn.close()
 
 # Override the legacy draft-saver with the live sender workflow.
-def sweep_for_locked_estimates():
-    """Hunts for 'Locked' estimates and sends them to the customer automatically."""
+def _legacy_estimate_auto_send_enabled() -> bool:
+    return str(os.getenv(LEGACY_ESTIMATE_AUTO_SEND_ENV, "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _run_legacy_locked_estimate_auto_send(cur) -> None:
+    """Legacy customer-send behavior retained only behind an explicit env gate."""
     from neon_ai.gateway import send_to_user
 
+    cur.execute("""
+        SELECT e."EstimateID", e."Description", e."TotalAmount",
+               c."CustomerName", c."Email", s."SiteName"
+        FROM "Estimate" e
+        JOIN "Site" s ON e."SiteID" = s."SiteID"
+        JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+        WHERE e."Status" = 'Locked'
+          AND e."CreatedDate" >= %s
+    """, (AUTOMATION_MIN_DATE,))
+    locked_estimates = cur.fetchall()
+
+    if not locked_estimates:
+        print("Sweeper: No 'Locked' estimates found.")
+        return
+
+    print(
+        f"Sweeper: {LEGACY_ESTIMATE_AUTO_SEND_ENV}=1 detected. "
+        "Running legacy estimate auto-send behavior."
+    )
+    for est in locked_estimates:
+        file_path = build_client_estimate_doc(est['EstimateID'])
+        total_amount = get_client_estimate_total(est['EstimateID'])
+        email_body = (
+            f"Hello {est['CustomerName']},\n\n"
+            f"Please find attached Estimate #{est['EstimateID']} for {est['SiteName']}.\n\n"
+            f"Project scope:\n{est['Description']}\n\n"
+            f"Estimated total: ${total_amount:,.2f}\n\n"
+            f"If you'd like to move forward, please reply to this email and include the exact wording 'I approve Estimate #{est['EstimateID']}' so we can confirm it officially.\n\n"
+            f"Best regards,\nArgon Electrical"
+        )
+        subject = f"Estimate #{est['EstimateID']} from Argon Electrical: {est['SiteName']}"
+
+        if send_to_user(
+            subject,
+            email_body,
+            recipient=est['Email'],
+            attachment_path=file_path,
+            cc_recipients=[os.getenv("PERSONAL_EMAIL")]
+        ):
+            cur.execute(
+                'UPDATE "Estimate" SET "Status" = \'Sent\', "SubmitDate" = CURRENT_DATE WHERE "EstimateID" = %s',
+                (est['EstimateID'],)
+            )
+            log_estimate_action(
+                est['EstimateID'],
+                f"Locked estimate auto-sent to customer and CC'd to owner. SubmitDate stamped. Attachment: {file_path}",
+                "System"
+            )
+
+
+def sweep_for_locked_estimates():
+    """Fence legacy estimate auto-send so locked estimates require explicit Final Doc View send."""
     conn = get_connection()
     cur = conn.cursor()
     try:
+        if _legacy_estimate_auto_send_enabled():
+            _run_legacy_locked_estimate_auto_send(cur)
+            conn.commit()
+            return
+
         cur.execute("""
-            SELECT e."EstimateID", e."Description", e."TotalAmount",
-                   c."CustomerName", c."Email", s."SiteName"
+            SELECT COUNT(*) AS "LockedCount"
             FROM "Estimate" e
-            JOIN "Site" s ON e."SiteID" = s."SiteID"
-            JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
             WHERE e."Status" = 'Locked'
               AND e."CreatedDate" >= %s
         """, (AUTOMATION_MIN_DATE,))
-        locked_estimates = cur.fetchall()
-
-        if not locked_estimates:
+        row = cur.fetchone() or {}
+        locked_count = int(row.get("LockedCount") or 0)
+        if locked_count <= 0:
             print("Sweeper: No 'Locked' estimates found.")
             return
 
-        for est in locked_estimates:
-            file_path = build_client_estimate_doc(est['EstimateID'])
-            total_amount = get_client_estimate_total(est['EstimateID'])
-            email_body = (
-                f"Hello {est['CustomerName']},\n\n"
-                f"Please find attached Estimate #{est['EstimateID']} for {est['SiteName']}.\n\n"
-                f"Project scope:\n{est['Description']}\n\n"
-                f"Estimated total: ${total_amount:,.2f}\n\n"
-                f"If you'd like to move forward, please reply to this email and include the exact wording 'I approve Estimate #{est['EstimateID']}' so we can confirm it officially.\n\n"
-                f"Best regards,\nArgon Electrical"
-            )
-            subject = f"Estimate #{est['EstimateID']} from Argon Electrical: {est['SiteName']}"
-
-            if send_to_user(
-                subject,
-                email_body,
-                recipient=est['Email'],
-                attachment_path=file_path,
-                cc_recipients=[os.getenv("PERSONAL_EMAIL")]
-            ):
-                cur.execute(
-                    'UPDATE "Estimate" SET "Status" = \'Sent\', "SubmitDate" = CURRENT_DATE WHERE "EstimateID" = %s',
-                    (est['EstimateID'],)
-                )
-                conn.commit()
-                log_estimate_action(
-                    est['EstimateID'],
-                    f"Locked estimate auto-sent to customer and CC'd to owner. SubmitDate stamped. Attachment: {file_path}",
-                    "System"
-                )
+        print(
+            "Sweeper: Legacy estimate auto-send is disabled. "
+            "Use Final Doc View Send to Customer. "
+            f"Locked estimates pending manual send: {locked_count}."
+        )
     finally:
         conn.close()
 

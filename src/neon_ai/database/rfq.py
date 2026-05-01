@@ -17,7 +17,12 @@ RFQ_DISPATCH_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
 # Automation is now fully ungated; keep a very early cutoff so the existing
 # sweeper queries still work without excluding historical RFQs.
 AUTOMATION_MIN_DATE = datetime.date(1900, 1, 1)
+BACKGROUND_VENDOR_RFQ_FOLLOWUPS_ENV = "NEON_ENABLE_BACKGROUND_VENDOR_RFQ_FOLLOWUPS"
 _OCR_ENGINE = None
+
+
+def _background_vendor_rfq_followups_enabled() -> bool:
+    return str(os.getenv(BACKGROUND_VENDOR_RFQ_FOLLOWUPS_ENV, "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 def load_rfq_dispatch_log():
     if not os.path.exists(RFQ_DISPATCH_LOG_PATH):
@@ -396,7 +401,6 @@ def get_vendor_email_for_rfq(vendor_id: int):
 
 def send_rfq_by_id(rfq_id: int, recipient_email: str = None):
     from neon_ai.gateway import send_to_user
-    from neon_ai.database.automation import log_estimate_action
 
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -460,34 +464,13 @@ def send_rfq_by_id(rfq_id: int, recipient_email: str = None):
     if not sent:
         raise RuntimeError(f"RFQ #{rfq_id} could not be sent through the email gateway.")
 
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            '''
-            UPDATE "PriceRequest"
-            SET "DateSent" = CURRENT_DATE,
-                "Status" = 'Sent'
-            WHERE "PriceRequestID" = %s
-            ''',
-            (rfq_id,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    append_rfq_dispatch_record({
-        "rfq_id": rfq_id,
-        "estimate_id": rfq_row["EstimateID"],
-        "vendor_id": rfq_row["VendorID"],
-        "vendor_name": rfq_row["VendorName"],
-        "recipient_email": email_to,
-        "sent_at": datetime.datetime.now().isoformat(),
-    })
-    log_estimate_action(
-        rfq_row["EstimateID"],
-        f"RFQ #{rfq_id} emailed to {rfq_row['VendorName']} at {email_to}. File: {pdf_path}",
-        "RFQ"
+    mark_rfq_sent(
+        rfq_id,
+        estimate_id=rfq_row["EstimateID"],
+        vendor_id=rfq_row["VendorID"],
+        vendor_name=rfq_row["VendorName"],
+        recipient_email=email_to,
+        attachment_path=pdf_path,
     )
     return {
         "rfq_id": rfq_id,
@@ -525,6 +508,86 @@ def create_and_send_rfq_batch(estimate_id: int, vendor_requests: list, due_date:
         })
 
     return results
+
+
+def create_rfq_batch_without_sending(estimate_id: int, vendor_requests: list, due_date: str = None):
+    """Creates RFQ draft records for selected vendors without sending email."""
+    estimate_row, material_rows = _load_estimate_rfq_material_rows(estimate_id)
+    if not estimate_row:
+        raise ValueError(f"Estimate #{estimate_id} could not be loaded.")
+    if not material_rows:
+        raise ValueError("This estimate has no material lines to package into an RFQ.")
+
+    material_ids = [row["EstimateMaterialID"] for row in material_rows]
+    results = []
+    seen_vendor_ids = set()
+
+    for request in vendor_requests:
+        vendor_id = int(request["vendor_id"])
+        vendor_name = str(request.get("vendor_name") or "").strip() or f"Vendor #{vendor_id}"
+        recipient_email = (request.get("recipient_email") or "").strip()
+        if not recipient_email:
+            raise ValueError(f"Recipient email is required for {vendor_name}.")
+        if vendor_id in seen_vendor_ids:
+            raise ValueError(f"{vendor_name} was selected more than once in this RFQ batch.")
+
+        seen_vendor_ids.add(vendor_id)
+        rfq_id = save_rfq_package_for_vendor_id(estimate_id, vendor_id, due_date, material_ids)
+        results.append(
+            {
+                "rfq_id": int(rfq_id),
+                "estimate_id": int(estimate_id),
+                "vendor_id": vendor_id,
+                "vendor_name": vendor_name,
+                "recipient_email": recipient_email,
+                "due_date": due_date,
+                "created_without_send": True,
+            }
+        )
+
+    return results
+
+
+def mark_rfq_sent(
+    rfq_id: int,
+    *,
+    estimate_id: int,
+    vendor_id: int,
+    vendor_name: str,
+    recipient_email: str,
+    attachment_path: str,
+) -> None:
+    from neon_ai.database.automation import log_estimate_action
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            '''
+            UPDATE "PriceRequest"
+            SET "DateSent" = CURRENT_DATE,
+                "Status" = 'Sent'
+            WHERE "PriceRequestID" = %s
+            ''',
+            (rfq_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    append_rfq_dispatch_record({
+        "rfq_id": rfq_id,
+        "estimate_id": estimate_id,
+        "vendor_id": vendor_id,
+        "vendor_name": vendor_name,
+        "recipient_email": str(recipient_email or "").strip().lower(),
+        "sent_at": datetime.datetime.now().isoformat(),
+    })
+    log_estimate_action(
+        estimate_id,
+        f"RFQ #{rfq_id} emailed to {vendor_name} at {recipient_email}. File: {attachment_path}",
+        "RFQ"
+    )
 
 def classify_vendor_rfq_response(subject, body_text):
     text = f"{subject or ''}\n{body_text or ''}".lower()
@@ -701,6 +764,14 @@ def sweep_for_outstanding_rfq_followups():
             continue
 
         if age_days >= 2 and status not in ("ETA Provided", "Reminder Sent") and recipient_email:
+            if not _background_vendor_rfq_followups_enabled():
+                print(
+                    "RFQ Sweeper: Background vendor follow-up is disabled. "
+                    "Use manual RFQ follow-up/send workflow. "
+                    f"RFQ #{rfq['PriceRequestID']} for {rfq['VendorName']} needs manual vendor follow-up."
+                )
+                continue
+
             send_to_user(
                 subject=f"Friendly Follow Up: RFQ #{rfq['PriceRequestID']}",
                 content=(

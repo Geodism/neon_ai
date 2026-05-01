@@ -537,3 +537,38 @@ def build_customer_invoice_plain_text_fallback(tokens: dict[str, Any]) -> str:
         owner_name,
     ]
     return "\n".join(sections).strip()
+
+
+def get_customer_invoice_delivery_tokens(
+    invoice_id: int,
+    *,
+    attachment_path: str | None = None,
+) -> dict[str, Any]:
+    tokens = get_customer_invoice_document_tokens(invoice_id)
+    resolved_attachment_path = str(attachment_path or "").strip()
+    attachment_file_name = os.path.basename(resolved_attachment_path) if resolved_attachment_path else ""
+    tokens.update(
+        {
+            "CustomerInvoiceId": tokens.get("CustomerInvoiceID") or tokens.get("InvoiceID"),
+            "AttachmentPath": resolved_attachment_path,
+            "AttachmentFileName": attachment_file_name,
+        }
+    )
+    return tokens
+
+
+def get_estimate_delivery_tokens(
+    estimate_id: int,
+    *,
+    attachment_path: str | None = None,
+) -> dict[str, Any]:
+    tokens = get_estimate_document_tokens(estimate_id)
+    resolved_attachment_path = str(attachment_path or "").strip()
+    attachment_file_name = os.path.basename(resolved_attachment_path) if resolved_attachment_path else ""
+    tokens.update(
+        {
+            "AttachmentPath": resolved_attachment_path,
+            "AttachmentFileName": attachment_file_name,
+        }
+    )
+    return tokens
