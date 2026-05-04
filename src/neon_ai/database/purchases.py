@@ -34,6 +34,30 @@ def ensure_purchase_schema():
         cur.execute('ALTER TABLE public."PurchaseOrderItem" ADD COLUMN IF NOT EXISTS "LastReceivedDate" date')
         cur.execute('ALTER TABLE public."PurchaseOrderItem" ADD COLUMN IF NOT EXISTS "LastPackingSlip" text')
         cur.execute('ALTER TABLE public."PurchaseOrderItem" ADD COLUMN IF NOT EXISTS "CatalogItemID" integer')
+        cur.execute('CREATE SEQUENCE IF NOT EXISTS "PurchaseOrderItemSourceLink_POItemSourceLinkID_seq"')
+        cur.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS public."PurchaseOrderItemSourceLink" (
+                "POItemSourceLinkID" integer NOT NULL DEFAULT nextval('"PurchaseOrderItemSourceLink_POItemSourceLinkID_seq"'::regclass),
+                "POItemID" integer NOT NULL,
+                "PurchaseOrderID" integer NOT NULL,
+                "RFQCarriedSelectionID" integer,
+                "PriceRequestID" integer,
+                "PRItemID" integer,
+                "VendorID" integer,
+                "EstimateID" integer,
+                "MaterialID" integer,
+                "CreatedAt" timestamptz DEFAULT NOW(),
+                CONSTRAINT "PurchaseOrderItemSourceLink_pkey" PRIMARY KEY ("POItemSourceLinkID")
+            )
+            '''
+        )
+        cur.execute(
+            '''
+            CREATE UNIQUE INDEX IF NOT EXISTS "idx_poitemsourcelink_poi"
+            ON public."PurchaseOrderItemSourceLink" ("POItemID")
+            '''
+        )
         cur.execute(
             '''
             CREATE TABLE IF NOT EXISTS public."PurchaseOrderReceipt" (
@@ -162,7 +186,174 @@ def get_carried_items_for_po_builder(rfq_id: int):
     finally:
         conn.close()
 
+
+def get_carried_items_for_po_center(
+    work_order_id: int,
+    estimate_id: int | None = None,
+    rfq_id: int | None = None,
+    vendor_id: int | None = None,
+):
+    ensure_purchase_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                wo."WorkOrderID",
+                wo."SourceEstimateID"
+            FROM "WorkOrder" wo
+            WHERE wo."WorkOrderID" = %s
+            ''',
+            (work_order_id,),
+        )
+        work_order = cur.fetchone()
+        if not work_order:
+            return []
+
+        source_estimate_id = estimate_id or work_order.get("SourceEstimateID")
+        filter_params = [work_order_id]
+        rfq_filters = []
+        if source_estimate_id:
+            rfq_filters.append('rcs."EstimateID" = %s')
+            filter_params.append(source_estimate_id)
+        if rfq_id:
+            rfq_filters.append('rcs."SourcePriceRequestID" = %s')
+            filter_params.append(rfq_id)
+        if vendor_id:
+            rfq_filters.append('rcs."VendorID" = %s')
+            filter_params.append(vendor_id)
+        rfq_where = (" AND " + " AND ".join(rfq_filters)) if rfq_filters else ""
+
+        cur.execute(
+            f'''
+            SELECT
+                rcs."RFQCarriedSelectionID",
+                rcs."EstimateID",
+                rcs."SourcePriceRequestID" AS "PriceRequestID",
+                rcs."SourcePRItemID" AS "PRItemID",
+                rcs."VendorID",
+                rcs."MaterialID",
+                rcs."CarriedQuantity",
+                rcs."CarriedUnitPrice",
+                rcs."CarriedExtendedPrice",
+                em."ItemID" AS "CatalogItemID",
+                COALESCE(NULLIF(TRIM(v."VendorName"), ''), 'Unknown Vendor') AS "VendorName",
+                COALESCE(NULLIF(TRIM(em."PartNumber"), ''), NULLIF(TRIM(m."PartNumber"), ''), '') AS "PartNumber",
+                COALESCE(NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') AS "Description",
+                COALESCE(NULLIF(TRIM(m."Unit"), ''), '') AS "Unit",
+                pr."PriceRequestID" AS "RFQID",
+                pr."EstimateID" AS "RFQEstimateID",
+                wo."WorkOrderID",
+                COALESCE(NULLIF(TRIM(pr."Status"), ''), 'Draft') AS "RFQStatus",
+                COALESCE(NULLIF(TRIM(rcs."SelectionType"), ''), 'LineItem') AS "SelectionType"
+            FROM "RFQCarriedSelection" rcs
+            JOIN "PriceRequest" pr ON rcs."SourcePriceRequestID" = pr."PriceRequestID"
+            JOIN "EstimateMaterial" em ON rcs."MaterialID" = em."EstimateMaterialID"
+            LEFT JOIN "Material" m ON em."ItemID" = m."ItemID"
+            LEFT JOIN "Vendor" v ON rcs."VendorID" = v."VendorID"
+            JOIN "WorkOrder" wo ON wo."WorkOrderID" = %s
+            WHERE (
+                wo."SourceEstimateID" = rcs."EstimateID"
+                OR em."EstimateID" = wo."SourceEstimateID"
+            )
+            {rfq_where}
+            ORDER BY v."VendorName" ASC, pr."PriceRequestID" ASC, em."Description" ASC
+            ''',
+            tuple(filter_params),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        seen_selection_ids = {int(row["RFQCarriedSelectionID"]) for row in rows if row.get("RFQCarriedSelectionID") is not None}
+
+        legacy_filters = ['wo."WorkOrderID" = %s']
+        legacy_params = [work_order_id]
+        if source_estimate_id:
+            legacy_filters.append('pr."EstimateID" = %s')
+            legacy_params.append(source_estimate_id)
+        if rfq_id:
+            legacy_filters.append('pr."PriceRequestID" = %s')
+            legacy_params.append(rfq_id)
+        if vendor_id:
+            legacy_filters.append('pr."VendorID" = %s')
+            legacy_params.append(vendor_id)
+
+        cur.execute(
+            f'''
+            SELECT
+                NULL::integer AS "RFQCarriedSelectionID",
+                pr."EstimateID",
+                pr."PriceRequestID",
+                pri."PRItemID",
+                pr."VendorID",
+                pri."MaterialID",
+                COALESCE(pri."QuantityOverride", em."Quantity", 0) AS "CarriedQuantity",
+                COALESCE(pri."QuotedUnitPrice", 0) AS "CarriedUnitPrice",
+                COALESCE(pri."QuotedUnitPrice", 0) * COALESCE(pri."QuantityOverride", em."Quantity", 0) AS "CarriedExtendedPrice",
+                em."ItemID" AS "CatalogItemID",
+                COALESCE(NULLIF(TRIM(v."VendorName"), ''), 'Unknown Vendor') AS "VendorName",
+                COALESCE(NULLIF(TRIM(em."PartNumber"), ''), NULLIF(TRIM(m."PartNumber"), ''), '') AS "PartNumber",
+                COALESCE(NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') AS "Description",
+                COALESCE(NULLIF(TRIM(m."Unit"), ''), '') AS "Unit",
+                pr."PriceRequestID" AS "RFQID",
+                pr."EstimateID" AS "RFQEstimateID",
+                wo."WorkOrderID",
+                COALESCE(NULLIF(TRIM(pr."Status"), ''), 'Draft') AS "RFQStatus",
+                'LegacyCarry' AS "SelectionType"
+            FROM "PriceRequestItem" pri
+            JOIN "PriceRequest" pr ON pri."PriceRequestID" = pr."PriceRequestID"
+            JOIN "EstimateMaterial" em ON pri."MaterialID" = em."EstimateMaterialID"
+            LEFT JOIN "Material" m ON em."ItemID" = m."ItemID"
+            LEFT JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
+            JOIN "WorkOrder" wo ON wo."WorkOrderID" = %s
+            WHERE pri."IsCarried" = TRUE
+              AND ({' AND '.join(legacy_filters)})
+            ORDER BY v."VendorName" ASC, pr."PriceRequestID" ASC, em."Description" ASC
+            ''',
+            tuple([work_order_id] + legacy_params),
+        )
+        for row in cur.fetchall():
+            row_dict = dict(row)
+            synthetic_key = f"legacy:{row_dict.get('PRItemID')}"
+            if synthetic_key in seen_selection_ids:
+                continue
+            if any(
+                existing.get("PRItemID") == row_dict.get("PRItemID")
+                for existing in rows
+            ):
+                continue
+            rows.append(row_dict)
+
+        return rows
+    finally:
+        conn.close()
+
+
+def get_purchase_order_source_links(po_id: int):
+    ensure_purchase_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                sl."POItemID",
+                sl."RFQCarriedSelectionID",
+                sl."PriceRequestID",
+                sl."PRItemID",
+                sl."VendorID",
+                sl."EstimateID",
+                sl."MaterialID"
+            FROM "PurchaseOrderItemSourceLink" sl
+            WHERE sl."PurchaseOrderID" = %s
+            ''',
+            (po_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
 def _insert_purchase_order_items(cur, po_id: int, items: list, commit_estimate_lines: bool):
+    inserted_po_item_ids = []
     for item in items:
         estimate_material_id = item.get('estimate_material_id')
         if estimate_material_id in (None, ""):
@@ -177,6 +368,7 @@ def _insert_purchase_order_items(cur, po_id: int, items: list, commit_estimate_l
             INSERT INTO "PurchaseOrderItem" 
             ("PurchaseOrderID", "MaterialID", "CatalogItemID", "QuantityOrdered", "UnitPriceAtOrder", "LineTotal", "Description")
             VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING "POItemID"
         ''', (
             po_id,
             estimate_material_id,
@@ -186,6 +378,7 @@ def _insert_purchase_order_items(cur, po_id: int, items: list, commit_estimate_l
             qty * price,
             desc,
         ))
+        inserted_po_item_ids.append(int(cur.fetchone()["POItemID"]))
 
         if commit_estimate_lines and estimate_material_id:
             cur.execute('''
@@ -201,6 +394,7 @@ def _insert_purchase_order_items(cur, po_id: int, items: list, commit_estimate_l
                         )) THEN TRUE ELSE FALSE END
                 WHERE "EstimateMaterialID" = %s
             ''', (price, qty * price, estimate_material_id, estimate_material_id))
+    return inserted_po_item_ids
 
 
 def _save_purchase_order_record(
@@ -263,7 +457,53 @@ def _save_purchase_order_record(
             ''', (work_order_id, vendor_id, status_text, total_val, expected_date or None, expected_note or None))
             target_po_id = int(cur.fetchone()["PurchaseOrderID"])
 
-        _insert_purchase_order_items(cur, target_po_id, items, commit_estimate_lines=commit_estimate_lines)
+        if po_id:
+            cur.execute('DELETE FROM "PurchaseOrderItemSourceLink" WHERE "PurchaseOrderID" = %s', (target_po_id,))
+        inserted_po_item_ids = _insert_purchase_order_items(cur, target_po_id, items, commit_estimate_lines=commit_estimate_lines)
+        for po_item_id, item in zip(inserted_po_item_ids, items):
+            source_selection_id = item.get("rfq_carried_selection_id")
+            source_price_request_id = item.get("source_price_request_id") or item.get("rfq_id")
+            source_pr_item_id = item.get("source_pr_item_id")
+            source_vendor_id = item.get("source_vendor_id") or item.get("vendor_id")
+            source_estimate_id = item.get("source_estimate_id") or item.get("estimate_id")
+            source_material_id = item.get("estimate_material_id") or item.get("mat_id")
+            if all(
+                value in (None, "", 0, "0")
+                for value in (
+                    source_selection_id,
+                    source_price_request_id,
+                    source_pr_item_id,
+                    source_vendor_id,
+                    source_estimate_id,
+                    source_material_id,
+                )
+            ):
+                continue
+            cur.execute(
+                '''
+                INSERT INTO "PurchaseOrderItemSourceLink" (
+                    "POItemID",
+                    "PurchaseOrderID",
+                    "RFQCarriedSelectionID",
+                    "PriceRequestID",
+                    "PRItemID",
+                    "VendorID",
+                    "EstimateID",
+                    "MaterialID"
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ''',
+                (
+                    po_item_id,
+                    target_po_id,
+                    source_selection_id or None,
+                    source_price_request_id or None,
+                    source_pr_item_id or None,
+                    source_vendor_id or None,
+                    source_estimate_id or None,
+                    source_material_id or None,
+                ),
+            )
         conn.commit()
         return target_po_id
     except Exception:
@@ -541,6 +781,17 @@ def get_purchase_order_edit_items(po_id: int):
         return cur.fetchall()
     finally:
         conn.close()
+
+
+def get_purchase_order_for_material_request(po_id: int):
+    return get_po_export_data(po_id)
+
+
+def get_purchase_order_items_for_material_request(po_id: int):
+    rows = get_purchase_order_edit_items(po_id)
+    for row in rows:
+        row["Notes"] = row.get("Notes") or ""
+    return rows
 
 def get_purchase_orders_ready_to_send():
     """Finds locked POs that already have a DOCX archived and are waiting to email."""
@@ -1901,6 +2152,8 @@ def get_po_items_with_receiving(po_id: int):
         cur.execute('''
             SELECT 
                 poi."POItemID",
+                poi."MaterialID",
+                poi."CatalogItemID",
                 COALESCE(poi."Description", em."Description", m."Description") AS "Description",
                 poi."QuantityOrdered",
                 poi."QuantityReceived", 

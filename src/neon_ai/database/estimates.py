@@ -650,6 +650,50 @@ def get_draft_estimates():
     finally:
         conn.close()
 
+
+def list_available_draft_estimates_for_material_request():
+    """Returns saved draft estimates that are still valid RFQ material-request sources."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            SELECT
+                e."EstimateID",
+                COALESCE(s."SiteName", 'Unknown Site') AS "SiteName",
+                COALESCE(e."Description", '') AS "Description",
+                COALESCE(e."Status", 'Draft') AS "Status",
+                COALESCE(e."IsConverted", FALSE) AS "IsConverted"
+            FROM "Estimate" e
+            LEFT JOIN "Site" s ON e."SiteID" = s."SiteID"
+            WHERE UPPER(TRIM(COALESCE(e."Status", 'DRAFT'))) = 'DRAFT'
+              AND COALESCE(e."IsConverted", FALSE) = FALSE
+            ORDER BY e."EstimateID" DESC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    choices: list[dict] = []
+    for row in rows:
+        estimate_id = row.get("EstimateID")
+        site_name = str(row.get("SiteName") or "Unknown Site").strip()
+        description = str(row.get("Description") or "").strip()
+        status = str(row.get("Status") or "Draft").strip() or "Draft"
+        label_suffix = description or site_name or "Draft Estimate"
+        choices.append(
+            {
+                "EstimateID": int(estimate_id),
+                "SiteName": site_name,
+                "Description": description,
+                "Status": status,
+                "IsConverted": bool(row.get("IsConverted")),
+                "Label": f"Estimate #{estimate_id} - {label_suffix}",
+            }
+        )
+    return choices
+
 def update_draft_estimate(est_id, site_id, desc, b_type, lab_markup, mat_markup, labor_lines, material_lines):
     """Updates the parent, replaces labor, and UPSERTS materials safely."""
     conn = get_connection()

@@ -223,6 +223,64 @@ def search_materials(search_text, include_inactive=False):
         conn.close()
 
 
+def search_materials_by_part_number(search_text, include_inactive=False, limit=30):
+    """Searches the material catalog primarily by part number for UI suggestion lists."""
+    ensure_material_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        normalized = str(search_text or "").strip()
+        if not normalized:
+            return []
+
+        filters = ['COALESCE("PartNumber", \'\') <> \'\'', '"PartNumber" ILIKE %s']
+        params = [f"%{normalized}%"]
+        if not include_inactive:
+            filters.append('COALESCE("IsActive", TRUE) = TRUE')
+        cur.execute(
+            f'''
+            SELECT
+                "ItemID",
+                "PartNumber",
+                "Description",
+                "Unit",
+                "CarryPriceSource",
+                "IsActive",
+                "InternalPrice",
+                "NedcoPrice",
+                "NedcoLastPriceDate",
+                "NedcoPartNumber",
+                "GescanPrice",
+                "GescanLastPriceDate",
+                "GescanPartNumber",
+                "EecolPrice",
+                "EecolLastPriceDate",
+                "EecolPartNumber",
+                "GuillevinPrice",
+                "GuillevinLastPriceDate",
+                "GuillevinPartNumber"
+            FROM "Material"
+            WHERE {' AND '.join(filters)}
+            ORDER BY
+                CASE
+                    WHEN LOWER("PartNumber") = LOWER(%s) THEN 0
+                    WHEN LOWER("PartNumber") LIKE LOWER(%s) THEN 1
+                    ELSE 2
+                END,
+                COALESCE("PartNumber", '') ASC,
+                "ItemID" ASC
+            LIMIT %s
+            ''',
+            params + [normalized, f"{normalized}%", int(limit)],
+        )
+        return _decorate_material_rows(cur.fetchall())
+    except Exception as e:
+        print(f"Material Part Search Error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
 def get_material_pipeline(search_text="", include_inactive=True):
     started_at = time.perf_counter()
     try:

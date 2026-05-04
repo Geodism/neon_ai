@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -7,10 +8,16 @@ from neon_ai.database.connection import get_connection
 from neon_ai.database.rfq import (
     _build_rfq_pdf,
     _load_estimate_rfq_material_rows,
+    ensure_material_request_source_schema,
+    get_material_request_source_context_for_rfq,
     get_vendor_email_for_rfq,
     mark_rfq_sent,
 )
+from neon_ai.document_control.catalog_service import DocumentCatalogService
+from neon_ai.document_control.models import DocumentTemplateKind
+from neon_ai.document_control.repository import DocumentControlRepository
 from neon_ai.gateway import send_to_user
+from neon_ai.document_control.token_engine import render_tokens
 from neon_ai.services.outbound_message_log_service import (
     ensure_outbound_message_log_table,
     record_failed_message,
@@ -19,16 +26,51 @@ from neon_ai.services.outbound_message_log_service import (
 )
 from psycopg2.extras import RealDictCursor
 
+RFQ_DELIVERY_DOCUMENT_TYPE_CODE = "RFQ_DELIVERY"
+RFQ_SEND_USAGE_CONTEXT = "RFQ_SEND"
+RFQ_REQUESTED_MATERIAL_TABLE_TOKEN = "RFQRequestedMaterialTable"
+
+
+def _get_estimate_id_from_context(data: dict[str, Any] | None) -> int | None:
+    if not data:
+        return None
+    # Accept legacy aliases from older RFQ context payloads and templates.
+    for key in ("EstimateID", "EstimateId", "estimate_id", "EstimatedID"):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _apply_estimate_id_aliases(data: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(data or {})
+    estimate_id = _get_estimate_id_from_context(normalized)
+    normalized["EstimateID"] = estimate_id
+    if "EstimateId" not in normalized:
+        normalized["EstimateId"] = estimate_id
+    if "estimate_id" not in normalized:
+        normalized["estimate_id"] = estimate_id
+    if "EstimatedID" not in normalized:
+        normalized["EstimatedID"] = estimate_id
+    return normalized
+
 
 def _load_rfq_context(rfq_id: int) -> dict[str, Any] | None:
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        ensure_material_request_source_schema(cur=cur)
         cur.execute(
             """
             SELECT
                 pr."PriceRequestID",
                 pr."EstimateID",
+                pr."MaterialRequestSourceType",
+                pr."MaterialRequestSourceID",
                 pr."VendorID",
                 pr."DueDate",
                 pr."DateSent",
@@ -54,36 +96,54 @@ def _load_rfq_context(rfq_id: int) -> dict[str, Any] | None:
             (rfq_id,),
         )
         rfq_row["MaterialIDs"] = [int(row["MaterialID"]) for row in cur.fetchall()]
-        return rfq_row
+        source_context = get_material_request_source_context_for_rfq(rfq_id, cur=cur)
+        if source_context:
+            rfq_row["MaterialRequestSourceType"] = source_context.get("MaterialRequestSourceType")
+            rfq_row["MaterialRequestSourceID"] = source_context.get("MaterialRequestSourceID")
+            rfq_row["SourceDocumentLabel"] = source_context.get("MaterialRequestSourceLabel")
+            rfq_row["WorkOrderID"] = source_context.get("MaterialRequestWorkOrderID")
+        return _apply_estimate_id_aliases(rfq_row)
     finally:
         conn.close()
 
 
 def _normalize_context(rfq_row: dict[str, Any] | None) -> dict[str, Any]:
     if not rfq_row:
-        return {
-            "PriceRequestID": None,
-            "EstimateID": None,
-            "VendorID": None,
-            "VendorName": None,
+        return _apply_estimate_id_aliases(
+            {
+                "PriceRequestID": None,
+                "EstimateID": None,
+                "VendorID": None,
+                "VendorName": None,
+                "VendorEmail": None,
+                "RFQStatus": None,
+                "DueDate": None,
+                "AttachmentPath": None,
+                "SiteName": None,
+                "SourceDocumentLabel": None,
+                "SourceDocumentType": None,
+                "SourceDocumentID": None,
+                "WorkOrderID": None,
+            }
+        )
+
+    return _apply_estimate_id_aliases(
+        {
+            "PriceRequestID": rfq_row.get("PriceRequestID"),
+            "EstimateID": rfq_row.get("EstimateID"),
+            "VendorID": rfq_row.get("VendorID"),
+            "VendorName": rfq_row.get("VendorName"),
             "VendorEmail": None,
-            "RFQStatus": None,
-            "DueDate": None,
+            "RFQStatus": rfq_row.get("Status"),
+            "DueDate": rfq_row.get("DueDate"),
             "AttachmentPath": None,
             "SiteName": None,
+            "SourceDocumentLabel": rfq_row.get("SourceDocumentLabel"),
+            "SourceDocumentType": rfq_row.get("MaterialRequestSourceType"),
+            "SourceDocumentID": rfq_row.get("MaterialRequestSourceID"),
+            "WorkOrderID": rfq_row.get("WorkOrderID"),
         }
-
-    return {
-        "PriceRequestID": rfq_row.get("PriceRequestID"),
-        "EstimateID": rfq_row.get("EstimateID"),
-        "VendorID": rfq_row.get("VendorID"),
-        "VendorName": rfq_row.get("VendorName"),
-        "VendorEmail": None,
-        "RFQStatus": rfq_row.get("Status"),
-        "DueDate": rfq_row.get("DueDate"),
-        "AttachmentPath": None,
-        "SiteName": None,
-    }
+    )
 
 
 def can_send_rfq(rfq_id: int) -> tuple[bool, str, dict[str, Any]]:
@@ -101,6 +161,14 @@ def can_send_rfq(rfq_id: int) -> tuple[bool, str, dict[str, Any]]:
     if not material_ids:
         return False, "This RFQ has no packaged material lines to send.", context
 
+    estimate_id = _get_estimate_id_from_context(rfq_row)
+    if estimate_id is None:
+        return (
+            False,
+            "This RFQ is missing estimate context. Reload the RFQ draft or save it again before previewing or sending.",
+            context,
+        )
+
     vendor_id = rfq_row.get("VendorID")
     vendor_email = get_vendor_email_for_rfq(int(vendor_id)) if vendor_id is not None else None
     context["VendorEmail"] = vendor_email
@@ -109,7 +177,7 @@ def can_send_rfq(rfq_id: int) -> tuple[bool, str, dict[str, Any]]:
 
     try:
         estimate_row, material_rows = _load_estimate_rfq_material_rows(
-            int(rfq_row["EstimateID"]),
+            estimate_id,
             material_ids=material_ids,
         )
     except Exception as exc:
@@ -142,11 +210,270 @@ def _fallback_body(vendor_name: str | None, rfq_id: int, estimate_id: int | None
         f"Please find attached RFQ #{rfq_id} for Estimate #{estimate_text} at {site_text}.\n\n"
         "Please review the attached material list and send your quote back at your earliest convenience.\n\n"
         f"Requested due date: {due_date_text}\n\n"
+        "Requested Material Lines\n"
+        f"{{{{{RFQ_REQUESTED_MATERIAL_TABLE_TOKEN}}}}}\n\n"
         "Best regards,\nArgon Electrical"
     )
 
 
-def prepare_rfq_delivery_message(rfq_id: int) -> dict[str, Any]:
+def _render_requested_material_table(material_rows: list[dict[str, Any]] | None, *, as_html: bool) -> str:
+    rows = material_rows or []
+    if not rows:
+        return "No requested material lines found for this RFQ."
+
+    headers = ["Qty", "Unit", "Part Number", "Description", "Notes"]
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        qty_value = row.get("Quantity") or row.get("QuotedQty") or row.get("quantity") or ""
+        try:
+            qty_text = str(float(qty_value))
+        except (TypeError, ValueError):
+            qty_text = str(qty_value or "").strip()
+        normalized_rows.append(
+            [
+                qty_text,
+                str(row.get("Unit") or row.get("UnitOfMeasure") or row.get("unit") or "").strip(),
+                str(row.get("PartNumber") or row.get("partnumber") or "").strip(),
+                str(row.get("Description") or row.get("description") or "").strip(),
+                str(row.get("Notes") or row.get("notes") or "").strip(),
+            ]
+        )
+
+    if as_html:
+        table_rows = []
+        for cells in normalized_rows:
+            row_html = "".join(
+                f"<td style=\"border: 1px solid #999; padding: 4px 6px; vertical-align: top;\">{escape(cell)}</td>"
+                for cell in cells
+            )
+            table_rows.append(f"<tr>{row_html}</tr>")
+        header_html = "".join(
+            f"<th style=\"border: 1px solid #999; padding: 4px 6px; text-align: left; background: #f3f3f3;\">{escape(label)}</th>"
+            for label in headers
+        )
+        return (
+            "<table style=\"border-collapse: collapse; width: 100%;\">"
+            f"<thead><tr>{header_html}</tr></thead>"
+            f"<tbody>{''.join(table_rows)}</tbody>"
+            "</table>"
+        )
+
+    lines = ["\t".join(headers)]
+    for cells in normalized_rows:
+        lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
+def _format_rfq_material_line_tokens(material_rows: list[dict[str, Any]] | None) -> dict[str, str]:
+    text_block = _render_requested_material_table(material_rows, as_html=False)
+    html_block = _render_requested_material_table(material_rows, as_html=True)
+    return {
+        "MaterialLineItemsText": text_block,
+        "MaterialLineItemsHtml": html_block,
+        "LineItemsText": text_block,
+        "LineItemsHtml": html_block,
+        RFQ_REQUESTED_MATERIAL_TABLE_TOKEN: html_block,
+    }
+
+
+def _inject_requested_material_table_token(
+    content: str,
+    *,
+    material_rows: list[dict[str, Any]] | None,
+    as_html: bool,
+) -> tuple[str, bool]:
+    text = str(content or "")
+    replacement = _render_requested_material_table(material_rows, as_html=as_html)
+    token_present = False
+    for token_text in (
+        f"{{{{{RFQ_REQUESTED_MATERIAL_TABLE_TOKEN}}}}}",
+        f"{{{RFQ_REQUESTED_MATERIAL_TABLE_TOKEN}}}",
+    ):
+        if token_text in text:
+            token_present = True
+            text = text.replace(token_text, replacement)
+    return text, token_present
+
+
+def _get_rfq_delivery_tokens(
+    *,
+    rfq_id: int,
+    estimate_id: int | None,
+    source_document_type: str | None,
+    source_document_id: int | None,
+    source_document_label: str | None,
+    work_order_id: int | None,
+    vendor_name: str | None,
+    vendor_email: str | None,
+    due_date: Any,
+    site_name: str | None,
+    customer_name: str | None,
+    attachment_path: str,
+    material_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    attachment_file_name = Path(attachment_path).name if attachment_path else ""
+    tokens = {
+        "RFQID": rfq_id,
+        "PriceRequestID": rfq_id,
+        "EstimateID": estimate_id or "",
+        "EstimatedID": estimate_id or "",
+        "SourceDocumentType": str(source_document_type or "").strip(),
+        "SourceDocumentID": str(source_document_id or "").strip(),
+        "SourceDocumentLabel": str(source_document_label or "").strip(),
+        "WorkOrderID": str(work_order_id or "").strip(),
+        "VendorName": str(vendor_name or "Vendor").strip() or "Vendor",
+        "VendorEmail": str(vendor_email or "").strip(),
+        "DueDate": str(due_date or "").strip(),
+        "SiteName": str(site_name or "").strip(),
+        "SiteAddress": str(site_name or "").strip(),
+        "CustomerName": str(customer_name or "").strip(),
+        "AttachmentFileName": attachment_file_name,
+        "AttachmentPath": attachment_path,
+        "CompanyName": "Argon Electrical",
+        "OwnerName": "Project Team",
+        "DocumentTitle": f"RFQ #{rfq_id}",
+    }
+    tokens.update(_format_rfq_material_line_tokens(material_rows))
+    return tokens
+
+
+def _load_rfq_template_version(
+    template_id: int | None,
+    expected_kind: DocumentTemplateKind,
+):
+    if template_id in (None, "", 0):
+        return None
+    try:
+        catalog_service = DocumentCatalogService(DocumentControlRepository())
+        version = catalog_service.get_template_version(template_id=int(template_id))
+    except Exception:
+        return None
+    if version is None:
+        return None
+    if str(version.document_type_code or "").strip() != RFQ_DELIVERY_DOCUMENT_TYPE_CODE:
+        return None
+    if version.kind != expected_kind:
+        return None
+    return version
+
+
+def _load_rfq_default_template_version(expected_kind: DocumentTemplateKind):
+    try:
+        catalog_service = DocumentCatalogService(DocumentControlRepository())
+        default_mapping = catalog_service.get_template_default(
+            document_type_code=RFQ_DELIVERY_DOCUMENT_TYPE_CODE,
+            template_kind=expected_kind,
+            usage_context=RFQ_SEND_USAGE_CONTEXT,
+        )
+        if default_mapping is None:
+            return None
+        return _load_rfq_template_version(int(default_mapping.template_id), expected_kind)
+    except Exception:
+        return None
+
+
+def _render_rfq_delivery_from_templates(
+    *,
+    tokens: dict[str, Any],
+    fallback_subject: str,
+    fallback_body: str,
+    header_template_id: int | None,
+    body_template_id: int | None,
+    footer_template_id: int | None,
+    material_rows: list[dict[str, Any]] | None,
+) -> tuple[str, str, str | None, int | None, str | None]:
+    header_version = _load_rfq_template_version(header_template_id, DocumentTemplateKind.HEADER)
+    body_version = _load_rfq_template_version(body_template_id, DocumentTemplateKind.BODY)
+    footer_version = _load_rfq_template_version(footer_template_id, DocumentTemplateKind.FOOTER)
+
+    missing_selection_messages: list[str] = []
+    if header_template_id not in (None, "", 0) and header_version is None:
+        missing_selection_messages.append(f"Header template #{header_template_id} could not be loaded")
+    if body_template_id not in (None, "", 0) and body_version is None:
+        missing_selection_messages.append(f"Body template #{body_template_id} could not be loaded")
+    if footer_template_id not in (None, "", 0) and footer_version is None:
+        missing_selection_messages.append(f"Footer template #{footer_template_id} could not be loaded")
+
+    selected_versions = [version for version in (header_version, body_version, footer_version) if version is not None]
+    if not selected_versions:
+        warning = None
+        if missing_selection_messages:
+            warning = "; ".join(missing_selection_messages) + ". Falling back to the default RFQ preview text."
+        return fallback_subject, fallback_body, None, None, warning
+
+    template_name_parts = [str(version.template_name or "").strip() for version in selected_versions if str(version.template_name or "").strip()]
+    template_version_ids = [int(version.template_version_id) for version in selected_versions if version.template_version_id is not None]
+    template_code = "RFQDelivery:selected"
+
+    subject_template = None
+    if body_version is not None:
+        subject_template = str(body_version.subject_line or "").strip() or None
+
+    body_sections = []
+    table_token_present = False
+    html_mode = False
+    for version in (header_version, body_version, footer_version):
+        if version is None:
+            continue
+        section_is_html = str(version.content_format or "").strip().lower() == "html"
+        html_mode = html_mode or section_is_html
+        body_text = str(version.body_content or "").strip()
+        if body_text:
+            body_text, section_had_token = _inject_requested_material_table_token(
+                body_text,
+                material_rows=material_rows,
+                as_html=section_is_html,
+            )
+            table_token_present = table_token_present or section_had_token
+            body_sections.append(body_text)
+
+    if not body_sections:
+        warning = None
+        if missing_selection_messages:
+            warning = "; ".join(missing_selection_messages) + ". Falling back to the default RFQ preview text."
+        return fallback_subject, fallback_body, None, None, warning
+
+    try:
+        rendered_subject = render_tokens(subject_template or fallback_subject, tokens).strip() or fallback_subject
+        rendered_body = render_tokens("\n\n".join(body_sections), tokens).strip() or fallback_body
+    except Exception as exc:
+        return fallback_subject, fallback_body, None, None, f"Selected RFQ templates could not be rendered: {exc}"
+
+    if not table_token_present:
+        fallback_table = _render_requested_material_table(material_rows, as_html=html_mode)
+        if html_mode:
+            rendered_body = (
+                rendered_body.rstrip()
+                + "\n<hr>\n<h3>Requested Material Lines</h3>\n"
+                + fallback_table
+            )
+        else:
+            rendered_body = (
+                rendered_body.rstrip()
+                + "\n\nRequested Material Lines\n"
+                + fallback_table
+            )
+
+    warning = None
+    if missing_selection_messages:
+        warning = "; ".join(missing_selection_messages) + ". Continuing with the remaining available RFQ templates."
+
+    return (
+        rendered_subject,
+        rendered_body,
+        " / ".join(part for part in template_name_parts if part) or "selected",
+        template_version_ids[0] if template_version_ids else None,
+        warning,
+    )
+
+
+def prepare_rfq_delivery_message(
+    rfq_id: int,
+    *,
+    header_template_id: int | None = None,
+    body_template_id: int | None = None,
+    footer_template_id: int | None = None,
+) -> dict[str, Any]:
     can_send, reason, context = can_send_rfq(rfq_id)
     if not can_send:
         return {
@@ -164,7 +491,13 @@ def prepare_rfq_delivery_message(rfq_id: int) -> dict[str, Any]:
         }
 
     material_ids = list(rfq_row.get("MaterialIDs") or [])
-    estimate_id = int(rfq_row["EstimateID"])
+    estimate_id = _get_estimate_id_from_context(rfq_row)
+    if estimate_id is None:
+        return {
+            "success": False,
+            "reason": "This RFQ is missing estimate context. Reload the RFQ draft or save it again before previewing or sending.",
+            **(context or {}),
+        }
     estimate_row, material_rows = _load_estimate_rfq_material_rows(estimate_id, material_ids=material_ids)
     if not estimate_row or not material_rows:
         return {
@@ -190,6 +523,44 @@ def prepare_rfq_delivery_message(rfq_id: int) -> dict[str, Any]:
         estimate_row.get("SiteName"),
         rfq_row.get("DueDate"),
     )
+    tokens = _get_rfq_delivery_tokens(
+        rfq_id=rfq_id,
+        estimate_id=estimate_id,
+        source_document_type=rfq_row.get("MaterialRequestSourceType") or "Estimate",
+        source_document_id=rfq_row.get("MaterialRequestSourceID") or estimate_id,
+        source_document_label=rfq_row.get("SourceDocumentLabel") or f"Estimate #{estimate_id}",
+        work_order_id=rfq_row.get("WorkOrderID"),
+        vendor_name=rfq_row.get("VendorName"),
+        vendor_email=context.get("VendorEmail"),
+        due_date=rfq_row.get("DueDate"),
+        site_name=estimate_row.get("SiteName"),
+        customer_name=estimate_row.get("CustomerName"),
+        attachment_path=attachment_path,
+        material_rows=material_rows,
+    )
+
+    selected_header_id = header_template_id
+    selected_body_id = body_template_id
+    selected_footer_id = footer_template_id
+    if selected_header_id is None:
+        default_header = _load_rfq_default_template_version(DocumentTemplateKind.HEADER)
+        selected_header_id = int(default_header.template_id) if default_header and default_header.template_id is not None else None
+    if selected_body_id is None:
+        default_body = _load_rfq_default_template_version(DocumentTemplateKind.BODY)
+        selected_body_id = int(default_body.template_id) if default_body and default_body.template_id is not None else None
+    if selected_footer_id is None:
+        default_footer = _load_rfq_default_template_version(DocumentTemplateKind.FOOTER)
+        selected_footer_id = int(default_footer.template_id) if default_footer and default_footer.template_id is not None else None
+
+    rendered_subject, rendered_body, template_used, template_version_id, template_warning = _render_rfq_delivery_from_templates(
+        tokens=tokens,
+        fallback_subject=subject,
+        fallback_body=body,
+        header_template_id=selected_header_id,
+        body_template_id=selected_body_id,
+        footer_template_id=selected_footer_id,
+        material_rows=material_rows,
+    )
     return {
         "success": True,
         "reason": "Ready to preview.",
@@ -202,19 +573,146 @@ def prepare_rfq_delivery_message(rfq_id: int) -> dict[str, Any]:
         "ResolvedRecipientEmail": context.get("VendorEmail"),
         "VendorID": rfq_row.get("VendorID"),
         "EstimateID": estimate_id,
+        "EstimatedID": estimate_id,
+        "SourceDocumentType": rfq_row.get("MaterialRequestSourceType") or "Estimate",
+        "SourceDocumentID": rfq_row.get("MaterialRequestSourceID") or estimate_id,
+        "SourceDocumentLabel": rfq_row.get("SourceDocumentLabel") or f"Estimate #{estimate_id}",
+        "WorkOrderID": rfq_row.get("WorkOrderID"),
         "AttachmentPath": attachment_path,
         "AttachmentFileName": Path(attachment_path).name,
-        "Subject": subject,
-        "Body": body,
-        "TemplateCode": "RFQDelivery:fallback",
-        "TemplateUsed": "fallback",
-        "TemplateVersionID": None,
+        "Subject": rendered_subject,
+        "Body": rendered_body,
+        "TemplateCode": "RFQDelivery:selected" if template_used else "RFQDelivery:fallback",
+        "TemplateUsed": template_used or "fallback",
+        "TemplateVersionID": template_version_id,
+        "TemplateRenderWarning": template_warning,
+        "SelectedHeaderTemplateID": selected_header_id,
+        "SelectedBodyTemplateID": selected_body_id,
+        "SelectedFooterTemplateID": selected_footer_id,
         "DueDate": rfq_row.get("DueDate"),
         "SiteName": estimate_row.get("SiteName"),
     }
 
 
-def prepare_rfq_batch_preview(rfq_ids: list[int]) -> dict[str, Any]:
+def render_rfq_delivery_preview_context(
+    *,
+    estimate_id: int,
+    vendor_name: str,
+    due_date: Any = None,
+    material_ids: list[int] | list[str] | None = None,
+    rfq_id: int | None = None,
+    header_template_id: int | None = None,
+    body_template_id: int | None = None,
+    footer_template_id: int | None = None,
+) -> dict[str, Any]:
+    normalized_material_ids: list[int] = []
+    for value in material_ids or []:
+        try:
+            normalized_material_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    estimate_row, material_rows = _load_estimate_rfq_material_rows(
+        int(estimate_id),
+        material_ids=normalized_material_ids or None,
+    )
+    if not estimate_row or not material_rows:
+        return {
+        "success": False,
+        "reason": "This RFQ preview does not have packaged material lines yet.",
+        "EstimateID": estimate_id,
+        "EstimatedID": estimate_id,
+        "RFQID": rfq_id,
+        "SourceDocumentType": "Estimate",
+        "SourceDocumentID": estimate_id,
+        "SourceDocumentLabel": f"Estimate #{estimate_id}",
+        }
+
+    effective_rfq_id = int(rfq_id) if rfq_id not in (None, "") else 0
+    attachment_file_name = (
+        f"RFQ_{effective_rfq_id}_{str(vendor_name or 'Vendor').strip().replace(' ', '_')}.pdf"
+        if effective_rfq_id
+        else f"RFQ_DRAFT_{str(vendor_name or 'Vendor').strip().replace(' ', '_')}.pdf"
+    )
+    attachment_path = str(Path("preview") / attachment_file_name)
+    subject = _fallback_subject(effective_rfq_id or 0, estimate_id, estimate_row.get("SiteName"))
+    body = _fallback_body(
+        vendor_name,
+        effective_rfq_id or 0,
+        estimate_id,
+        estimate_row.get("SiteName"),
+        due_date,
+    )
+    tokens = _get_rfq_delivery_tokens(
+        rfq_id=effective_rfq_id or 0,
+        estimate_id=estimate_id,
+        source_document_type="Estimate",
+        source_document_id=estimate_id,
+        source_document_label=f"Estimate #{estimate_id}",
+        work_order_id=None,
+        vendor_name=vendor_name,
+        vendor_email=None,
+        due_date=due_date,
+        site_name=estimate_row.get("SiteName"),
+        customer_name=estimate_row.get("CustomerName"),
+        attachment_path=attachment_path,
+        material_rows=material_rows,
+    )
+
+    selected_header_id = header_template_id
+    selected_body_id = body_template_id
+    selected_footer_id = footer_template_id
+    if selected_header_id is None:
+        default_header = _load_rfq_default_template_version(DocumentTemplateKind.HEADER)
+        selected_header_id = int(default_header.template_id) if default_header and default_header.template_id is not None else None
+    if selected_body_id is None:
+        default_body = _load_rfq_default_template_version(DocumentTemplateKind.BODY)
+        selected_body_id = int(default_body.template_id) if default_body and default_body.template_id is not None else None
+    if selected_footer_id is None:
+        default_footer = _load_rfq_default_template_version(DocumentTemplateKind.FOOTER)
+        selected_footer_id = int(default_footer.template_id) if default_footer and default_footer.template_id is not None else None
+
+    rendered_subject, rendered_body, template_used, template_version_id, template_warning = _render_rfq_delivery_from_templates(
+        tokens=tokens,
+        fallback_subject=subject,
+        fallback_body=body,
+        header_template_id=selected_header_id,
+        body_template_id=selected_body_id,
+        footer_template_id=selected_footer_id,
+        material_rows=material_rows,
+    )
+    return {
+        "success": True,
+        "reason": "Ready to preview.",
+        "RFQID": effective_rfq_id or None,
+        "EstimateID": estimate_id,
+        "EstimatedID": estimate_id,
+        "SourceDocumentType": "Estimate",
+        "SourceDocumentID": estimate_id,
+        "SourceDocumentLabel": f"Estimate #{estimate_id}",
+        "VendorName": vendor_name,
+        "SiteName": estimate_row.get("SiteName"),
+        "Subject": rendered_subject,
+        "Body": rendered_body,
+        "TemplateCode": "RFQDelivery:selected" if template_used else "RFQDelivery:fallback",
+        "TemplateUsed": template_used or "fallback",
+        "TemplateVersionID": template_version_id,
+        "TemplateRenderWarning": template_warning,
+        "SelectedHeaderTemplateID": selected_header_id,
+        "SelectedBodyTemplateID": selected_body_id,
+        "SelectedFooterTemplateID": selected_footer_id,
+        "AttachmentPath": attachment_path,
+        "AttachmentFileName": attachment_file_name,
+    }
+
+
+def prepare_rfq_batch_preview(
+    rfq_ids: list[int],
+    *,
+    header_template_id: int | None = None,
+    body_template_id: int | None = None,
+    footer_template_id: int | None = None,
+) -> dict[str, Any]:
     normalized_ids: list[int] = []
     seen_ids: set[int] = set()
     for value in rfq_ids or []:
@@ -242,7 +740,12 @@ def prepare_rfq_batch_preview(rfq_ids: list[int]) -> dict[str, Any]:
     error_count = 0
 
     for rfq_id in normalized_ids:
-        preview = prepare_rfq_delivery_message(rfq_id)
+        preview = prepare_rfq_delivery_message(
+            rfq_id,
+            header_template_id=header_template_id,
+            body_template_id=body_template_id,
+            footer_template_id=footer_template_id,
+        )
         row = {
             "PriceRequestID": preview.get("PriceRequestID") or rfq_id,
             "RFQID": preview.get("RFQID") or rfq_id,
@@ -255,6 +758,7 @@ def prepare_rfq_batch_preview(rfq_ids: list[int]) -> dict[str, Any]:
             "Body": preview.get("Body"),
             "AttachmentPath": preview.get("AttachmentPath"),
             "TemplateUsed": preview.get("TemplateUsed"),
+            "TemplateRenderWarning": preview.get("TemplateRenderWarning"),
             "PreviewReady": bool(preview.get("success")),
             "PreviewReason": preview.get("reason") or ("Ready to preview." if preview.get("success") else "Preview unavailable."),
         }
@@ -285,6 +789,11 @@ def send_rfq(
     rfq_id: int,
     sent_by: str = "UI",
     override_recipient: str | None = None,
+    *,
+    header_template_id: int | None = None,
+    body_template_id: int | None = None,
+    footer_template_id: int | None = None,
+    body_override: str | None = None,
 ) -> dict[str, Any]:
     preview: dict[str, Any] | None = None
     prepared_log: dict[str, Any] | None = None
@@ -300,9 +809,17 @@ def send_rfq(
                 **(context or {}),
             }
 
-        preview = prepare_rfq_delivery_message(rfq_id)
+        preview = prepare_rfq_delivery_message(
+            rfq_id,
+            header_template_id=header_template_id,
+            body_template_id=body_template_id,
+            footer_template_id=footer_template_id,
+        )
         if not preview.get("success"):
             return preview
+
+        if body_override is not None:
+            preview["Body"] = str(body_override)
 
         original_vendor_email = str(preview.get("VendorEmail") or "").strip()
         recipient = str(override_recipient or "").strip() or original_vendor_email

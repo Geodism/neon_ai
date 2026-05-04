@@ -67,6 +67,9 @@ class NeonMainWindow(QMainWindow):
         self.page_factories: dict[str, type[QWidget]] = {}
         self.page_last_refresh_at: dict[str, float] = {}
         self.page_refresh_interval_s = 30.0
+        self.current_category_name: str | None = None
+        self.current_action_key: str | None = None
+        self.action_buttons: dict[str, QPushButton] = {}
         self.menu_structure: dict[str, list[MenuAction]] = {
             "ðŸ“ˆ METRICS": [
                 MenuAction("Company Dashboard", "DashboardFrame"),
@@ -88,8 +91,8 @@ class NeonMainWindow(QMainWindow):
             ],
             "ðŸ“¦ MATERIALS": [
                 MenuAction("Materials Catalog", "MaterialFrame"),
-                MenuAction("Review RFQs", "RFQViewerFrame"),
-                MenuAction("Receive Goods", "ReceivingViewerFrame"),
+                MenuAction("RFQ Center", "RFQCenterFrame"),
+                MenuAction("PO Center", "POCenterFrame"),
             ],
             "ðŸ› ï¸ EMPLOYEES": [
                 MenuAction("Manage People", "EmployeeManagerFrame"),
@@ -199,6 +202,11 @@ class NeonMainWindow(QMainWindow):
                 margin-top: 8px;
             }
             QPushButton:hover { background-color: #3d4752; }
+            QPushButton[navSelected="true"] {
+                background-color: #27ae60;
+                border-color: #1e8449;
+                font-weight: 700;
+            }
             """
         )
         return sidebar
@@ -246,6 +254,8 @@ class NeonMainWindow(QMainWindow):
             _perf_log("ui", f"create_page:{page_key}", started_at)
 
     def load_sub_menu(self, category_name: str) -> None:
+        self.current_category_name = category_name
+        self.action_buttons = {}
         while self.action_layout.count():
             item = self.action_layout.takeAt(0)
             widget = item.widget()
@@ -266,12 +276,21 @@ class NeonMainWindow(QMainWindow):
             button = QPushButton(action.label)
             button.clicked.connect(lambda checked=False, key=action.page_key: self.show_page(key))
             self.action_layout.addWidget(button)
+            self.action_buttons[action.page_key] = button
 
         self.action_layout.addStretch(1)
         if actions:
             self.show_page(actions[0].page_key)
 
     def show_page(self, page_key: str) -> None:
+        if page_key == "RFQCenterFrame":
+            self.open_rfq_center()
+            return
+        if page_key == "POCenterFrame":
+            self.open_po_center()
+            return
+
+        self._set_active_action(page_key)
         started_at = time.perf_counter()
         try:
             page = self._get_or_create_page(page_key)
@@ -297,3 +316,50 @@ class NeonMainWindow(QMainWindow):
 
         dialog = PrivateBrainDialog(self)
         dialog.exec()
+
+    def open_materials_catalog(self) -> None:
+        self.show_page("MaterialFrame")
+
+    def open_rfq_center(self) -> None:
+        self.set_material_procurement_center("RFQ")
+
+    def open_po_center(self) -> None:
+        self.set_material_procurement_center("PO")
+
+    def set_material_procurement_center(self, center: str) -> None:
+        center = "PO" if str(center or "").strip().upper() == "PO" else "RFQ"
+        action_key = "POCenterFrame" if center == "PO" else "RFQCenterFrame"
+        self._set_active_action(action_key)
+
+        started_at = time.perf_counter()
+        try:
+            page_key = "RFQViewerFrame"
+            page = self._get_or_create_page(page_key)
+            refresh = getattr(page, "refresh_data", None)
+            if callable(refresh):
+                now = time.perf_counter()
+                last_refresh_at = self.page_last_refresh_at.get(page_key)
+                if last_refresh_at is None or (now - last_refresh_at) >= self.page_refresh_interval_s:
+                    refresh()
+                    self.page_last_refresh_at[page_key] = time.perf_counter()
+                else:
+                    _perf_log_skipped(page_key)
+            if hasattr(page, "set_procurement_center"):
+                page.set_procurement_center(center)
+            self.stack.setCurrentWidget(page)
+        finally:
+            _perf_log("ui", f"show_page:{action_key}", started_at)
+
+    def refresh_materials_subnav_selection(self, center: str | None = None) -> None:
+        if not str(self.current_category_name or "").endswith("MATERIALS"):
+            return
+        action_key = "POCenterFrame" if str(center or "").strip().upper() == "PO" else "RFQCenterFrame"
+        self._set_active_action(action_key)
+
+    def _set_active_action(self, page_key: str) -> None:
+        self.current_action_key = page_key
+        for key, button in self.action_buttons.items():
+            selected = key == page_key
+            button.setProperty("navSelected", selected)
+            button.style().unpolish(button)
+            button.style().polish(button)

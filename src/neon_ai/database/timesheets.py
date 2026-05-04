@@ -1,10 +1,9 @@
 from neon_ai.database.connection import get_connection
 from psycopg2.extras import RealDictCursor
 
-from neon_ai.database.connection import get_connection
 
-def get_open_workorder_choices():
-    """Returns all open work orders for timesheet dropdowns."""
+def list_open_work_orders_for_material_request():
+    """Returns open work orders for Material Request and PO source selectors."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
@@ -31,9 +30,16 @@ def get_open_workorder_choices():
         site_name = row.get("SiteName") or "Unknown Site"
         choices.append({
             "WorkOrderID": int(wo_id),
-            "Label": f"{wo_id} - {site_name}",
+            "SiteName": str(site_name),
+            "BillingType": str(row.get("BillingType") or ""),
+            "Label": f"Work Order #{wo_id} - {site_name}",
         })
     return choices
+
+
+def get_open_workorder_choices():
+    """Returns all open work orders for timesheet dropdowns."""
+    return list_open_work_orders_for_material_request()
 
 
 def get_standard_tasks():

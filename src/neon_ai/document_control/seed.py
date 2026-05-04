@@ -1829,6 +1829,87 @@ def _customer_invoice_delivery_template_seed_spec() -> dict[str, object]:
     }
 
 
+def _rfq_delivery_template_seed_specs() -> list[dict[str, object]]:
+    return [
+        {
+            "template_name": "RFQDeliveryHeader",
+            "template_kind": DocumentTemplateKind.HEADER.value,
+            "subject_line": None,
+            "body_content": """
+<header>
+  <h1>{CompanyName}</h1>
+  <h2>{DocumentTitle}</h2>
+  <p><strong>RFQ Number:</strong> {RFQID}</p>
+  <p><strong>Estimate:</strong> {EstimateID}</p>
+  <p><strong>Project / Site:</strong> {SiteName}</p>
+</header>
+""".strip(),
+            "token_schema": [
+                "CompanyName",
+                "DocumentTitle",
+                "RFQID",
+                "PriceRequestID",
+                "EstimateID",
+                "SiteName",
+                "SiteAddress",
+            ],
+            "change_summary": "Initial seeded RFQ delivery header template",
+            "notes": "Seeded RFQ delivery header template for RFQ preview/send preparation.",
+        },
+        {
+            "template_name": "RFQDeliveryBody",
+            "template_kind": DocumentTemplateKind.BODY.value,
+            "subject_line": "RFQ #{RFQID} - Estimate #{EstimateID} - {SiteName}",
+            "body_content": """
+<section>
+  <p>Hello {VendorName},</p>
+  <p>Please review the attached RFQ package for RFQ #{RFQID} on Estimate #{EstimateID}.</p>
+  <p><strong>Project / Site:</strong> {SiteAddress}</p>
+  <p><strong>Requested Due Date:</strong> {DueDate}</p>
+  <p>Please provide pricing for the following materials:</p>
+  {{RFQRequestedMaterialTable}}
+  <p>Please include lead time, quote validity date, freight, and any approved alternates or substitutions.</p>
+  <p><strong>Attachment:</strong> {AttachmentFileName}</p>
+  <p>Thank you,</p>
+  <p><strong>{CompanyName}</strong><br>{OwnerName}</p>
+</section>
+""".strip(),
+            "token_schema": [
+                "VendorName",
+                "RFQID",
+                "PriceRequestID",
+                "EstimateID",
+                "SiteAddress",
+                "DueDate",
+                "RFQRequestedMaterialTable",
+                "AttachmentFileName",
+                "CompanyName",
+                "OwnerName",
+            ],
+            "change_summary": "Initial seeded RFQ delivery body template",
+            "notes": "Seeded RFQ delivery body template for RFQ preview/send preparation.",
+        },
+        {
+            "template_name": "RFQDeliveryFooter",
+            "template_kind": DocumentTemplateKind.FOOTER.value,
+            "subject_line": None,
+            "body_content": """
+<footer>
+  <hr>
+  <p>Thank you for reviewing this request for quotation.</p>
+  <p><strong>{CompanyName}</strong><br>{OwnerName}</p>
+</footer>
+""".strip(),
+            "token_schema": [
+                "CompanyName",
+                "OwnerName",
+            ],
+            "change_summary": "Initial seeded RFQ delivery footer template",
+            "notes": "Seeded RFQ delivery footer template for RFQ preview/send preparation.",
+        },
+    ]
+
+
 def ensure_customer_invoice_delivery_template(force_default: bool = False) -> dict[str, object]:
     document_type_code = "CUSTOMER_INVOICE_DELIVERY"
     usage_context = "CUSTOMER_INVOICE_SEND"
@@ -2072,6 +2153,294 @@ def ensure_customer_invoice_delivery_template(force_default: bool = False) -> di
     except OperationalError as exc:
         raise RuntimeError(
             f"Customer invoice delivery template seed failed because the database connection is unavailable: {exc}"
+        ) from exc
+    except psycopg2.Error as exc:
+        if exc.pgcode in {
+            errorcodes.UNDEFINED_TABLE,
+            errorcodes.UNDEFINED_COLUMN,
+            errorcodes.INVALID_COLUMN_REFERENCE,
+        }:
+            raise RuntimeError(
+                "Document control schema is not available. Apply database_schema.sql first."
+            ) from exc
+        raise
+
+
+def ensure_rfq_delivery_templates(force_defaults: bool = False) -> dict[str, object]:
+    document_type_code = "RFQ_DELIVERY"
+    usage_context = "RFQ_SEND"
+    specs = _rfq_delivery_template_seed_specs()
+    actions: dict[str, object] = {
+        "created_document_type": False,
+        "activated_document_type": False,
+        "templates": {},
+        "defaults": {},
+    }
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT document_type_id, is_active
+                    FROM public.app_document_type
+                    WHERE document_type_code = %s
+                    LIMIT 1
+                    """,
+                    (document_type_code,),
+                )
+                document_type_row = cur.fetchone()
+                if not document_type_row:
+                    cur.execute(
+                        """
+                        INSERT INTO public.app_document_type (
+                            document_type_code,
+                            display_name,
+                            description,
+                            default_output_format,
+                            is_active
+                        )
+                        VALUES (%s, %s, %s, %s, TRUE)
+                        """,
+                        (
+                            document_type_code,
+                            "RFQ Delivery",
+                            "Vendor-facing RFQ delivery message templates for preview/send preparation.",
+                            DocumentOutputFormat.HTML.value,
+                        ),
+                    )
+                    actions["created_document_type"] = True
+                elif not bool(document_type_row.get("is_active")):
+                    cur.execute(
+                        """
+                        UPDATE public.app_document_type
+                        SET is_active = TRUE
+                        WHERE document_type_code = %s
+                        """,
+                        (document_type_code,),
+                    )
+                    actions["activated_document_type"] = True
+
+                for spec in specs:
+                    template_kind = str(spec["template_kind"])
+                    template_name = str(spec["template_name"])
+                    template_actions: dict[str, object] = {
+                        "template_id": None,
+                        "template_name": template_name,
+                        "template_kind": template_kind,
+                        "created_template": False,
+                        "activated_template": False,
+                        "created_version": False,
+                        "activated_version": False,
+                        "template_version_id": None,
+                    }
+
+                    cur.execute(
+                        """
+                        SELECT template_id, active_version_id, is_active
+                        FROM public.app_document_template
+                        WHERE document_type_code = %s
+                          AND template_kind = %s
+                          AND template_name = %s
+                        LIMIT 1
+                        """,
+                        (document_type_code, template_kind, template_name),
+                    )
+                    template_row = cur.fetchone()
+                    if not template_row:
+                        cur.execute(
+                            """
+                            INSERT INTO public.app_document_template (
+                                document_type_code,
+                                template_kind,
+                                template_name,
+                                content_format,
+                                current_version_number,
+                                notes,
+                                is_active
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                            RETURNING template_id, active_version_id, is_active
+                            """,
+                            (
+                                document_type_code,
+                                template_kind,
+                                template_name,
+                                "html",
+                                0,
+                                spec.get("notes"),
+                            ),
+                        )
+                        template_row = cur.fetchone()
+                        template_actions["created_template"] = True
+
+                    template_id = int(template_row["template_id"])
+                    template_actions["template_id"] = template_id
+
+                    if not bool(template_row.get("is_active")):
+                        cur.execute(
+                            """
+                            UPDATE public.app_document_template
+                            SET is_active = TRUE,
+                                updated_at = now()
+                            WHERE template_id = %s
+                            """,
+                            (template_id,),
+                        )
+                        template_actions["activated_template"] = True
+
+                    if template_row.get("active_version_id") is None:
+                        cur.execute(
+                            """
+                            SELECT template_version_id, version_number
+                            FROM public.app_document_template_version
+                            WHERE template_id = %s
+                            ORDER BY version_number DESC, template_version_id DESC
+                            LIMIT 1
+                            """,
+                            (template_id,),
+                        )
+                        version_row = cur.fetchone()
+                        if version_row:
+                            template_version_id = int(version_row["template_version_id"])
+                            version_number = int(version_row["version_number"])
+                            cur.execute(
+                                """
+                                UPDATE public.app_document_template
+                                SET active_version_id = %s,
+                                    current_version_number = %s,
+                                    is_active = TRUE,
+                                    updated_at = now()
+                                WHERE template_id = %s
+                                """,
+                                (template_version_id, version_number, template_id),
+                            )
+                            template_actions["activated_version"] = True
+                            template_actions["template_version_id"] = template_version_id
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO public.app_document_template_version (
+                                    template_id,
+                                    version_number,
+                                    subject_line,
+                                    body_content,
+                                    content_format,
+                                    output_format,
+                                    token_schema,
+                                    change_summary,
+                                    notes,
+                                    created_by
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING template_version_id, version_number
+                                """,
+                                (
+                                    template_id,
+                                    1,
+                                    spec.get("subject_line"),
+                                    spec.get("body_content"),
+                                    "html",
+                                    DocumentOutputFormat.HTML.value,
+                                    Json(spec.get("token_schema") or []),
+                                    spec.get("change_summary"),
+                                    spec.get("notes"),
+                                    "rfq-delivery-template-seed",
+                                ),
+                            )
+                            version_row = cur.fetchone()
+                            template_version_id = int(version_row["template_version_id"])
+                            version_number = int(version_row["version_number"])
+                            cur.execute(
+                                """
+                                UPDATE public.app_document_template
+                                SET active_version_id = %s,
+                                    current_version_number = %s,
+                                    is_active = TRUE,
+                                    updated_at = now()
+                                WHERE template_id = %s
+                                """,
+                                (template_version_id, version_number, template_id),
+                            )
+                            template_actions["created_version"] = True
+                            template_actions["template_version_id"] = template_version_id
+                    else:
+                        template_actions["template_version_id"] = int(template_row["active_version_id"])
+
+                    actions["templates"][template_kind] = template_actions
+
+                    default_actions: dict[str, object] = {
+                        "template_kind": template_kind,
+                        "usage_context": usage_context,
+                        "created_default": False,
+                        "updated_default": False,
+                        "preserved_default": False,
+                        "default_template_id": template_id,
+                    }
+                    cur.execute(
+                        """
+                        SELECT template_default_id, template_id
+                        FROM public.app_document_template_default
+                        WHERE document_type_code = %s
+                          AND template_kind = %s
+                          AND usage_context = %s
+                        LIMIT 1
+                        """,
+                        (document_type_code, template_kind, usage_context),
+                    )
+                    default_row = cur.fetchone()
+                    if default_row:
+                        existing_template_id = int(default_row["template_id"])
+                        default_actions["default_template_id"] = existing_template_id
+                        if force_defaults and existing_template_id != template_id:
+                            cur.execute(
+                                """
+                                UPDATE public.app_document_template_default
+                                SET template_id = %s,
+                                    updated_at = now(),
+                                    updated_by = %s
+                                WHERE template_default_id = %s
+                                """,
+                                (
+                                    template_id,
+                                    "rfq-delivery-template-seed",
+                                    int(default_row["template_default_id"]),
+                                ),
+                            )
+                            default_actions["updated_default"] = True
+                            default_actions["default_template_id"] = template_id
+                        else:
+                            default_actions["preserved_default"] = True
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO public.app_document_template_default (
+                                document_type_code,
+                                template_kind,
+                                usage_context,
+                                template_id,
+                                updated_at,
+                                updated_by
+                            )
+                            VALUES (%s, %s, %s, %s, now(), %s)
+                            """,
+                            (
+                                document_type_code,
+                                template_kind,
+                                usage_context,
+                                template_id,
+                                "rfq-delivery-template-seed",
+                            ),
+                        )
+                        default_actions["created_default"] = True
+
+                    actions["defaults"][template_kind] = default_actions
+
+                conn.commit()
+        return actions
+    except OperationalError as exc:
+        raise RuntimeError(
+            f"RFQ delivery template seed failed because the database connection is unavailable: {exc}"
         ) from exc
     except psycopg2.Error as exc:
         if exc.pgcode in {

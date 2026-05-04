@@ -29,6 +29,276 @@ from neon_ai.document_control.models import (
 from neon_ai.ui.widgets.rich_text_toolbar import RichTextToolbar
 
 
+TOKEN_GUIDE_GROUPS: list[tuple[str, list[str]]] = [
+    (
+        "Company / Sender",
+        [
+            "CompanyName",
+            "CompanyAddress",
+            "CompanyPhone",
+            "CompanyEmail",
+            "CompanyWebsite",
+            "OwnerName",
+            "OwnerEmail",
+            "OwnerPhone",
+            "SenderName",
+            "SenderEmail",
+            "SenderTitle",
+        ],
+    ),
+    (
+        "Customer",
+        [
+            "CustomerName",
+            "CustomerEmail",
+            "CustomerPhone",
+            "CustomerBillingAddress",
+            "CustomerContactName",
+            "CustomerContactEmail",
+            "CustomerContactPhone",
+        ],
+    ),
+    (
+        "Site / Project",
+        [
+            "SiteName",
+            "SiteAddress",
+            "SiteCity",
+            "SitePostalCode",
+            "ProjectName",
+            "ProjectAddress",
+            "ProjectDescription",
+            "ScopeOfWork",
+        ],
+    ),
+    (
+        "Estimate",
+        [
+            "EstimateID",
+            "EstimateNumber",
+            "EstimateDate",
+            "EstimateStatus",
+            "EstimateTotal",
+            "EstimateSubtotal",
+            "EstimateMaterialSubtotal",
+            "EstimateLaborSubtotal",
+            "EstimateTaxAmount",
+            "EstimateMarkupPercent",
+            "EstimateBillingType",
+            "EstimateValidUntil",
+            "EstimateTerms",
+        ],
+    ),
+    (
+        "Work Order",
+        [
+            "WorkOrderID",
+            "WorkOrderNumber",
+            "WorkOrderStatus",
+            "WorkOrderDate",
+            "WorkOrderCreatedDate",
+            "WorkOrderApprovedDate",
+            "WorkOrderClosedDate",
+            "CustomerPO",
+            "AssignedElectrician",
+        ],
+    ),
+    (
+        "Customer Invoice",
+        [
+            "CustomerInvoiceId",
+            "InvoiceNumber",
+            "InvoiceDate",
+            "DueDate",
+            "InvoiceStatus",
+            "InvoiceType",
+            "InvoiceTotal",
+            "InvoiceSubtotal",
+            "InvoiceTaxAmount",
+            "InvoiceBalanceDue",
+            "PaymentTerms",
+            "PercentOfContract",
+            "BillingMilestone",
+        ],
+    ),
+    (
+        "RFQ",
+        [
+            "RFQID",
+            "PriceRequestID",
+            "RFQDate",
+            "RFQDueDate",
+            "RFQStatus",
+            "RFQNumber",
+            "RFQNotes",
+            "RequestedDueDate",
+        ],
+    ),
+    (
+        "Purchase Order",
+        [
+            "PurchaseOrderID",
+            "PurchaseOrderNumber",
+            "PODate",
+            "POStatus",
+            "POTotal",
+            "POSubtotal",
+            "POTaxAmount",
+            "POExpectedArrival",
+            "POETA",
+            "PONotes",
+        ],
+    ),
+    (
+        "Vendor / Wholesaler",
+        [
+            "VendorName",
+            "VendorEmail",
+            "VendorPhone",
+            "VendorAddress",
+            "VendorContactName",
+            "VendorAccountNumber",
+            "VendorQuoteNumber",
+        ],
+    ),
+    (
+        "Materials / Line Items",
+        [
+            "MaterialLineItems",
+            "MaterialLineItemsHtml",
+            "MaterialLineItemsText",
+            "RFQRequestedMaterialTable",
+            "LaborLineItems",
+            "LaborLineItemsHtml",
+            "LaborLineItemsText",
+            "LineItems",
+            "LineItemsHtml",
+            "LineItemsText",
+            "PartNumber",
+            "MaterialDescription",
+            "MaterialQuantity",
+            "MaterialUnitCost",
+            "MaterialLineTotal",
+            "MaterialNotes",
+            "LaborRole",
+            "LaborHours",
+            "LaborRate",
+            "LaborLineTotal",
+        ],
+    ),
+    (
+        "Financial Summary",
+        [
+            "TotalEstimateAmount",
+            "PreviouslyInvoicedAmount",
+            "AmountStillToInvoice",
+            "LabourCostToDate",
+            "ApprovedPurchaseOrderCost",
+            "CommittedCost",
+            "BillingPositionAmount",
+            "BillingPositionLabel",
+            "EstimatePositionAmount",
+            "EstimatePositionLabel",
+        ],
+    ),
+    (
+        "Dates / Terms",
+        [
+            "Today",
+            "CurrentDate",
+            "RequestedDate",
+            "DeliveryDate",
+            "PaymentDueDate",
+            "Terms",
+        ],
+    ),
+    (
+        "Attachments / Files",
+        [
+            "AttachmentFileName",
+            "AttachmentPath",
+            "EstimateDocumentPath",
+            "InvoiceDocumentPath",
+            "RFQAttachmentPath",
+            "PurchaseOrderDocumentPath",
+        ],
+    ),
+]
+
+SUPPORTED_TEMPLATE_TOKENS: set[str] = {
+    "CompanyName",
+    "OwnerName",
+    "CustomerName",
+    "CustomerEmail",
+    "CustomerPhone",
+    "SiteName",
+    "SiteAddress",
+    "ScopeOfWork",
+    "EstimateID",
+    "EstimateNumber",
+    "EstimateDate",
+    "EstimateTotal",
+    "EstimateSubtotal",
+    "WorkOrderID",
+    "CustomerInvoiceId",
+    "InvoiceNumber",
+    "InvoiceDate",
+    "DueDate",
+    "InvoiceType",
+    "InvoiceTotal",
+    "PaymentTerms",
+    "PercentOfContract",
+    "BillingMilestone",
+    "RFQID",
+    "PriceRequestID",
+    "VendorName",
+    "VendorEmail",
+    "MaterialLineItems",
+    "MaterialLineItemsHtml",
+    "MaterialLineItemsText",
+    "RFQRequestedMaterialTable",
+    "LaborLineItems",
+    "LaborLineItemsHtml",
+    "LaborLineItemsText",
+    "LineItems",
+    "LineItemsHtml",
+    "LineItemsText",
+    "Terms",
+    "AttachmentFileName",
+    "AttachmentPath",
+}
+
+PARTIAL_TEMPLATE_TOKENS: set[str] = {
+    "CompanyAddress",
+    "CompanyPhone",
+    "CompanyEmail",
+    "CompanyWebsite",
+    "OwnerEmail",
+    "OwnerPhone",
+    "SenderName",
+    "SenderEmail",
+    "SenderTitle",
+    "CustomerBillingAddress",
+    "CustomerContactName",
+    "CustomerContactEmail",
+    "CustomerContactPhone",
+    "SiteCity",
+    "SitePostalCode",
+    "ProjectName",
+    "ProjectAddress",
+    "ProjectDescription",
+    "EstimateMaterialSubtotal",
+    "EstimateLaborSubtotal",
+    "EstimateTaxAmount",
+    "WorkOrderNumber",
+    "InvoiceSubtotal",
+    "InvoiceTaxAmount",
+    "RFQDueDate",
+    "RFQNumber",
+    "RequestedDueDate",
+}
+
+
 class DocumentStudioPage(QWidget):
     def __init__(self, main_window=None, container=None) -> None:
         parent = main_window if isinstance(main_window, QWidget) else None
@@ -42,9 +312,11 @@ class DocumentStudioPage(QWidget):
         self._suspend_dirty_tracking = False
         self._is_dirty = False
         self._token_help_map: dict[str, str] = {}
+        self._token_support_map: dict[str, str] = {}
         self._estimate_default_usage_context = "ESTIMATE_DRAFT_WORKSPACE"
         self._invoice_default_usage_context = "CUSTOMER_INVOICE_DRAFT_WORKSPACE"
         self._invoice_delivery_default_usage_context = "CUSTOMER_INVOICE_SEND"
+        self._rfq_delivery_default_usage_context = "RFQ_SEND"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -248,10 +520,16 @@ class DocumentStudioPage(QWidget):
         token_actions.addWidget(self.insert_token_button)
         token_actions.addStretch(1)
         token_layout.addLayout(token_actions)
+        self.token_scope_label = QLabel(
+            "Some tokens are workflow-specific. Missing values will be reported during preview/render."
+        )
+        self.token_scope_label.setWordWrap(True)
+        self.token_scope_label.setStyleSheet("color: #8a5a00;")
+        token_layout.addWidget(self.token_scope_label)
         self.token_help_label = QLabel("Select a token to see its description.")
         self.token_help_label.setWordWrap(True)
         self.token_help_label.setStyleSheet("color: #555;")
-        self.token_help_label.setMinimumHeight(48)
+        self.token_help_label.setMinimumHeight(72)
         self.token_help_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         token_layout.addWidget(self.token_help_label)
 
@@ -460,7 +738,7 @@ class DocumentStudioPage(QWidget):
             token_schema=tuple(),
             change_summary=self.change_summary_edit.toPlainText().strip() or None,
             notes=self.notes_edit.toPlainText().strip() or None,
-            is_active=False,
+            is_active=bool(self._current_template_is_active),
             created_by="ui",
         )
 
@@ -471,10 +749,16 @@ class DocumentStudioPage(QWidget):
             return
 
         saved_template_id = saved_version.template_id
-        self._set_status_message(
-            f"Saved version {saved_version.version_number} for '{saved_version.template_name}'. "
-            "Active template status was left unchanged."
-        )
+        if self._current_template_is_active:
+            self._set_status_message(
+                f"Saved version {saved_version.version_number} for '{saved_version.template_name}'. "
+                "It remains active and editable."
+            )
+        else:
+            self._set_status_message(
+                f"Saved version {saved_version.version_number} for '{saved_version.template_name}'. "
+                "It remains inactive until you explicitly activate it."
+            )
         self._refresh_templates_for_current_type()
         if saved_template_id is not None:
             self._reselect_template(saved_template_id)
@@ -553,6 +837,14 @@ class DocumentStudioPage(QWidget):
                 "label_prefix": "Invoice delivery",
                 "workspace_label": "invoice send preview workflow",
             }
+        if document_type_code == "RFQ_DELIVERY":
+            return {
+                "document_type_code": "RFQ_DELIVERY",
+                "usage_context": self._rfq_delivery_default_usage_context,
+                "button_prefix": "RFQ Delivery",
+                "label_prefix": "RFQ delivery",
+                "workspace_label": "RFQ send preview workflow",
+            }
         return None
 
     def _on_set_workspace_default(self) -> None:
@@ -567,7 +859,7 @@ class DocumentStudioPage(QWidget):
         config = self._default_workspace_config(document_type_code, kind)
         if template_id is None or config is None:
             self._set_status_message(
-                "Select a saved estimate or customer invoice header/body/footer template before setting a workspace default.",
+                "Select a saved estimate, customer invoice, or RFQ delivery header/body/footer template before setting a workspace default.",
                 is_error=True,
             )
             return
@@ -618,16 +910,16 @@ class DocumentStudioPage(QWidget):
 
     def _insert_selected_token(self, item: QListWidgetItem | None = None) -> None:
         token_item = item or self.token_list.currentItem()
-        if token_item is None:
+        token_value = token_item.data(Qt.ItemDataRole.UserRole) if token_item is not None else None
+        if token_item is None or not token_value:
             QMessageBox.information(
                 self,
                 "No Token Selected",
                 "Select a token in the Token Guide before using Insert Token.",
             )
             return
-        token_text = token_item.data(Qt.ItemDataRole.UserRole) or token_item.text()
         target = self._current_token_insert_target()
-        self._insert_text_into_widget(target, str(token_text))
+        self._insert_text_into_widget(target, str(token_value))
 
     def _current_token_insert_target(self):
         focused = QApplication.focusWidget()
@@ -711,42 +1003,83 @@ class DocumentStudioPage(QWidget):
         catalog_service = getattr(self.container, "document_catalog_service", None) if self.container else None
         if catalog_service is None:
             self._token_help_map = {}
+            self._token_support_map = {}
             self.token_help_label.setText("Token guide will appear here once document_catalog_service is available.")
-            self._populate_token_list({})
+            self._populate_token_list([])
             return
 
         try:
             token_help = catalog_service.get_token_help()
         except Exception as exc:
             self._token_help_map = {}
+            self._token_support_map = {}
             self.token_help_label.setText(f"Could not load token guide right now. Details: {exc}")
-            self._populate_token_list({})
+            self._populate_token_list([])
             return
 
-        token_help_map = {
-            "{CustomerName}": token_help.get("CustomerName", "Customer or account name."),
-            "{Name}": "General person or company display name.",
-            "{Price}": "Single line-item or quoted price text.",
-            "{InvoiceNumber}": token_help.get("InvoiceNumber", "Customer-facing invoice number."),
-            "{InvoiceDate}": token_help.get("InvoiceDate", "Formatted invoice date."),
-            "{WorkOrderID}": token_help.get("WorkOrderID", "Work order identifier."),
-            "{TotalAmount}": token_help.get("TotalAmount", "Rendered total amount text."),
-        }
+        token_help_map: dict[str, str] = {}
+        token_support_map: dict[str, str] = {}
+        token_entries: list[dict[str, str]] = []
+        seen_tokens: set[str] = set()
+
+        for group_name, token_names in TOKEN_GUIDE_GROUPS:
+            token_entries.append({"type": "group", "label": group_name})
+            for bare_token in token_names:
+                token_name = f"{{{bare_token}}}"
+                if token_name in seen_tokens:
+                    continue
+                seen_tokens.add(token_name)
+                support_level = self._support_level_for_token(bare_token)
+                token_help_map[token_name] = token_help.get(
+                    bare_token,
+                    "Workflow-specific token. Missing values will be surfaced during preview/render.",
+                )
+                token_support_map[token_name] = support_level
+                token_entries.append(
+                    {
+                        "type": "token",
+                        "label": token_name,
+                        "token": token_name,
+                        "support": support_level,
+                    }
+                )
 
         self._token_help_map = token_help_map
-        self._populate_token_list(token_help_map)
+        self._token_support_map = token_support_map
+        self._populate_token_list(token_entries)
 
-    def _populate_token_list(self, token_help_map: dict[str, str]) -> None:
+    def _support_level_for_token(self, bare_token: str) -> str:
+        if bare_token in SUPPORTED_TEMPLATE_TOKENS:
+            return "Supported"
+        if bare_token in PARTIAL_TEMPLATE_TOKENS:
+            return "Partial"
+        return "Planned"
+
+    def _populate_token_list(self, token_entries: list[dict[str, str]]) -> None:
         self.token_list.blockSignals(True)
         self.token_list.clear()
-        for token_name in token_help_map:
-            item = QListWidgetItem(token_name)
+        for entry in token_entries:
+            if entry.get("type") == "group":
+                item = QListWidgetItem(entry.get("label") or "")
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                item.setForeground(Qt.GlobalColor.darkBlue)
+                self.token_list.addItem(item)
+                continue
+            token_name = entry.get("token") or entry.get("label") or ""
+            item = QListWidgetItem(entry.get("label") or token_name)
             item.setData(Qt.ItemDataRole.UserRole, token_name)
+            item.setToolTip(
+                f"Support: {entry.get('support') or 'Planned'}\n{self._token_help_map.get(token_name, '')}"
+            )
             self.token_list.addItem(item)
         self.token_list.blockSignals(False)
         if self.token_list.count() > 0:
-            self.token_list.setCurrentRow(0)
-            self._on_token_selected(self.token_list.currentItem(), None)
+            for row in range(self.token_list.count()):
+                current_item = self.token_list.item(row)
+                if current_item.data(Qt.ItemDataRole.UserRole):
+                    self.token_list.setCurrentRow(row)
+                    self._on_token_selected(self.token_list.currentItem(), None)
+                    break
         else:
             self._on_token_selected(None, None)
 
@@ -760,14 +1093,20 @@ class DocumentStudioPage(QWidget):
             self.token_help_label.setText("Select a token to see its description.")
             return
         token_name = str(current.data(Qt.ItemDataRole.UserRole) or current.text())
+        if not current.data(Qt.ItemDataRole.UserRole):
+            self.token_help_label.setText("Select a token row to see its description and support level.")
+            return
         description = self._token_help_map.get(token_name, "No description is available for this token yet.")
-        self.token_help_label.setText(f"{token_name}: {description}")
+        support_level = self._token_support_map.get(token_name, "Planned")
+        self.token_help_label.setText(
+            f"{token_name}\nSupport: {support_level}\n{description}"
+        )
 
     def _current_selected_token(self) -> str | None:
         current_item = self.token_list.currentItem()
         if current_item is None:
             return None
-        token_value = current_item.data(Qt.ItemDataRole.UserRole) or current_item.text()
+        token_value = current_item.data(Qt.ItemDataRole.UserRole)
         return str(token_value) if token_value else None
 
     def _clear_document_types(self) -> None:

@@ -213,6 +213,860 @@ def save_rfq_package_for_vendor_id(estimate_id: int, vendor_id: int, due_date: s
     finally:
         conn.close()
 
+
+def ensure_material_request_source_schema(cur=None):
+    owns_connection = cur is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        cur = conn.cursor()
+    try:
+        cur.execute('ALTER TABLE public."PriceRequest" ADD COLUMN IF NOT EXISTS "MaterialRequestSourceType" text')
+        cur.execute('ALTER TABLE public."PriceRequest" ADD COLUMN IF NOT EXISTS "MaterialRequestSourceID" integer')
+        if owns_connection and conn is not None:
+            conn.commit()
+    except Exception:
+        if owns_connection and conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if owns_connection and conn is not None:
+            conn.close()
+
+
+def _normalize_material_request_source_type(source_type: str | None) -> str:
+    normalized = str(source_type or "").strip().lower()
+    if normalized in {"workorder", "work order", "wo"}:
+        return "WorkOrder"
+    return "Estimate"
+
+
+def resolve_material_request_source_context(
+    source_type: str,
+    source_id: int,
+    *,
+    cur=None,
+    require_eligible: bool = False,
+):
+    from neon_ai.database.estimates import normalize_estimate_status
+
+    normalized_source_type = _normalize_material_request_source_type(source_type)
+    owns_connection = cur is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if normalized_source_type == "Estimate":
+            cur.execute(
+                """
+                SELECT
+                    e."EstimateID",
+                    COALESCE(e."Status", 'Draft') AS "Status",
+                    COALESCE(e."IsConverted", FALSE) AS "IsConverted",
+                    COALESCE(s."SiteName", 'Unknown Site') AS "SiteName",
+                    COALESCE(e."Description", '') AS "Description"
+                FROM "Estimate" e
+                LEFT JOIN "Site" s ON e."SiteID" = s."SiteID"
+                WHERE e."EstimateID" = %s
+                """,
+                (int(source_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"Estimate #{source_id} was not found.")
+
+            estimate_id = int(row["EstimateID"])
+            estimate_status = normalize_estimate_status(row.get("Status"))
+            is_converted = bool(row.get("IsConverted"))
+            is_available = estimate_status == "Draft" and not is_converted
+            if require_eligible and not is_available:
+                if is_converted:
+                    raise ValueError(
+                        f"Estimate #{estimate_id} has already been converted to a Work Order and cannot be used for a new material-request RFQ."
+                    )
+                raise ValueError(
+                    f"Estimate #{estimate_id} is not an available draft estimate for material requests (current status: {estimate_status or 'Unknown'})."
+                )
+
+            description = str(row.get("Description") or "").strip()
+            site_name = str(row.get("SiteName") or "Unknown Site").strip()
+            return {
+                "source_type": "Estimate",
+                "source_id": estimate_id,
+                "selector_label": "Estimate #",
+                "source_document_label": f"Estimate #{estimate_id}",
+                "selection_label": f"{estimate_id} - {description or site_name or 'Draft Estimate'}",
+                "estimate_id": estimate_id,
+                "work_order_id": None,
+                "site_name": site_name,
+                "description": description,
+                "estimate_status": estimate_status,
+                "is_valid_for_material_request": is_available,
+            }
+
+        cur.execute(
+            """
+            SELECT
+                wo."WorkOrderID",
+                COALESCE(NULLIF(TRIM(wo."JobStatus"), ''), CASE WHEN COALESCE(wo."IsClosed", FALSE) THEN 'Closed' ELSE 'Unknown' END) AS "JobStatus",
+                COALESCE(wo."IsClosed", FALSE) AS "IsClosed",
+                COALESCE(s."SiteName", 'Unknown Site') AS "SiteName",
+                COALESCE(wo."Description", '') AS "Description",
+                COALESCE(wo."SourceEstimateID", est."EstimateID") AS "EstimateID"
+            FROM "WorkOrder" wo
+            LEFT JOIN "Site" s ON wo."SiteID" = s."SiteID"
+            LEFT JOIN LATERAL (
+                SELECT e."EstimateID"
+                FROM "Estimate" e
+                WHERE e."SiteID" = wo."SiteID"
+                ORDER BY e."EstimateID" DESC
+                LIMIT 1
+            ) est ON TRUE
+            WHERE wo."WorkOrderID" = %s
+            """,
+            (int(source_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Work Order #{source_id} was not found.")
+
+        work_order_id = int(row["WorkOrderID"])
+        work_order_status = str(row.get("JobStatus") or "").strip() or "Unknown"
+        is_open = work_order_status.upper() == "OPEN" and not bool(row.get("IsClosed"))
+        if require_eligible and not is_open:
+            raise ValueError(
+                f"Work Order #{work_order_id} is not open and cannot be used for a new material request (current status: {work_order_status})."
+            )
+
+        estimate_id = int(row["EstimateID"]) if row.get("EstimateID") is not None else None
+        if not estimate_id:
+            raise ValueError(
+                f"Work Order #{work_order_id} could not be mapped to an EstimateID for RFQ drafting."
+            )
+
+        description = str(row.get("Description") or "").strip()
+        site_name = str(row.get("SiteName") or "Unknown Site").strip()
+        return {
+            "source_type": "WorkOrder",
+            "source_id": work_order_id,
+            "selector_label": "Work Order #",
+            "source_document_label": f"Work Order #{work_order_id}",
+            "selection_label": f"{work_order_id} - {site_name or description or 'Open Work Order'}",
+            "estimate_id": estimate_id,
+            "work_order_id": work_order_id,
+            "site_name": site_name,
+            "description": description,
+            "work_order_status": work_order_status,
+            "is_valid_for_material_request": is_open,
+        }
+    finally:
+        if owns_connection and conn is not None:
+            conn.close()
+
+
+def _resolve_manual_rfq_estimate_id(cur, source_type: str, source_id: int) -> int:
+    context = resolve_material_request_source_context(
+        source_type,
+        int(source_id),
+        cur=cur,
+        require_eligible=True,
+    )
+    return int(context["estimate_id"])
+
+
+def _insert_manual_estimate_material(cur, estimate_id: int, row: dict) -> int:
+    description = str(row.get("description") or "").strip()
+    if not description:
+        raise ValueError("Material description is required.")
+
+    quantity = float(row.get("qty") or 0)
+    if quantity <= 0:
+        raise ValueError("Material quantity must be greater than zero.")
+
+    part_number = str(row.get("part_number") or "").strip() or None
+    catalog_item_id = row.get("catalog_item_id")
+    if catalog_item_id in ("", None):
+        catalog_item_id = None
+    else:
+        catalog_item_id = int(catalog_item_id)
+    unit_cost = float(row.get("unit_cost") or 0)
+    line_total = quantity * unit_cost
+    price_source = "Catalog" if catalog_item_id else "Manual"
+
+    cur.execute(
+        """
+        INSERT INTO "EstimateMaterial" (
+            "EstimateID",
+            "Description",
+            "Quantity",
+            "UnitCost",
+            "LineTotal",
+            "ItemID",
+            "PartNumber",
+            "PriceSource"
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING "EstimateMaterialID"
+        """,
+        (
+            estimate_id,
+            description,
+            quantity,
+            unit_cost,
+            line_total,
+            catalog_item_id,
+            part_number,
+            price_source,
+        ),
+    )
+    return int(cur.fetchone()["EstimateMaterialID"])
+
+
+def _update_manual_estimate_material(cur, estimate_material_id: int, row: dict) -> None:
+    description = str(row.get("description") or "").strip()
+    if not description:
+        raise ValueError("Material description is required.")
+
+    quantity = float(row.get("qty") or 0)
+    if quantity <= 0:
+        raise ValueError("Material quantity must be greater than zero.")
+
+    part_number = str(row.get("part_number") or "").strip() or None
+    catalog_item_id = row.get("catalog_item_id")
+    if catalog_item_id in ("", None):
+        catalog_item_id = None
+    else:
+        catalog_item_id = int(catalog_item_id)
+    unit_cost = float(row.get("unit_cost") or 0)
+    line_total = quantity * unit_cost
+    price_source = "Catalog" if catalog_item_id else "Manual"
+
+    cur.execute(
+        """
+        UPDATE "EstimateMaterial"
+        SET "Description" = %s,
+            "Quantity" = %s,
+            "UnitCost" = %s,
+            "LineTotal" = %s,
+            "ItemID" = %s,
+            "PartNumber" = %s,
+            "PriceSource" = %s
+        WHERE "EstimateMaterialID" = %s
+        """,
+        (
+            description,
+            quantity,
+            unit_cost,
+            line_total,
+            catalog_item_id,
+            part_number,
+            price_source,
+            estimate_material_id,
+        ),
+    )
+
+
+def _normalize_material_request_due_date(due_date):
+    if due_date in (None, ""):
+        return None
+    if isinstance(due_date, datetime.datetime):
+        return due_date.date()
+    if isinstance(due_date, datetime.date):
+        return due_date
+    raw_text = str(due_date).strip()
+    if not raw_text:
+        return None
+    return datetime.date.fromisoformat(raw_text)
+
+
+def _build_material_request_notes(
+    *,
+    source_type: str,
+    source_id: int,
+    material_rows: list[dict],
+    rfq_notes: str | None = None,
+    rfq_id: int | None = None,
+    is_update: bool = False,
+) -> str:
+    header_note_lines = []
+    if is_update and rfq_id:
+        header_note_lines.append(f"Updated from Material Request Workspace. RFQID={rfq_id}.")
+    else:
+        header_note_lines.append("Created from Material Request Workspace.")
+    source_label = "Work Order" if _normalize_material_request_source_type(source_type) == "WorkOrder" else "Estimate"
+    header_note_lines.append(f"Source Document: {source_label} #{int(source_id)}")
+    clean_rfq_notes = str(rfq_notes or "").strip()
+    if clean_rfq_notes:
+        header_note_lines.append(f"Request Notes: {clean_rfq_notes}")
+        header_note_lines.append(f"RFQ Notes: {clean_rfq_notes}")
+    for index, row in enumerate(material_rows, start=1):
+        note_text = str(row.get("notes") or "").strip()
+        if note_text:
+            header_note_lines.append(f"Row {index} note: {note_text}")
+    return "\n".join(header_note_lines)
+
+
+def create_manual_rfq_draft(
+    source_type: str,
+    source_id: int,
+    vendor_id: int,
+    material_rows: list[dict],
+    *,
+    due_date=None,
+    rfq_notes: str | None = None,
+) -> int:
+    if not vendor_id:
+        raise ValueError("Vendor selection is required.")
+    if not material_rows:
+        raise ValueError("Add at least one material row before saving the RFQ draft.")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_material_request_source_schema(cur=cur)
+        source_context = resolve_material_request_source_context(
+            source_type,
+            int(source_id),
+            cur=cur,
+            require_eligible=True,
+        )
+        estimate_id = int(source_context["estimate_id"])
+        normalized_due_date = _normalize_material_request_due_date(due_date)
+        notes_payload = _build_material_request_notes(
+            source_type=str(source_context["source_type"]),
+            source_id=int(source_context["source_id"]),
+            material_rows=material_rows,
+            rfq_notes=rfq_notes,
+            is_update=False,
+        )
+
+        cur.execute(
+            """
+            INSERT INTO "PriceRequest" (
+                "EstimateID",
+                "VendorID",
+                "DueDate",
+                "DateSent",
+                "Status",
+                "Notes",
+                "MaterialRequestSourceType",
+                "MaterialRequestSourceID"
+            )
+            VALUES (%s, %s, %s, NULL, 'Draft', %s, %s, %s)
+            RETURNING "PriceRequestID"
+            """,
+            (
+                estimate_id,
+                int(vendor_id),
+                normalized_due_date,
+                notes_payload,
+                str(source_context["source_type"]),
+                int(source_context["source_id"]),
+            ),
+        )
+        rfq_id = int(cur.fetchone()["PriceRequestID"])
+
+        for row in material_rows:
+            estimate_material_id = _insert_manual_estimate_material(cur, estimate_id, row)
+            cur.execute(
+                """
+                INSERT INTO "PriceRequestItem" (
+                    "PriceRequestID",
+                    "MaterialID",
+                    "QuantityOverride",
+                    "QuotedUnitPrice",
+                    "IsSubstitute",
+                    "SubstituteNotes",
+                    "IsCarried"
+                )
+                VALUES (%s, %s, %s, NULL, FALSE, NULL, FALSE)
+                """,
+                (
+                    rfq_id,
+                    estimate_material_id,
+                    float(row.get("qty") or 0),
+                ),
+            )
+
+        conn.commit()
+        return rfq_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_manual_rfq_draft(
+    rfq_id: int,
+    material_rows: list[dict],
+    *,
+    due_date=None,
+    rfq_notes: str | None = None,
+) -> None:
+    if not material_rows:
+        raise ValueError("Add at least one material row before saving the RFQ draft.")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_material_request_source_schema(cur=cur)
+        cur.execute(
+            """
+            SELECT
+                "PriceRequestID",
+                "EstimateID",
+                "Status",
+                "Notes",
+                "MaterialRequestSourceType",
+                "MaterialRequestSourceID"
+            FROM "PriceRequest"
+            WHERE "PriceRequestID" = %s
+            """,
+            (rfq_id,),
+        )
+        rfq_row = cur.fetchone()
+        if not rfq_row:
+            raise ValueError(f"RFQ #{rfq_id} was not found.")
+        if str(rfq_row.get("Status") or "").strip().lower() == "sent":
+            raise ValueError("Sent RFQs cannot be updated through Material Request Workspace.")
+
+        estimate_id = int(rfq_row["EstimateID"])
+        cur.execute(
+            """
+            SELECT "PRItemID", "MaterialID"
+            FROM "PriceRequestItem"
+            WHERE "PriceRequestID" = %s
+            ORDER BY "PRItemID"
+            """,
+            (rfq_id,),
+        )
+        existing_rows = cur.fetchall()
+
+        metadata = _parse_material_request_metadata(rfq_row.get("Notes"))
+        persisted_source_type = rfq_row.get("MaterialRequestSourceType") or metadata.get("source_type") or "Estimate"
+        persisted_source_id = (
+            rfq_row.get("MaterialRequestSourceID")
+            or metadata.get("source_id")
+            or estimate_id
+        )
+        notes_payload = _build_material_request_notes(
+            source_type=str(persisted_source_type),
+            source_id=int(persisted_source_id),
+            material_rows=material_rows,
+            rfq_notes=rfq_notes,
+            rfq_id=int(rfq_id),
+            is_update=True,
+        )
+        normalized_due_date = _normalize_material_request_due_date(due_date)
+
+        reusable_count = min(len(existing_rows), len(material_rows))
+        for index in range(reusable_count):
+            existing = existing_rows[index]
+            row = material_rows[index]
+            estimate_material_id = int(existing["MaterialID"])
+            _update_manual_estimate_material(cur, estimate_material_id, row)
+            cur.execute(
+                """
+                UPDATE "PriceRequestItem"
+                SET "QuantityOverride" = %s
+                WHERE "PRItemID" = %s
+                """,
+                (float(row.get("qty") or 0), int(existing["PRItemID"])),
+            )
+
+        for row in material_rows[reusable_count:]:
+            estimate_material_id = _insert_manual_estimate_material(cur, estimate_id, row)
+            cur.execute(
+                """
+                INSERT INTO "PriceRequestItem" (
+                    "PriceRequestID",
+                    "MaterialID",
+                    "QuantityOverride",
+                    "QuotedUnitPrice",
+                    "IsSubstitute",
+                    "SubstituteNotes",
+                    "IsCarried"
+                )
+                VALUES (%s, %s, %s, NULL, FALSE, NULL, FALSE)
+                """,
+                (
+                    int(rfq_id),
+                    estimate_material_id,
+                    float(row.get("qty") or 0),
+                ),
+            )
+
+        for existing in existing_rows[reusable_count:]:
+            cur.execute(
+                'DELETE FROM "PriceRequestItem" WHERE "PRItemID" = %s',
+                (int(existing["PRItemID"]),),
+            )
+
+        cur.execute(
+            """
+            UPDATE "PriceRequest"
+            SET "DateSent" = NULL,
+                "Status" = 'Draft',
+                "DueDate" = %s,
+                "Notes" = %s,
+                "MaterialRequestSourceType" = %s,
+                "MaterialRequestSourceID" = %s
+            WHERE "PriceRequestID" = %s
+            """,
+            (
+                normalized_due_date,
+                notes_payload,
+                str(_normalize_material_request_source_type(str(persisted_source_type))),
+                int(persisted_source_id),
+                int(rfq_id),
+            ),
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _parse_material_request_metadata(notes_text: str | None) -> dict[str, object]:
+    raw_notes = str(notes_text or "")
+    source_type: str | None = None
+    source_id: int | None = None
+    rfq_notes = ""
+    row_notes: dict[int, str] = {}
+    for line in raw_notes.splitlines():
+        line = line.strip()
+        if "SourceType=" in line and "SourceID=" in line:
+            try:
+                source_type = line.split("SourceType=", 1)[1].split(".", 1)[0].split(" ", 1)[0].strip()
+            except Exception:
+                source_type = None
+            try:
+                source_id_text = line.split("SourceID=", 1)[1].split(".", 1)[0].split(" ", 1)[0].strip()
+                source_id = int(source_id_text)
+            except Exception:
+                source_id = None
+            continue
+        if line.startswith("SourceType="):
+            source_type = line.split("=", 1)[1].strip() or source_type
+            continue
+        if line.startswith("SourceID="):
+            try:
+                source_id = int(line.split("=", 1)[1].strip())
+            except Exception:
+                pass
+            continue
+        if line.startswith("RFQ Notes:"):
+            rfq_notes = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("Request Notes:") and not rfq_notes:
+            rfq_notes = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("Row ") and " note:" in line:
+            try:
+                index_text, note_text = line.split(" note:", 1)
+                row_number = int(index_text.replace("Row", "").strip())
+                row_notes[row_number] = note_text.strip()
+            except Exception:
+                continue
+    return {
+        "source_type": source_type,
+        "source_id": source_id,
+        "rfq_notes": rfq_notes,
+        "row_notes": row_notes,
+    }
+
+
+def _extract_material_request_source_fields(row: dict | None) -> tuple[str | None, int | None]:
+    if not row:
+        return None, None
+    source_type = row.get("MaterialRequestSourceType")
+    source_id = row.get("MaterialRequestSourceID")
+    if source_type and source_id not in (None, ""):
+        try:
+            return str(source_type), int(source_id)
+        except (TypeError, ValueError):
+            pass
+    metadata = _parse_material_request_metadata(row.get("Notes"))
+    source_type = metadata.get("source_type")
+    source_id = metadata.get("source_id")
+    if source_type and source_id not in (None, ""):
+        try:
+            return str(source_type), int(source_id)
+        except (TypeError, ValueError):
+            return None, None
+    estimate_id = row.get("EstimateID")
+    if estimate_id not in (None, ""):
+        try:
+            return "Estimate", int(estimate_id)
+        except (TypeError, ValueError):
+            return None, None
+    return None, None
+
+
+def _apply_material_request_source_context(row: dict | None, *, cur=None) -> dict | None:
+    if not row:
+        return row
+    metadata = _parse_material_request_metadata(row.get("Notes"))
+    source_type, source_id = _extract_material_request_source_fields(row)
+    row["MaterialRequestSourceType"] = source_type
+    row["MaterialRequestSourceID"] = source_id
+    row["MaterialRequestNotes"] = metadata.get("rfq_notes") or ""
+    row["MaterialRequestSourceLabel"] = ""
+    row["MaterialRequestSelectorLabel"] = "Source Document #"
+    row["MaterialRequestWorkOrderID"] = None
+    if source_type and source_id:
+        try:
+            context = resolve_material_request_source_context(source_type, int(source_id), cur=cur, require_eligible=False)
+            row["MaterialRequestSourceType"] = context.get("source_type")
+            row["MaterialRequestSourceID"] = context.get("source_id")
+            row["MaterialRequestSourceLabel"] = context.get("source_document_label") or ""
+            row["MaterialRequestSelectorLabel"] = context.get("selector_label") or "Source Document #"
+            row["MaterialRequestWorkOrderID"] = context.get("work_order_id")
+        except Exception:
+            normalized_source_type = _normalize_material_request_source_type(source_type)
+            row["MaterialRequestSourceType"] = normalized_source_type
+            row["MaterialRequestSourceID"] = int(source_id)
+            row["MaterialRequestSelectorLabel"] = "Work Order #" if normalized_source_type == "WorkOrder" else "Estimate #"
+            row["MaterialRequestSourceLabel"] = (
+                f"Work Order #{int(source_id)}" if normalized_source_type == "WorkOrder" else f"Estimate #{int(source_id)}"
+            )
+            row["MaterialRequestWorkOrderID"] = int(source_id) if normalized_source_type == "WorkOrder" else None
+    return row
+
+
+def get_material_request_source_context_for_rfq(rfq_id: int, *, cur=None):
+    owns_connection = cur is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_material_request_source_schema(cur=cur)
+        cur.execute(
+            """
+            SELECT
+                pr."PriceRequestID",
+                pr."EstimateID",
+                pr."Notes",
+                pr."MaterialRequestSourceType",
+                pr."MaterialRequestSourceID"
+            FROM "PriceRequest" pr
+            WHERE pr."PriceRequestID" = %s
+            """,
+            (rfq_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return _apply_material_request_source_context(dict(row), cur=cur)
+    finally:
+        if owns_connection and conn is not None:
+            conn.close()
+
+
+def get_rfq_for_material_request(rfq_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_material_request_source_schema(cur=cur)
+        cur.execute(
+            """
+            SELECT
+                pr."PriceRequestID",
+                pr."EstimateID",
+                pr."VendorID",
+                pr."DueDate",
+                pr."DateSent",
+                pr."Status",
+                pr."Notes",
+                pr."MaterialRequestSourceType",
+                pr."MaterialRequestSourceID",
+                v."VendorName"
+            FROM "PriceRequest" pr
+            JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
+            WHERE pr."PriceRequestID" = %s
+            """,
+            (rfq_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return _apply_material_request_source_context(row, cur=cur)
+    finally:
+        conn.close()
+
+
+def get_rfq_items_for_material_request(rfq_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            SELECT
+                pri."PRItemID",
+                pri."MaterialID" AS "EstimateMaterialID",
+                COALESCE(pri."QuantityOverride", em."Quantity", 0) AS "Quantity",
+                COALESCE(em."PartNumber", m."PartNumber", '') AS "PartNumber",
+                COALESCE(em."Description", m."Description", '') AS "Description",
+                COALESCE(
+                    NULLIF(pri."QuotedUnitPrice", 0),
+                    NULLIF(em."UnitCost", 0),
+                    NULLIF(m."InternalPrice", 0),
+                    0
+                ) AS "UnitCost",
+                em."ItemID" AS "CatalogItemID"
+            FROM "PriceRequestItem" pri
+            JOIN "EstimateMaterial" em ON pri."MaterialID" = em."EstimateMaterialID"
+            LEFT JOIN "Material" m ON em."ItemID" = m."ItemID"
+            WHERE pri."PriceRequestID" = %s
+            ORDER BY pri."PRItemID" ASC
+            """,
+            (rfq_id,),
+        )
+        rows = cur.fetchall()
+
+        cur.execute('SELECT COALESCE("Notes", \'\') AS "Notes" FROM "PriceRequest" WHERE "PriceRequestID" = %s', (rfq_id,))
+        notes_row = cur.fetchone() or {}
+        metadata = _parse_material_request_metadata(notes_row.get("Notes"))
+        note_lines = metadata.get("row_notes") or {}
+        for index, row in enumerate(rows, start=1):
+            row["Notes"] = note_lines.get(index, "")
+        return rows
+    finally:
+        conn.close()
+
+
+def duplicate_rfq_for_vendor(source_rfq_id: int, target_vendor_id: int) -> int:
+    if not target_vendor_id:
+        raise ValueError("Select a target vendor first.")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_material_request_source_schema(cur=cur)
+        cur.execute(
+            """
+            SELECT
+                "PriceRequestID",
+                "EstimateID",
+                "VendorID",
+                "DueDate",
+                "Notes",
+                "MaterialRequestSourceType",
+                "MaterialRequestSourceID"
+            FROM "PriceRequest"
+            WHERE "PriceRequestID" = %s
+            """,
+            (source_rfq_id,),
+        )
+        source_header = cur.fetchone()
+        if not source_header:
+            raise ValueError(f"RFQ #{source_rfq_id} was not found.")
+
+        metadata = _parse_material_request_metadata(source_header.get("Notes"))
+        source_context = _apply_material_request_source_context(source_header, cur=cur) or source_header
+        persisted_source_type = source_context.get("MaterialRequestSourceType") or "Estimate"
+        persisted_source_id = int(
+            source_context.get("MaterialRequestSourceID")
+            or source_header.get("EstimateID")
+            or 0
+        )
+        cur.execute(
+            """
+            INSERT INTO "PriceRequest" (
+                "EstimateID",
+                "VendorID",
+                "DueDate",
+                "DateSent",
+                "Status",
+                "Notes",
+                "MaterialRequestSourceType",
+                "MaterialRequestSourceID"
+            )
+            VALUES (%s, %s, %s, NULL, 'Draft', %s, %s, %s)
+            RETURNING "PriceRequestID"
+            """,
+            (
+                int(source_header["EstimateID"]),
+                int(target_vendor_id),
+                source_header.get("DueDate"),
+                _build_material_request_notes(
+                    source_type=str(persisted_source_type),
+                    source_id=int(persisted_source_id),
+                    material_rows=[],
+                    rfq_notes=str(metadata.get("rfq_notes") or ""),
+                    is_update=False,
+                ),
+                str(_normalize_material_request_source_type(str(persisted_source_type))),
+                int(persisted_source_id),
+            ),
+        )
+        new_rfq_id = int(cur.fetchone()["PriceRequestID"])
+
+        cur.execute(
+            """
+            SELECT "PRItemID", "MaterialID", "QuantityOverride"
+            FROM "PriceRequestItem"
+            WHERE "PriceRequestID" = %s
+            ORDER BY "PRItemID" ASC
+            """,
+            (source_rfq_id,),
+        )
+        source_items = cur.fetchall()
+        if not source_items:
+            raise ValueError("The selected RFQ has no material rows to duplicate.")
+
+        row_notes = metadata.get("row_notes") or {}
+        material_rows_for_notes = []
+        for index, item in enumerate(source_items, start=1):
+            material_rows_for_notes.append({"notes": row_notes.get(index, "")})
+            cur.execute(
+                """
+                INSERT INTO "PriceRequestItem" (
+                    "PriceRequestID",
+                    "MaterialID",
+                    "QuantityOverride",
+                    "QuotedUnitPrice",
+                    "IsSubstitute",
+                    "SubstituteNotes",
+                    "IsCarried"
+                )
+                VALUES (%s, %s, %s, NULL, FALSE, NULL, FALSE)
+                """,
+                (
+                    new_rfq_id,
+                    int(item["MaterialID"]),
+                    float(item.get("QuantityOverride") or 0),
+                ),
+            )
+
+        cur.execute(
+            'UPDATE "PriceRequest" SET "Notes" = %s WHERE "PriceRequestID" = %s',
+            (
+                _build_material_request_notes(
+                    source_type=str(metadata.get("source_type") or "Estimate"),
+                    source_id=int(metadata.get("source_id") or source_header["EstimateID"]),
+                    material_rows=material_rows_for_notes,
+                    rfq_notes=str(metadata.get("rfq_notes") or ""),
+                    is_update=False,
+                ),
+                new_rfq_id,
+            ),
+        )
+
+        conn.commit()
+        return new_rfq_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def get_vendor_choices():
     """Returns vendor rows for RFQ selection dialogs."""
     conn = get_connection()
@@ -1566,21 +2420,452 @@ def get_rfq_header_data(rfq_id: int):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        ensure_material_request_source_schema(cur=cur)
         cur.execute('''
             SELECT
+                pr."EstimateID",
                 pr."VendorQuoteNumber",
                 pr."VendorQuoteDate",
                 pr."QuoteFilePath",
                 pr."DateSent",
                 pr."DueDate",
                 pr."Status",
+                pr."Notes",
+                pr."MaterialRequestSourceType",
+                pr."MaterialRequestSourceID",
                 v."VendorName",
                 pr."VendorID"
             FROM "PriceRequest" pr
             JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
             WHERE pr."PriceRequestID" = %s
         ''', (rfq_id,))
-        return cur.fetchone()
+        row = cur.fetchone()
+        if not row:
+            return None
+        return _apply_material_request_source_context(row, cur=cur)
+    finally:
+        conn.close()
+
+
+def ensure_rfq_bid_compare_schema(cur=None):
+    owns_connection = cur is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        cur = conn.cursor()
+    try:
+        cur.execute('CREATE SEQUENCE IF NOT EXISTS "RFQCarriedSelection_RFQCarriedSelectionID_seq"')
+        cur.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS public."RFQCarriedSelection" (
+                "RFQCarriedSelectionID" integer NOT NULL DEFAULT nextval('"RFQCarriedSelection_RFQCarriedSelectionID_seq"'::regclass),
+                "ContextPriceRequestID" integer NOT NULL,
+                "EstimateID" integer NOT NULL,
+                "MaterialID" integer NOT NULL,
+                "SourcePriceRequestID" integer NOT NULL,
+                "SourcePRItemID" integer NOT NULL,
+                "VendorID" integer NOT NULL,
+                "CarriedUnitPrice" numeric,
+                "CarriedExtendedPrice" numeric,
+                "CarriedQuantity" numeric,
+                "SelectionType" text,
+                "SelectionNotes" text,
+                "CreatedAt" timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "UpdatedAt" timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT "RFQCarriedSelection_pkey" PRIMARY KEY ("RFQCarriedSelectionID"),
+                CONSTRAINT "RFQCarriedSelection_context_rfq_fkey"
+                    FOREIGN KEY ("ContextPriceRequestID") REFERENCES public."PriceRequest"("PriceRequestID"),
+                CONSTRAINT "RFQCarriedSelection_estimate_fkey"
+                    FOREIGN KEY ("EstimateID") REFERENCES public."Estimate"("EstimateID"),
+                CONSTRAINT "RFQCarriedSelection_material_fkey"
+                    FOREIGN KEY ("MaterialID") REFERENCES public."EstimateMaterial"("EstimateMaterialID"),
+                CONSTRAINT "RFQCarriedSelection_source_rfq_fkey"
+                    FOREIGN KEY ("SourcePriceRequestID") REFERENCES public."PriceRequest"("PriceRequestID"),
+                CONSTRAINT "RFQCarriedSelection_source_item_fkey"
+                    FOREIGN KEY ("SourcePRItemID") REFERENCES public."PriceRequestItem"("PRItemID"),
+                CONSTRAINT "RFQCarriedSelection_vendor_fkey"
+                    FOREIGN KEY ("VendorID") REFERENCES public."Vendor"("VendorID")
+            )
+            '''
+        )
+        cur.execute(
+            '''
+            CREATE UNIQUE INDEX IF NOT EXISTS "idx_rfqcarriedselection_estimate_material"
+            ON public."RFQCarriedSelection" ("EstimateID", "MaterialID")
+            '''
+        )
+        if owns_connection and conn is not None:
+            conn.commit()
+    except Exception:
+        if owns_connection and conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if owns_connection and conn is not None:
+            conn.close()
+
+
+def get_bid_compare_data(rfq_id: int):
+    ensure_rfq_bid_compare_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                pr."PriceRequestID",
+                pr."EstimateID",
+                pr."VendorID",
+                pr."Status",
+                pr."DueDate",
+                pr."DateSent",
+                pr."VendorQuoteNumber",
+                pr."VendorQuoteDate",
+                v."VendorName",
+                s."SiteName"
+            FROM "PriceRequest" pr
+            LEFT JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
+            LEFT JOIN "Estimate" e ON pr."EstimateID" = e."EstimateID"
+            LEFT JOIN "Site" s ON e."SiteID" = s."SiteID"
+            WHERE pr."PriceRequestID" = %s
+            ''',
+            (rfq_id,),
+        )
+        header = cur.fetchone()
+        if not header:
+            raise ValueError(f"RFQ #{rfq_id} was not found.")
+
+        estimate_id = header.get("EstimateID")
+        wo_resolution = get_wo_resolution_for_rfq(rfq_id)
+        work_order_id = (
+            wo_resolution.get("open_work_order_id")
+            or wo_resolution.get("latest_work_order_id")
+        )
+
+        cur.execute(
+            '''
+            SELECT
+                pr."PriceRequestID",
+                pr."VendorID",
+                pr."Status",
+                pr."DateSent",
+                pr."VendorQuoteNumber",
+                pr."VendorQuoteDate",
+                v."VendorName"
+            FROM "PriceRequest" pr
+            LEFT JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
+            WHERE pr."EstimateID" = %s
+            ORDER BY
+                CASE WHEN pr."PriceRequestID" = %s THEN 0 ELSE 1 END,
+                v."VendorName" ASC,
+                pr."PriceRequestID" ASC
+            ''',
+            (estimate_id, rfq_id),
+        )
+        vendor_rows = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(
+            '''
+            SELECT
+                pri."PRItemID",
+                pri."MaterialID",
+                COALESCE(NULLIF(TRIM(em."PartNumber"), ''), NULLIF(TRIM(m."PartNumber"), ''), '') AS "PartNumber",
+                COALESCE(NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') AS "Description",
+                COALESCE(pri."QuantityOverride", em."Quantity", 0) AS "RequestedQuantity",
+                COALESCE(NULLIF(TRIM(m."Unit"), ''), '') AS "Unit",
+                COALESCE(pri."QuotedUnitPrice", 0) AS "ContextQuotedUnitPrice",
+                COALESCE(pri."IsCarried", FALSE) AS "ContextIsCarried"
+            FROM "PriceRequestItem" pri
+            JOIN "EstimateMaterial" em ON pri."MaterialID" = em."EstimateMaterialID"
+            LEFT JOIN "Material" m ON em."ItemID" = m."ItemID"
+            WHERE pri."PriceRequestID" = %s
+            ORDER BY em."Description" ASC, pri."PRItemID" ASC
+            ''',
+            (rfq_id,),
+        )
+        base_lines = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(
+            '''
+            SELECT
+                pri."PRItemID",
+                pri."PriceRequestID",
+                pr."VendorID",
+                pri."MaterialID",
+                COALESCE(pri."QuantityOverride", em."Quantity", 0) AS "RequestedQuantity",
+                pri."QuotedUnitPrice",
+                COALESCE(pri."IsSubstitute", FALSE) AS "IsSubstitute",
+                COALESCE(pri."SubstituteNotes", '') AS "SubstituteNotes",
+                COALESCE(pri."IsCarried", FALSE) AS "IsCarried",
+                pr."VendorQuoteNumber",
+                pr."VendorQuoteDate"
+            FROM "PriceRequestItem" pri
+            JOIN "PriceRequest" pr ON pri."PriceRequestID" = pr."PriceRequestID"
+            JOIN "EstimateMaterial" em ON pri."MaterialID" = em."EstimateMaterialID"
+            WHERE pr."EstimateID" = %s
+            ORDER BY pri."PriceRequestID" ASC, pri."PRItemID" ASC
+            ''',
+            (estimate_id,),
+        )
+        quote_rows = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(
+            '''
+            SELECT
+                "MaterialID",
+                "SourcePriceRequestID",
+                "SourcePRItemID",
+                "VendorID",
+                "CarriedUnitPrice",
+                "CarriedExtendedPrice",
+                "CarriedQuantity",
+                COALESCE("SelectionType", '') AS "SelectionType",
+                COALESCE("SelectionNotes", '') AS "SelectionNotes"
+            FROM "RFQCarriedSelection"
+            WHERE "EstimateID" = %s
+            ''',
+            (estimate_id,),
+        )
+        selection_rows = {
+            int(row["MaterialID"]): dict(row)
+            for row in cur.fetchall()
+        }
+
+        vendor_quote_map = {}
+        for row in quote_rows:
+            material_id = int(row["MaterialID"])
+            pr_id = int(row["PriceRequestID"])
+            quoted_unit = row.get("QuotedUnitPrice")
+            qty = float(row.get("RequestedQuantity") or 0)
+            vendor_quote_map.setdefault(material_id, {})[pr_id] = {
+                "source_pr_item_id": int(row["PRItemID"]),
+                "source_price_request_id": pr_id,
+                "vendor_id": int(row["VendorID"]) if row.get("VendorID") is not None else None,
+                "quoted_unit_price": float(quoted_unit) if quoted_unit is not None else None,
+                "quoted_extended_price": float(quoted_unit) * qty if quoted_unit is not None else None,
+                "requested_quantity": qty,
+                "is_substitute": bool(row.get("IsSubstitute")),
+                "substitute_notes": str(row.get("SubstituteNotes") or "").strip(),
+                "is_carried": bool(row.get("IsCarried")),
+                "vendor_quote_number": str(row.get("VendorQuoteNumber") or "").strip(),
+                "vendor_quote_date": row.get("VendorQuoteDate"),
+            }
+
+        lines = []
+        for base in base_lines:
+            material_id = int(base["MaterialID"])
+            vendor_quotes = vendor_quote_map.get(material_id, {})
+            saved_selection = selection_rows.get(material_id)
+            if not saved_selection:
+                saved_selection = next(
+                    (
+                        {
+                            "SourcePriceRequestID": quote["source_price_request_id"],
+                            "SourcePRItemID": quote["source_pr_item_id"],
+                            "VendorID": quote.get("vendor_id"),
+                            "CarriedUnitPrice": quote.get("quoted_unit_price"),
+                            "CarriedExtendedPrice": quote.get("quoted_extended_price"),
+                            "CarriedQuantity": quote.get("requested_quantity"),
+                            "SelectionType": "LegacyCarry",
+                            "SelectionNotes": "",
+                        }
+                        for quote in vendor_quotes.values()
+                        if quote.get("is_carried")
+                    ),
+                    None,
+                )
+
+            notes_summary_parts = []
+            for vendor_row in vendor_rows:
+                quote = vendor_quotes.get(int(vendor_row["PriceRequestID"]))
+                if not quote:
+                    continue
+                vendor_label = str(vendor_row.get("VendorName") or f"RFQ #{vendor_row['PriceRequestID']}")
+                note_bits = []
+                if quote.get("is_substitute"):
+                    note_bits.append("Substitution")
+                if quote.get("substitute_notes"):
+                    note_bits.append(quote["substitute_notes"])
+                if note_bits:
+                    notes_summary_parts.append(f"{vendor_label}: {' | '.join(note_bits)}")
+
+            lines.append(
+                {
+                    "material_id": material_id,
+                    "base_pr_item_id": int(base["PRItemID"]),
+                    "part_number": str(base.get("PartNumber") or "").strip(),
+                    "description": str(base.get("Description") or "").strip(),
+                    "requested_quantity": float(base.get("RequestedQuantity") or 0),
+                    "unit": str(base.get("Unit") or "").strip(),
+                    "vendor_quotes": vendor_quotes,
+                    "saved_selection": saved_selection,
+                    "notes_summary": "\n".join(notes_summary_parts),
+                }
+            )
+
+        return {
+            "header": {
+                "rfq_id": int(header["PriceRequestID"]),
+                "estimate_id": int(header["EstimateID"]) if header.get("EstimateID") is not None else None,
+                "work_order_id": work_order_id,
+                "status": str(header.get("Status") or ""),
+                "vendor_name": str(header.get("VendorName") or ""),
+                "vendor_id": int(header["VendorID"]) if header.get("VendorID") is not None else None,
+                "site_name": str(header.get("SiteName") or ""),
+                "quote_number": str(header.get("VendorQuoteNumber") or "").strip(),
+                "quote_date": header.get("VendorQuoteDate"),
+            },
+            "vendors": vendor_rows,
+            "lines": lines,
+        }
+    finally:
+        conn.close()
+
+
+def save_bid_compare_carried_selections(context_rfq_id: int, selections: list[dict]):
+    from neon_ai.database.estimates import sync_estimate_pricing_from_sources
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        ensure_rfq_bid_compare_schema(cur=cur)
+        cur.execute(
+            '''
+            SELECT "EstimateID"
+            FROM "PriceRequest"
+            WHERE "PriceRequestID" = %s
+            ''',
+            (context_rfq_id,),
+        )
+        rfq_row = cur.fetchone()
+        if not rfq_row or rfq_row.get("EstimateID") is None:
+            raise ValueError(f"RFQ #{context_rfq_id} is missing estimate context.")
+
+        estimate_id = int(rfq_row["EstimateID"])
+        cur.execute(
+            '''
+            SELECT "MaterialID"
+            FROM "PriceRequestItem"
+            WHERE "PriceRequestID" = %s
+            ''',
+            (context_rfq_id,),
+        )
+        scoped_material_ids = [int(row["MaterialID"]) for row in cur.fetchall()]
+        if not scoped_material_ids:
+            return {"saved": True, "selection_count": 0, "estimate_pricing_updated": False, "estimate_status": "Unknown"}
+
+        for material_id in scoped_material_ids:
+            cur.execute(
+                '''
+                UPDATE "PriceRequestItem"
+                SET "IsCarried" = FALSE
+                WHERE "MaterialID" = %s
+                  AND "PriceRequestID" IN (
+                      SELECT "PriceRequestID" FROM "PriceRequest" WHERE "EstimateID" = %s
+                  )
+                ''',
+                (material_id, estimate_id),
+            )
+            cur.execute(
+                '''
+                DELETE FROM "RFQCarriedSelection"
+                WHERE "EstimateID" = %s AND "MaterialID" = %s
+                ''',
+                (estimate_id, material_id),
+            )
+
+        normalized = []
+        for selection in selections or []:
+            if not selection:
+                continue
+            material_id = int(selection["material_id"])
+            source_pr_item_id = int(selection["source_pr_item_id"])
+            source_price_request_id = int(selection["source_price_request_id"])
+            vendor_id = int(selection["vendor_id"])
+            quantity = float(selection.get("carried_quantity") or 0)
+            unit_price = float(selection.get("carried_unit_price") or 0)
+            extended_price = float(selection.get("carried_extended_price") or (quantity * unit_price))
+            normalized.append(
+                {
+                    "material_id": material_id,
+                    "source_pr_item_id": source_pr_item_id,
+                    "source_price_request_id": source_price_request_id,
+                    "vendor_id": vendor_id,
+                    "carried_quantity": quantity,
+                    "carried_unit_price": unit_price,
+                    "carried_extended_price": extended_price,
+                }
+            )
+
+        unique_vendor_ids = {row["vendor_id"] for row in normalized}
+        selection_type = "FullPackage" if len(unique_vendor_ids) == 1 and normalized else "LineItem"
+
+        for row in normalized:
+            cur.execute(
+                '''
+                INSERT INTO "RFQCarriedSelection" (
+                    "ContextPriceRequestID",
+                    "EstimateID",
+                    "MaterialID",
+                    "SourcePriceRequestID",
+                    "SourcePRItemID",
+                    "VendorID",
+                    "CarriedUnitPrice",
+                    "CarriedExtendedPrice",
+                    "CarriedQuantity",
+                    "SelectionType",
+                    "SelectionNotes",
+                    "UpdatedAt"
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT ("EstimateID", "MaterialID")
+                DO UPDATE SET
+                    "ContextPriceRequestID" = EXCLUDED."ContextPriceRequestID",
+                    "SourcePriceRequestID" = EXCLUDED."SourcePriceRequestID",
+                    "SourcePRItemID" = EXCLUDED."SourcePRItemID",
+                    "VendorID" = EXCLUDED."VendorID",
+                    "CarriedUnitPrice" = EXCLUDED."CarriedUnitPrice",
+                    "CarriedExtendedPrice" = EXCLUDED."CarriedExtendedPrice",
+                    "CarriedQuantity" = EXCLUDED."CarriedQuantity",
+                    "SelectionType" = EXCLUDED."SelectionType",
+                    "SelectionNotes" = EXCLUDED."SelectionNotes",
+                    "UpdatedAt" = CURRENT_TIMESTAMP
+                ''',
+                (
+                    context_rfq_id,
+                    estimate_id,
+                    row["material_id"],
+                    row["source_price_request_id"],
+                    row["source_pr_item_id"],
+                    row["vendor_id"],
+                    row["carried_unit_price"],
+                    row["carried_extended_price"],
+                    row["carried_quantity"],
+                    selection_type,
+                    "",
+                ),
+            )
+            cur.execute(
+                '''
+                UPDATE "PriceRequestItem"
+                SET "IsCarried" = TRUE
+                WHERE "PRItemID" = %s
+                ''',
+                (row["source_pr_item_id"],),
+            )
+
+        sync_result = sync_estimate_pricing_from_sources(estimate_id, cur=cur)
+        conn.commit()
+        return {
+            "saved": True,
+            "selection_count": len(normalized),
+            "selection_type": selection_type,
+            "estimate_pricing_updated": bool(sync_result.get("estimate_pricing_updated")),
+            "estimate_status": str(sync_result.get("estimate_status") or "Unknown"),
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
