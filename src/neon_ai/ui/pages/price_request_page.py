@@ -15,15 +15,30 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neon_ai.database.material_calls import LEGACY_LOOSE_RFQ_DEBUG_ENV, legacy_loose_rfq_debug_enabled
 from neon_ai.database.estimates import add_single_material, get_all_estimates, get_estimate_materials
 from neon_ai.database.rfq import get_active_rfqs, get_all_vendors, get_quoted_vendors_for_estimate, save_rfq_package
 
 
 class PriceRequestPage(QWidget):
+    """Hidden legacy workflow surface for loose RFQ/PriceRequest compatibility.
+
+    Do not expose in main navigation until ownership is explicitly reaffirmed.
+    Current primary procurement workflow is RFQ Center / PO Center with
+    MaterialCall -> Create RFQ -> child PriceRequest.
+    """
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._legacy_debug_enabled = legacy_loose_rfq_debug_enabled()
         self.current_estimate_id: int | None = None
         self.estimates: list[dict] = []
+
+        if not self._legacy_debug_enabled:
+            self._legacy_refs = ()
+            self._build_blocked_ui()
+            return
+
         self._legacy_refs = (
             save_rfq_package,
             get_all_vendors,
@@ -107,7 +122,27 @@ class PriceRequestPage(QWidget):
         footer_layout.addWidget(self.save_new_button)
         layout.addWidget(footer)
 
+    def _build_blocked_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+
+        header = QLabel("Legacy PriceRequestPage Disabled")
+        header.setStyleSheet("font-size: 16px; font-weight: 700; color: #8a5a00;")
+        layout.addWidget(header, 0, Qt.AlignmentFlag.AlignLeft)
+
+        body = QLabel(
+            "Legacy loose-RFQ compatibility is disabled in normal runtime.\n\n"
+            "This hidden page is debug-only and is not part of the current MaterialCall -> Create RFQ workflow.\n"
+            f"Enable {LEGACY_LOOSE_RFQ_DEBUG_ENV}=1 only when intentionally reviewing old loose-RFQ behavior."
+        )
+        body.setWordWrap(True)
+        layout.addWidget(body)
+        layout.addStretch(1)
+
     def load_estimates(self) -> None:
+        if not self._legacy_debug_enabled:
+            return
         try:
             self.estimates = get_all_estimates()
             self.estimate_combo.blockSignals(True)
@@ -120,6 +155,8 @@ class PriceRequestPage(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load estimates: {exc}")
 
     def refresh_data(self) -> None:
+        if not self._legacy_debug_enabled:
+            return
         self.current_estimate_id = None
         self.load_estimates()
         self.existing_table.setRowCount(0)
@@ -129,6 +166,8 @@ class PriceRequestPage(QWidget):
         self.save_new_button.setEnabled(False)
 
     def on_estimate_select(self, selection: str) -> None:
+        if not self._legacy_debug_enabled:
+            return
         if not selection:
             return
         self.current_estimate_id = int(selection.split(" - ")[0])
@@ -136,6 +175,8 @@ class PriceRequestPage(QWidget):
         self.save_new_button.setEnabled(True)
 
     def refresh_existing_grid(self) -> None:
+        if not self._legacy_debug_enabled:
+            return
         self.existing_table.setRowCount(0)
         if not self.current_estimate_id:
             return
@@ -155,6 +196,13 @@ class PriceRequestPage(QWidget):
             self.existing_table.setItem(table_row, 1, QTableWidgetItem(str(desc)))
 
     def stage_material(self) -> None:
+        if not self._legacy_debug_enabled:
+            QMessageBox.information(
+                self,
+                "Legacy Page Disabled",
+                "Legacy loose-RFQ compatibility is disabled in normal runtime.",
+            )
+            return
         if not self.current_estimate_id:
             QMessageBox.warning(self, "Warning", "Please select an estimate first.")
             return
@@ -179,6 +227,13 @@ class PriceRequestPage(QWidget):
         self.qty_field.setFocus()
 
     def save_staged_materials(self) -> None:
+        if not self._legacy_debug_enabled:
+            QMessageBox.information(
+                self,
+                "Legacy Page Disabled",
+                "Legacy loose-RFQ compatibility is disabled in normal runtime.",
+            )
+            return
         if self.staging_table.rowCount() == 0:
             QMessageBox.information(self, "Empty", "No new materials staged to save.")
             return

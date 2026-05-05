@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neon_ai.database.material_calls import LEGACY_LOOSE_RFQ_DEBUG_ENV, legacy_loose_rfq_debug_enabled
 from neon_ai.ui.dialogs.tiber_dialog import launch_tiber
 from neon_ai.ui.pages.customer_page import CustomerPage
 from neon_ai.ui.pages.dashboard_page import DashboardPage
@@ -90,9 +92,9 @@ class NeonMainWindow(QMainWindow):
                 MenuAction("Review Workorders", "WorkOrderViewerFrame"),
             ],
             "ðŸ“¦ MATERIALS": [
-                MenuAction("Materials Catalog", "MaterialFrame"),
                 MenuAction("RFQ Center", "RFQCenterFrame"),
                 MenuAction("PO Center", "POCenterFrame"),
+                MenuAction("Materials Catalogue", "MaterialFrame"),
             ],
             "ðŸ› ï¸ EMPLOYEES": [
                 MenuAction("Manage People", "EmployeeManagerFrame"),
@@ -232,10 +234,12 @@ class NeonMainWindow(QMainWindow):
             "VendorFrame": VendorPage,
             "VendorInvoiceFrame": VendorInvoicePage,
             "TimeEntryFrame": TimeEntryPage,
-            "PriceRequestForm": PriceRequestPage,
             "WorkOrderFrame": WorkOrderFormPage,
             "PurchaseOrderFrame": PurchaseOrderFormPage,
         }
+        # Hidden legacy loose-RFQ surface: only register in explicit debug mode.
+        if legacy_loose_rfq_debug_enabled():
+            self.page_factories["PriceRequestForm"] = PriceRequestPage
 
     def _get_or_create_page(self, page_key: str) -> QWidget:
         page = self.pages.get(page_key)
@@ -289,6 +293,13 @@ class NeonMainWindow(QMainWindow):
         if page_key == "POCenterFrame":
             self.open_po_center()
             return
+        if page_key == "PriceRequestForm" and not legacy_loose_rfq_debug_enabled():
+            QMessageBox.information(
+                self,
+                "Legacy Page Disabled",
+                f"PriceRequestPage is legacy/debug-only. Enable {LEGACY_LOOSE_RFQ_DEBUG_ENV}=1 to access it.",
+            )
+            return
 
         self._set_active_action(page_key)
         started_at = time.perf_counter()
@@ -335,6 +346,8 @@ class NeonMainWindow(QMainWindow):
         try:
             page_key = "RFQViewerFrame"
             page = self._get_or_create_page(page_key)
+            if hasattr(page, "set_procurement_center"):
+                page.set_procurement_center(center)
             refresh = getattr(page, "refresh_data", None)
             if callable(refresh):
                 now = time.perf_counter()
@@ -344,8 +357,6 @@ class NeonMainWindow(QMainWindow):
                     self.page_last_refresh_at[page_key] = time.perf_counter()
                 else:
                     _perf_log_skipped(page_key)
-            if hasattr(page, "set_procurement_center"):
-                page.set_procurement_center(center)
             self.stack.setCurrentWidget(page)
         finally:
             _perf_log("ui", f"show_page:{action_key}", started_at)

@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import datetime
-import json
 import os
-from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -38,12 +33,7 @@ from neon_ai.database.estimates import (
     recalculate_estimate_totals,
     update_estimate_status,
 )
-from neon_ai.database.rfq import (
-    create_and_send_rfq_batch,
-    create_rfq_batch_without_sending,
-    get_estimate_rfq_status,
-    get_vendor_choices,
-)
+from neon_ai.database.rfq import get_estimate_rfq_status
 from neon_ai.services.estimate_document_draft_service import (
     get_draft_for_display,
     get_or_create_active_draft,
@@ -56,7 +46,6 @@ from neon_ai.services.estimate_document_send_service import (
     prepare_estimate_delivery_message,
     send_estimate_document_draft,
 )
-from neon_ai.services.rfq_send_service import prepare_rfq_batch_preview
 from neon_ai.services.document_generation_service import (
     export_estimate_document_draft,
     generate_estimate_document_record,
@@ -65,283 +54,8 @@ from neon_ai.services.document_generation_service import (
 )
 from neon_ai.ui.widgets.rich_text_toolbar import RichTextToolbar
 
-RFQ_EMAIL_MEMORY_PATH = Path(__file__).resolve().parents[4] / "resources" / "rfq_vendor_email_memory.json"
 ESTIMATE_DOCUMENT_TYPE_CODE = "ESTIMATE_DOCUMENT"
 ESTIMATE_DRAFT_WORKSPACE_CONTEXT = "ESTIMATE_DRAFT_WORKSPACE"
-
-
-def load_rfq_email_memory() -> dict:
-    if not RFQ_EMAIL_MEMORY_PATH.exists():
-        return {}
-    try:
-        data = json.loads(RFQ_EMAIL_MEMORY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_rfq_email_memory(memory: dict) -> None:
-    try:
-        RFQ_EMAIL_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        RFQ_EMAIL_MEMORY_PATH.write_text(json.dumps(memory, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-class CreateRFQDialog(QDialog):
-    def __init__(self, parent, estimate_id: int, vendors: list[dict]) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Create RFQ")
-        self.setModal(True)
-        self.result: dict | None = None
-        self.estimate_id = int(estimate_id)
-        self.vendors = vendors or []
-        self.vendor_widgets: dict[int, tuple[QCheckBox, QLineEdit, str]] = {}
-        self.email_memory = load_rfq_email_memory()
-        self.prepared_batch_rows: list[dict] = []
-        self.prepared_batch_signature: tuple | None = None
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel("Select wholesalers and enter the recipient email for each RFQ.")
-        )
-
-        due_row = QFrame()
-        due_layout = QHBoxLayout(due_row)
-        due_layout.setContentsMargins(0, 0, 0, 0)
-        due_layout.addWidget(QLabel("Due Date:"))
-        self.due_date_field = QLineEdit((datetime.date.today() + datetime.timedelta(days=7)).isoformat())
-        self.due_date_field.setMaximumWidth(120)
-        due_layout.addWidget(self.due_date_field)
-        due_layout.addStretch(1)
-        layout.addWidget(due_row)
-
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        for vendor in self.vendors:
-            row = QFrame()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            enabled = QCheckBox(vendor["VendorName"])
-            row_layout.addWidget(enabled)
-
-            contact_bits = []
-            if vendor.get("VendorContactName"):
-                contact_bits.append(vendor["VendorContactName"])
-            if vendor.get("VendorContactNumber"):
-                contact_bits.append(vendor["VendorContactNumber"])
-            if contact_bits:
-                row_layout.addWidget(QLabel(f"({', '.join(contact_bits)})"))
-
-            remembered_email = self.email_memory.get(str(vendor["VendorID"])) or self.email_memory.get(vendor["VendorName"], "")
-            email_field = QLineEdit(remembered_email)
-            row_layout.addWidget(email_field, 1)
-            body_layout.addWidget(row)
-            self.vendor_widgets[vendor["VendorID"]] = (enabled, email_field, vendor["VendorName"])
-        layout.addWidget(body)
-
-        footer = QFrame()
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(0, 0, 0, 0)
-        footer_layout.addStretch(1)
-        cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.reject)
-        footer_layout.addWidget(cancel_button)
-        preview_button = QPushButton("Preview RFQ Batch")
-        preview_button.clicked.connect(self.on_preview_batch)
-        footer_layout.addWidget(preview_button)
-        self.submit_button = QPushButton("Create & Send RFQs")
-        self.submit_button.clicked.connect(self.on_submit)
-        footer_layout.addWidget(self.submit_button)
-        layout.addWidget(footer)
-
-    def _selection_signature(self, selected: list[dict], due_date: str) -> tuple:
-        normalized = tuple(
-            sorted(
-                (
-                    int(vendor["vendor_id"]),
-                    str(vendor["vendor_name"] or "").strip(),
-                    str(vendor["recipient_email"] or "").strip().lower(),
-                )
-                for vendor in selected
-            )
-        )
-        return (str(due_date or "").strip(), normalized)
-
-    def _collect_selected_vendors(self) -> list[dict]:
-        selected: list[dict] = []
-        for vendor_id, (enabled, email_field, vendor_name) in self.vendor_widgets.items():
-            if enabled.isChecked():
-                email_value = email_field.text().strip()
-                if not email_value:
-                    QMessageBox.warning(self, "Missing Email", f"Please enter a recipient email for {vendor_name}.")
-                    return
-                selected.append(
-                    {
-                        "vendor_id": vendor_id,
-                        "vendor_name": vendor_name,
-                        "recipient_email": email_value,
-                    }
-                )
-
-        if not selected:
-            raise ValueError("Select at least one wholesaler to create RFQs.")
-
-        return selected
-
-    def _remember_selected_vendor_emails(self, selected: list[dict]) -> None:
-        updated_memory = dict(self.email_memory)
-        for vendor in selected:
-            updated_memory[str(vendor["vendor_id"])] = vendor["recipient_email"]
-            updated_memory[vendor["vendor_name"]] = vendor["recipient_email"]
-        save_rfq_email_memory(updated_memory)
-
-    def _show_batch_preview_dialog(self, preview: dict) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Preview RFQ Batch")
-        dialog.resize(980, 620)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        summary = QLabel(
-            "Preview only. No email is sent in this workflow.\n"
-            f"Prepared RFQ drafts: {len(preview.get('Rows') or [])} | "
-            f"Ready: {preview.get('ReadyCount') or 0} | "
-            f"Errors: {preview.get('ErrorCount') or 0}"
-        )
-        summary.setWordWrap(True)
-        summary.setStyleSheet("color: #8a5a00; font-weight: 600;")
-        layout.addWidget(summary)
-
-        table = QTableWidget(0, 6)
-        table.setHorizontalHeaderLabels(["RFQ", "Vendor", "Email", "Status", "Attachment", "Subject"])
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.verticalHeader().setVisible(False)
-        table.setColumnWidth(0, 70)
-        table.setColumnWidth(1, 180)
-        table.setColumnWidth(2, 220)
-        table.setColumnWidth(3, 110)
-        table.setColumnWidth(4, 260)
-        table.setColumnWidth(5, 240)
-
-        rows = preview.get("Rows") or []
-        for row_data in rows:
-            row = table.rowCount()
-            table.insertRow(row)
-            values = [
-                str(row_data.get("PriceRequestID") or row_data.get("RFQID") or ""),
-                str(row_data.get("VendorName") or ""),
-                str(row_data.get("ResolvedRecipientEmail") or row_data.get("VendorEmail") or ""),
-                "Ready" if row_data.get("PreviewReady") else "Blocked",
-                str(row_data.get("AttachmentPath") or ""),
-                str(row_data.get("Subject") or ""),
-            ]
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(value))
-        layout.addWidget(table, 1)
-
-        body_label = QLabel("Body Preview / Validation Detail")
-        layout.addWidget(body_label)
-        body_box = QPlainTextEdit()
-        body_box.setReadOnly(True)
-        layout.addWidget(body_box, 1)
-
-        def refresh_detail() -> None:
-            selected_row = table.currentRow()
-            if selected_row < 0 or selected_row >= len(rows):
-                body_box.setPlainText("")
-                return
-            row_data = rows[selected_row]
-            body_box.setPlainText(
-                f"Vendor: {row_data.get('VendorName') or ''}\n"
-                f"RFQ ID: {row_data.get('PriceRequestID') or row_data.get('RFQID') or ''}\n"
-                f"Status: {'Ready' if row_data.get('PreviewReady') else 'Blocked'}\n"
-                f"Reason: {row_data.get('PreviewReason') or ''}\n"
-                f"Attachment: {row_data.get('AttachmentPath') or ''}\n\n"
-                f"{row_data.get('Body') or ''}"
-            )
-
-        table.itemSelectionChanged.connect(refresh_detail)
-        if rows:
-            table.selectRow(0)
-            refresh_detail()
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        buttons.accepted.connect(dialog.accept)
-        layout.addWidget(buttons)
-
-        dialog.exec()
-
-    def on_preview_batch(self) -> None:
-        try:
-            selected = self._collect_selected_vendors()
-        except ValueError as exc:
-            QMessageBox.warning(self, "No Vendors Selected", str(exc))
-            return
-
-        due_date = self.due_date_field.text().strip()
-        signature = self._selection_signature(selected, due_date)
-        if self.prepared_batch_signature and signature != self.prepared_batch_signature:
-            QMessageBox.warning(
-                self,
-                "Batch Already Prepared",
-                "This dialog has already prepared an RFQ batch preview.\n"
-                "Close it and reopen the batch dialog before previewing a different vendor selection."
-                "\n\nThis prevents duplicate RFQ drafts from being created accidentally.",
-            )
-            return
-
-        try:
-            if not self.prepared_batch_rows:
-                self.prepared_batch_rows = create_rfq_batch_without_sending(
-                    self.estimate_id,
-                    selected,
-                    due_date or None,
-                )
-                self.prepared_batch_signature = signature
-                self._remember_selected_vendor_emails(selected)
-
-            preview = prepare_rfq_batch_preview([row["rfq_id"] for row in self.prepared_batch_rows])
-            if not preview.get("success"):
-                QMessageBox.warning(
-                    self,
-                    "Preview Unavailable",
-                    str(preview.get("reason") or "RFQ batch preview could not be prepared."),
-                )
-                return
-            self._show_batch_preview_dialog(preview)
-        except Exception as exc:
-            QMessageBox.critical(self, "Batch Preview Error", str(exc))
-
-    def on_submit(self) -> None:
-        if self.prepared_batch_rows:
-            QMessageBox.information(
-                self,
-                "Legacy Batch Send Blocked After Preview",
-                "This RFQ batch has already been prepared for preview.\n"
-                "No email was sent, and the draft RFQs were created successfully."
-                "\n\nClose this dialog and continue from the RFQ workspace to review the created RFQs."
-                "\nLegacy create-and-send is blocked after preview to avoid duplicate RFQ drafts or duplicate vendor sends.",
-            )
-            return
-
-        try:
-            selected = self._collect_selected_vendors()
-        except ValueError as exc:
-            QMessageBox.warning(self, "No Vendors Selected", str(exc))
-            return
-
-        self.result = {
-            "due_date": self.due_date_field.text().strip(),
-            "vendors": selected,
-        }
-        self._remember_selected_vendor_emails(selected)
-        self.accept()
 
 
 class EstimateDocViewPage(QWidget):
@@ -530,41 +244,46 @@ class EstimateDocViewPage(QWidget):
         primary_button_layout.addStretch(1)
         layout.addWidget(primary_button_row)
 
-        legacy_group = QGroupBox("Legacy / Staged Actions")
-        legacy_layout = QGridLayout(legacy_group)
-        legacy_layout.setHorizontalSpacing(8)
-        legacy_layout.setVerticalSpacing(8)
+        submission_group = QGroupBox("Submission Actions")
+        submission_layout = QGridLayout(submission_group)
+        submission_layout.setHorizontalSpacing(8)
+        submission_layout.setVerticalSpacing(8)
 
         self.btn_lock = QPushButton("Lock For Submission")
         self.btn_lock.clicked.connect(self.lock_for_submission)
         self.btn_lock.setEnabled(False)
-        legacy_layout.addWidget(self.btn_lock, 0, 0)
+        submission_layout.addWidget(self.btn_lock, 0, 0)
 
         self.btn_create_copy = QPushButton("Create Customer Copy")
         self.btn_create_copy.clicked.connect(self.create_customer_copy)
         self.btn_create_copy.setEnabled(False)
-        legacy_layout.addWidget(self.btn_create_copy, 0, 1)
+        submission_layout.addWidget(self.btn_create_copy, 0, 1)
 
         self.btn_view_copy = QPushButton("View Customer Copy")
         self.btn_view_copy.clicked.connect(self.view_customer_copy)
         self.btn_view_copy.setEnabled(False)
-        legacy_layout.addWidget(self.btn_view_copy, 0, 2)
+        submission_layout.addWidget(self.btn_view_copy, 0, 2)
 
-        self.btn_create_rfq = QPushButton("Create RFQ")
-        self.btn_create_rfq.clicked.connect(self.create_rfq)
-        self.btn_create_rfq.setEnabled(False)
-        legacy_layout.addWidget(self.btn_create_rfq, 0, 3)
+        self.btn_open_rfq_center = QPushButton("Open RFQ Center")
+        self.btn_open_rfq_center.clicked.connect(self.open_rfq_center_handoff)
+        self.btn_open_rfq_center.setEnabled(False)
+        submission_layout.addWidget(self.btn_open_rfq_center, 0, 3)
+        layout.addWidget(submission_group)
 
+        advanced_group = QGroupBox("Template / Advanced Actions")
+        advanced_layout = QGridLayout(advanced_group)
+        advanced_layout.setHorizontalSpacing(8)
+        advanced_layout.setVerticalSpacing(8)
         self.btn_preview_template = QPushButton("Preview Template Document")
         self.btn_preview_template.clicked.connect(self.preview_template_document)
         self.btn_preview_template.setEnabled(False)
-        legacy_layout.addWidget(self.btn_preview_template, 1, 0, 1, 2)
+        advanced_layout.addWidget(self.btn_preview_template, 0, 0, 1, 2)
 
         self.btn_generate_template = QPushButton("Generate Template Document Record")
         self.btn_generate_template.clicked.connect(self.generate_template_document_record)
         self.btn_generate_template.setEnabled(False)
-        legacy_layout.addWidget(self.btn_generate_template, 1, 2, 1, 2)
-        layout.addWidget(legacy_group)
+        advanced_layout.addWidget(self.btn_generate_template, 0, 2, 1, 2)
+        layout.addWidget(advanced_group)
         return panel
 
     def refresh_data(self) -> None:
@@ -685,6 +404,13 @@ class EstimateDocViewPage(QWidget):
         if not self.current_data or not self.current_loaded_id:
             QMessageBox.warning(self, "Warning", "Please select an estimate first.")
             return
+        if not self._estimate_is_submission_locked():
+            QMessageBox.information(
+                self,
+                "Lock Required",
+                "Lock the estimate for submission before creating the customer copy.",
+            )
+            return
         try:
             self.current_customer_copy_path = build_client_estimate_doc(self.current_loaded_id)
             self._update_button_states()
@@ -711,37 +437,39 @@ class EstimateDocViewPage(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Open Error", f"Could not open the customer copy:\n{exc}")
 
-    def create_rfq(self) -> None:
+    def open_rfq_center_handoff(self) -> None:
         if not self.current_loaded_id or not self.current_data:
-            QMessageBox.warning(self, "Warning", "Please select an estimate first.")
+            QMessageBox.warning(self, "Open RFQ Center", "Please select an estimate first.")
             return
 
-        vendors = get_vendor_choices()
-        if not vendors:
-            QMessageBox.warning(self, "No Vendors", "No wholesalers are set up yet in the vendor list.")
-            return
+        main_window = self.window()
+        handoff_completed = False
+        if main_window is not None and hasattr(main_window, "open_rfq_center"):
+            main_window.open_rfq_center()
+            try:
+                page = getattr(main_window, "_get_or_create_page", lambda _key: None)("RFQViewerFrame")
+                if page is not None and hasattr(page, "set_procurement_center"):
+                    page.set_procurement_center("RFQ")
+                if page is not None and hasattr(page, "_set_procurement_tab") and hasattr(page, "tab_build_rfq"):
+                    page._set_procurement_tab(page.tab_build_rfq, center="RFQ")
+                if page is not None and hasattr(page, "build_mc_source_type_combo"):
+                    page.build_mc_source_type_combo.setCurrentText("Estimate")
+                if page is not None and hasattr(page, "refresh_build_mc_source_choices"):
+                    page.refresh_build_mc_source_choices()
+                if page is not None and hasattr(page, "_set_build_mc_source_selection"):
+                    page._set_build_mc_source_selection(int(self.current_loaded_id))
+                if page is not None and hasattr(page, "on_build_mc_source_changed"):
+                    page.on_build_mc_source_changed()
+                handoff_completed = page is not None
+            except Exception:
+                pass
 
-        dialog = CreateRFQDialog(self, self.current_loaded_id, vendors)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result:
-            return
-
-        try:
-            results = create_and_send_rfq_batch(
-                self.current_loaded_id,
-                dialog.result["vendors"],
-                dialog.result["due_date"] or None,
+        if not handoff_completed:
+            QMessageBox.information(
+                self,
+                "Open RFQ Center",
+                f"Open RFQ Center and use Build MC from Estimate for Estimate #{self.current_loaded_id}.",
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "RFQ Error", f"Failed to create/send RFQ package:\n{exc}")
-            return
-
-        sent_count = sum(1 for row in results if row["sent"])
-        total_count = len(results)
-        QMessageBox.information(
-            self,
-            "RFQ Complete",
-            f"Created {total_count} RFQ(s).\nSent successfully: {sent_count}.",
-        )
 
     def _get_customer_copy_path(self) -> str | None:
         if not self.current_loaded_id:
@@ -1153,19 +881,26 @@ class EstimateDocViewPage(QWidget):
         self._sync_template_tracking_from_draft()
         self._update_button_states()
 
+    def _estimate_status_text(self) -> str:
+        if not self.current_data:
+            return ""
+        return str((self.current_data.get("parent") or {}).get("Status") or "").strip()
+
+    def _estimate_is_submission_locked(self) -> bool:
+        return self._estimate_status_text().lower() in {"locked", "sent", "accepted"}
+
     def _update_button_states(self) -> None:
         has_selection = self.current_data is not None
-        status_text = str(self.current_data["parent"].get("Status") or "") if has_selection else ""
-        is_locked = status_text.strip().lower() in {"locked", "sent", "accepted"}
+        is_locked = self._estimate_is_submission_locked()
         has_copy = bool(self.current_customer_copy_path and os.path.exists(self.current_customer_copy_path))
         draft_loaded = self.current_estimate_draft is not None
         draft_status = str(self.current_estimate_draft.get("DraftStatus") or "") if draft_loaded else ""
         draft_is_editable = draft_status == "Draft"
 
         self.btn_lock.setEnabled(bool(has_selection and not is_locked))
-        self.btn_create_copy.setEnabled(bool(has_selection))
+        self.btn_create_copy.setEnabled(bool(has_selection and is_locked and not has_copy))
         self.btn_view_copy.setEnabled(has_copy)
-        self.btn_create_rfq.setEnabled(bool(has_selection and not is_locked))
+        self.btn_open_rfq_center.setEnabled(bool(has_selection and not is_locked))
         self.btn_preview_template.setEnabled(bool(has_selection))
         self.btn_generate_template.setEnabled(bool(has_selection))
         self.btn_load_draft.setEnabled(bool(has_selection))
@@ -1193,6 +928,14 @@ class EstimateDocViewPage(QWidget):
         self._update_send_button_state()
 
     def _current_send_validation(self) -> tuple[bool, str, dict]:
+        if not self.current_data:
+            return False, "Select an estimate first.", {}
+        if not self._estimate_is_submission_locked():
+            return (
+                False,
+                "Lock the estimate for submission before sending it to the customer.",
+                self._send_context_from_current_draft(),
+            )
         if not self.current_estimate_draft:
             return False, "No draft loaded.", {}
 
@@ -1201,6 +944,12 @@ class EstimateDocViewPage(QWidget):
             return False, "Draft is retired.", self._send_context_from_current_draft()
         if draft_status == "Sent":
             return False, "Draft has already been sent.", self._send_context_from_current_draft()
+        if draft_status != "Locked":
+            return (
+                False,
+                "Lock the estimate document draft before sending it to the customer.",
+                self._send_context_from_current_draft(),
+            )
         if draft_status == "Draft" and self._pending_template_selection_change:
             return (
                 False,
@@ -1497,7 +1246,10 @@ class EstimateDocViewPage(QWidget):
                 material_markup = float(parent.get("MaterialMarkUp") or 20.0) / 100.0
                 labor_total = sum(float(line.get("Hours") or 0.0) * float(line.get("Rate") or 0.0) for line in data.get("labor") or [])
                 material_total = sum(
-                    float(line.get("Quantity") or 0.0) * float(line.get("UnitCost") or 0.0)
+                    float(
+                        line.get("LineTotal")
+                        or (float(line.get("Quantity") or 0.0) * float(line.get("UnitCost") or 0.0))
+                    )
                     for line in data.get("materials") or []
                 )
                 total = (labor_total * (1 + labor_markup)) + (material_total * (1 + material_markup))

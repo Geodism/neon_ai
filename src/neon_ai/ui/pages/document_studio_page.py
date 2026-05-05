@@ -26,277 +26,8 @@ from neon_ai.document_control.models import (
     DocumentTemplateKind,
     DocumentTemplateVersion,
 )
+from neon_ai.services.document_token_catalog import grouped_document_tokens
 from neon_ai.ui.widgets.rich_text_toolbar import RichTextToolbar
-
-
-TOKEN_GUIDE_GROUPS: list[tuple[str, list[str]]] = [
-    (
-        "Company / Sender",
-        [
-            "CompanyName",
-            "CompanyAddress",
-            "CompanyPhone",
-            "CompanyEmail",
-            "CompanyWebsite",
-            "OwnerName",
-            "OwnerEmail",
-            "OwnerPhone",
-            "SenderName",
-            "SenderEmail",
-            "SenderTitle",
-        ],
-    ),
-    (
-        "Customer",
-        [
-            "CustomerName",
-            "CustomerEmail",
-            "CustomerPhone",
-            "CustomerBillingAddress",
-            "CustomerContactName",
-            "CustomerContactEmail",
-            "CustomerContactPhone",
-        ],
-    ),
-    (
-        "Site / Project",
-        [
-            "SiteName",
-            "SiteAddress",
-            "SiteCity",
-            "SitePostalCode",
-            "ProjectName",
-            "ProjectAddress",
-            "ProjectDescription",
-            "ScopeOfWork",
-        ],
-    ),
-    (
-        "Estimate",
-        [
-            "EstimateID",
-            "EstimateNumber",
-            "EstimateDate",
-            "EstimateStatus",
-            "EstimateTotal",
-            "EstimateSubtotal",
-            "EstimateMaterialSubtotal",
-            "EstimateLaborSubtotal",
-            "EstimateTaxAmount",
-            "EstimateMarkupPercent",
-            "EstimateBillingType",
-            "EstimateValidUntil",
-            "EstimateTerms",
-        ],
-    ),
-    (
-        "Work Order",
-        [
-            "WorkOrderID",
-            "WorkOrderNumber",
-            "WorkOrderStatus",
-            "WorkOrderDate",
-            "WorkOrderCreatedDate",
-            "WorkOrderApprovedDate",
-            "WorkOrderClosedDate",
-            "CustomerPO",
-            "AssignedElectrician",
-        ],
-    ),
-    (
-        "Customer Invoice",
-        [
-            "CustomerInvoiceId",
-            "InvoiceNumber",
-            "InvoiceDate",
-            "DueDate",
-            "InvoiceStatus",
-            "InvoiceType",
-            "InvoiceTotal",
-            "InvoiceSubtotal",
-            "InvoiceTaxAmount",
-            "InvoiceBalanceDue",
-            "PaymentTerms",
-            "PercentOfContract",
-            "BillingMilestone",
-        ],
-    ),
-    (
-        "RFQ",
-        [
-            "RFQID",
-            "PriceRequestID",
-            "RFQDate",
-            "RFQDueDate",
-            "RFQStatus",
-            "RFQNumber",
-            "RFQNotes",
-            "RequestedDueDate",
-        ],
-    ),
-    (
-        "Purchase Order",
-        [
-            "PurchaseOrderID",
-            "PurchaseOrderNumber",
-            "PODate",
-            "POStatus",
-            "POTotal",
-            "POSubtotal",
-            "POTaxAmount",
-            "POExpectedArrival",
-            "POETA",
-            "PONotes",
-        ],
-    ),
-    (
-        "Vendor / Wholesaler",
-        [
-            "VendorName",
-            "VendorEmail",
-            "VendorPhone",
-            "VendorAddress",
-            "VendorContactName",
-            "VendorAccountNumber",
-            "VendorQuoteNumber",
-        ],
-    ),
-    (
-        "Materials / Line Items",
-        [
-            "MaterialLineItems",
-            "MaterialLineItemsHtml",
-            "MaterialLineItemsText",
-            "RFQRequestedMaterialTable",
-            "LaborLineItems",
-            "LaborLineItemsHtml",
-            "LaborLineItemsText",
-            "LineItems",
-            "LineItemsHtml",
-            "LineItemsText",
-            "PartNumber",
-            "MaterialDescription",
-            "MaterialQuantity",
-            "MaterialUnitCost",
-            "MaterialLineTotal",
-            "MaterialNotes",
-            "LaborRole",
-            "LaborHours",
-            "LaborRate",
-            "LaborLineTotal",
-        ],
-    ),
-    (
-        "Financial Summary",
-        [
-            "TotalEstimateAmount",
-            "PreviouslyInvoicedAmount",
-            "AmountStillToInvoice",
-            "LabourCostToDate",
-            "ApprovedPurchaseOrderCost",
-            "CommittedCost",
-            "BillingPositionAmount",
-            "BillingPositionLabel",
-            "EstimatePositionAmount",
-            "EstimatePositionLabel",
-        ],
-    ),
-    (
-        "Dates / Terms",
-        [
-            "Today",
-            "CurrentDate",
-            "RequestedDate",
-            "DeliveryDate",
-            "PaymentDueDate",
-            "Terms",
-        ],
-    ),
-    (
-        "Attachments / Files",
-        [
-            "AttachmentFileName",
-            "AttachmentPath",
-            "EstimateDocumentPath",
-            "InvoiceDocumentPath",
-            "RFQAttachmentPath",
-            "PurchaseOrderDocumentPath",
-        ],
-    ),
-]
-
-SUPPORTED_TEMPLATE_TOKENS: set[str] = {
-    "CompanyName",
-    "OwnerName",
-    "CustomerName",
-    "CustomerEmail",
-    "CustomerPhone",
-    "SiteName",
-    "SiteAddress",
-    "ScopeOfWork",
-    "EstimateID",
-    "EstimateNumber",
-    "EstimateDate",
-    "EstimateTotal",
-    "EstimateSubtotal",
-    "WorkOrderID",
-    "CustomerInvoiceId",
-    "InvoiceNumber",
-    "InvoiceDate",
-    "DueDate",
-    "InvoiceType",
-    "InvoiceTotal",
-    "PaymentTerms",
-    "PercentOfContract",
-    "BillingMilestone",
-    "RFQID",
-    "PriceRequestID",
-    "VendorName",
-    "VendorEmail",
-    "MaterialLineItems",
-    "MaterialLineItemsHtml",
-    "MaterialLineItemsText",
-    "RFQRequestedMaterialTable",
-    "LaborLineItems",
-    "LaborLineItemsHtml",
-    "LaborLineItemsText",
-    "LineItems",
-    "LineItemsHtml",
-    "LineItemsText",
-    "Terms",
-    "AttachmentFileName",
-    "AttachmentPath",
-}
-
-PARTIAL_TEMPLATE_TOKENS: set[str] = {
-    "CompanyAddress",
-    "CompanyPhone",
-    "CompanyEmail",
-    "CompanyWebsite",
-    "OwnerEmail",
-    "OwnerPhone",
-    "SenderName",
-    "SenderEmail",
-    "SenderTitle",
-    "CustomerBillingAddress",
-    "CustomerContactName",
-    "CustomerContactEmail",
-    "CustomerContactPhone",
-    "SiteCity",
-    "SitePostalCode",
-    "ProjectName",
-    "ProjectAddress",
-    "ProjectDescription",
-    "EstimateMaterialSubtotal",
-    "EstimateLaborSubtotal",
-    "EstimateTaxAmount",
-    "WorkOrderNumber",
-    "InvoiceSubtotal",
-    "InvoiceTaxAmount",
-    "RFQDueDate",
-    "RFQNumber",
-    "RequestedDueDate",
-}
 
 
 class DocumentStudioPage(QWidget):
@@ -315,6 +46,7 @@ class DocumentStudioPage(QWidget):
         self._token_support_map: dict[str, str] = {}
         self._estimate_default_usage_context = "ESTIMATE_DRAFT_WORKSPACE"
         self._invoice_default_usage_context = "CUSTOMER_INVOICE_DRAFT_WORKSPACE"
+        self._purchase_order_default_usage_context = "PURCHASE_ORDER_DRAFT_WORKSPACE"
         self._invoice_delivery_default_usage_context = "CUSTOMER_INVOICE_SEND"
         self._rfq_delivery_default_usage_context = "RFQ_SEND"
 
@@ -829,6 +561,14 @@ class DocumentStudioPage(QWidget):
                 "label_prefix": "Invoice draft",
                 "workspace_label": "invoice draft workspace",
             }
+        if document_type_code == "PURCHASE_ORDER":
+            return {
+                "document_type_code": "PURCHASE_ORDER",
+                "usage_context": self._purchase_order_default_usage_context,
+                "button_prefix": "Purchase Order",
+                "label_prefix": "purchase order draft",
+                "workspace_label": "purchase order draft workspace",
+            }
         if document_type_code == "CUSTOMER_INVOICE_DELIVERY" and kind == DocumentTemplateKind.BODY:
             return {
                 "document_type_code": "CUSTOMER_INVOICE_DELIVERY",
@@ -1000,40 +740,15 @@ class DocumentStudioPage(QWidget):
             self._reset_editor_for_empty_state("Select a template to inspect or edit it.")
 
     def _populate_token_help(self) -> None:
-        catalog_service = getattr(self.container, "document_catalog_service", None) if self.container else None
-        if catalog_service is None:
-            self._token_help_map = {}
-            self._token_support_map = {}
-            self.token_help_label.setText("Token guide will appear here once document_catalog_service is available.")
-            self._populate_token_list([])
-            return
-
-        try:
-            token_help = catalog_service.get_token_help()
-        except Exception as exc:
-            self._token_help_map = {}
-            self._token_support_map = {}
-            self.token_help_label.setText(f"Could not load token guide right now. Details: {exc}")
-            self._populate_token_list([])
-            return
-
         token_help_map: dict[str, str] = {}
         token_support_map: dict[str, str] = {}
         token_entries: list[dict[str, str]] = []
-        seen_tokens: set[str] = set()
-
-        for group_name, token_names in TOKEN_GUIDE_GROUPS:
+        for group_name, token_records in grouped_document_tokens():
             token_entries.append({"type": "group", "label": group_name})
-            for bare_token in token_names:
-                token_name = f"{{{bare_token}}}"
-                if token_name in seen_tokens:
-                    continue
-                seen_tokens.add(token_name)
-                support_level = self._support_level_for_token(bare_token)
-                token_help_map[token_name] = token_help.get(
-                    bare_token,
-                    "Workflow-specific token. Missing values will be surfaced during preview/render.",
-                )
+            for token_record in token_records:
+                token_name = token_record.token
+                support_level = token_record.support_level
+                token_help_map[token_name] = token_record.description
                 token_support_map[token_name] = support_level
                 token_entries.append(
                     {
@@ -1047,13 +762,6 @@ class DocumentStudioPage(QWidget):
         self._token_help_map = token_help_map
         self._token_support_map = token_support_map
         self._populate_token_list(token_entries)
-
-    def _support_level_for_token(self, bare_token: str) -> str:
-        if bare_token in SUPPORTED_TEMPLATE_TOKENS:
-            return "Supported"
-        if bare_token in PARTIAL_TEMPLATE_TOKENS:
-            return "Partial"
-        return "Planned"
 
     def _populate_token_list(self, token_entries: list[dict[str, str]]) -> None:
         self.token_list.blockSignals(True)

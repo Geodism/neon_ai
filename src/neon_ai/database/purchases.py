@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import time
+from typing import Any
 from neon_ai.database.connection import get_connection
 from psycopg2.extras import RealDictCursor
 
@@ -13,20 +14,37 @@ AUTOMATION_MIN_DATE = datetime.date(1900, 1, 1)
 PO_DISPATCH_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "po_dispatch_log.json")
 LEGACY_PO_AUTO_SEND_ENV = "NEON_ENABLE_LEGACY_PO_AUTO_SEND"
 BACKGROUND_VENDOR_PO_FOLLOWUPS_ENV = "NEON_ENABLE_BACKGROUND_VENDOR_PO_FOLLOWUPS"
+_PURCHASE_SCHEMA_READY = False
 
 
-def _perf_log(area: str, name: str, started_at: float) -> None:
+def _perf_log(area: str, name: str, started_at: float, **fields) -> None:
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}")
+    extras = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            normalized = "true" if value else "false"
+        else:
+            normalized = str(value).replace(" ", "_")
+        extras.append(f"{key}={normalized}")
+    suffix = f" {' '.join(extras)}" if extras else ""
+    print(f"[PERF] area={area} name={name} elapsed_ms={elapsed_ms:.2f}{suffix}")
 
 
 def _background_vendor_po_followups_enabled() -> bool:
     return str(os.getenv(BACKGROUND_VENDOR_PO_FOLLOWUPS_ENV, "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def ensure_purchase_schema():
-    conn = get_connection()
-    cur = conn.cursor()
+def ensure_purchase_schema(cur=None, *, force: bool = False):
+    global _PURCHASE_SCHEMA_READY
+    if _PURCHASE_SCHEMA_READY and not force:
+        return
+    owns_connection = cur is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        cur = conn.cursor()
     try:
         cur.execute('ALTER TABLE public."PurchaseOrder" ADD COLUMN IF NOT EXISTS "ExpectedArrivalDate" date')
         cur.execute('ALTER TABLE public."PurchaseOrder" ADD COLUMN IF NOT EXISTS "ExpectedArrivalNote" text')
@@ -52,10 +70,18 @@ def ensure_purchase_schema():
             )
             '''
         )
+        cur.execute('ALTER TABLE public."PurchaseOrderItemSourceLink" ADD COLUMN IF NOT EXISTS "MaterialCallID" integer')
+        cur.execute('ALTER TABLE public."PurchaseOrderItemSourceLink" ADD COLUMN IF NOT EXISTS "MaterialCallItemID" integer')
         cur.execute(
             '''
             CREATE UNIQUE INDEX IF NOT EXISTS "idx_poitemsourcelink_poi"
             ON public."PurchaseOrderItemSourceLink" ("POItemID")
+            '''
+        )
+        cur.execute(
+            '''
+            CREATE INDEX IF NOT EXISTS "idx_poitemsourcelink_materialcallid"
+            ON public."PurchaseOrderItemSourceLink" ("MaterialCallID")
             '''
         )
         cur.execute(
@@ -80,9 +106,16 @@ def ensure_purchase_schema():
             )
             '''
         )
-        conn.commit()
+        if owns_connection and conn is not None:
+            conn.commit()
+        _PURCHASE_SCHEMA_READY = True
+    except Exception:
+        if owns_connection and conn is not None:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if owns_connection and conn is not None:
+            conn.close()
 
 
 def load_po_dispatch_log():
@@ -215,7 +248,7 @@ def get_carried_items_for_po_center(
         filter_params = [work_order_id]
         rfq_filters = []
         if source_estimate_id:
-            rfq_filters.append('rcs."EstimateID" = %s')
+            rfq_filters.append('COALESCE(rcs."EstimateID", mc."EstimateID", pr."EstimateID") = %s')
             filter_params.append(source_estimate_id)
         if rfq_id:
             rfq_filters.append('rcs."SourcePriceRequestID" = %s')
@@ -229,41 +262,77 @@ def get_carried_items_for_po_center(
             f'''
             SELECT
                 rcs."RFQCarriedSelectionID",
-                rcs."EstimateID",
+                COALESCE(rcs."EstimateID", mc."EstimateID", pr."EstimateID") AS "EstimateID",
+                rcs."MaterialCallID",
+                rcs."MaterialCallItemID",
                 rcs."SourcePriceRequestID" AS "PriceRequestID",
                 rcs."SourcePRItemID" AS "PRItemID",
                 rcs."VendorID",
-                rcs."MaterialID",
-                rcs."CarriedQuantity",
-                rcs."CarriedUnitPrice",
-                rcs."CarriedExtendedPrice",
-                em."ItemID" AS "CatalogItemID",
+                COALESCE(rcs."MaterialID", pri."MaterialID", mci."EstimateItemID") AS "MaterialID",
+                COALESCE(rcs."CarriedQuantity", pri."QuantityOverride", mci."Quantity", em."Quantity", 0) AS "CarriedQuantity",
+                COALESCE(rcs."CarriedUnitPrice", pri."QuotedUnitPrice", 0) AS "CarriedUnitPrice",
+                COALESCE(
+                    rcs."CarriedExtendedPrice",
+                    COALESCE(rcs."CarriedQuantity", pri."QuantityOverride", mci."Quantity", em."Quantity", 0)
+                    * COALESCE(rcs."CarriedUnitPrice", pri."QuotedUnitPrice", 0)
+                ) AS "CarriedExtendedPrice",
+                COALESCE(mci."MaterialID", em."ItemID") AS "CatalogItemID",
                 COALESCE(NULLIF(TRIM(v."VendorName"), ''), 'Unknown Vendor') AS "VendorName",
-                COALESCE(NULLIF(TRIM(em."PartNumber"), ''), NULLIF(TRIM(m."PartNumber"), ''), '') AS "PartNumber",
-                COALESCE(NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') AS "Description",
-                COALESCE(NULLIF(TRIM(m."Unit"), ''), '') AS "Unit",
+                COALESCE(NULLIF(TRIM(mci."PartNumber"), ''), NULLIF(TRIM(em."PartNumber"), ''), NULLIF(TRIM(m."PartNumber"), ''), '') AS "PartNumber",
+                COALESCE(NULLIF(TRIM(mci."Description"), ''), NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') AS "Description",
+                COALESCE(NULLIF(TRIM(mci."Unit"), ''), NULLIF(TRIM(m."Unit"), ''), '') AS "Unit",
                 pr."PriceRequestID" AS "RFQID",
                 pr."EstimateID" AS "RFQEstimateID",
                 wo."WorkOrderID",
                 COALESCE(NULLIF(TRIM(pr."Status"), ''), 'Draft') AS "RFQStatus",
-                COALESCE(NULLIF(TRIM(rcs."SelectionType"), ''), 'LineItem') AS "SelectionType"
+                COALESCE(NULLIF(TRIM(rcs."SelectionType"), ''), 'LineItem') AS "SelectionType",
+                COALESCE(NULLIF(TRIM(mc."MaterialCallNumber"), ''), '') AS "MaterialCallNumber",
+                CASE
+                    WHEN rcs."MaterialCallID" IS NOT NULL THEN 'Material Call'
+                    ELSE COALESCE(NULLIF(TRIM(rcs."SelectionType"), ''), 'LineItem')
+                END AS "SourceType",
+                CASE
+                    WHEN rcs."MaterialCallID" IS NOT NULL THEN COALESCE(NULLIF(TRIM(mc."MaterialCallNumber"), ''), 'MC#' || rcs."MaterialCallID"::text)
+                    ELSE COALESCE(NULLIF(TRIM(rcs."SelectionType"), ''), 'Legacy Carry')
+                END AS "SourceLabel"
             FROM "RFQCarriedSelection" rcs
             JOIN "PriceRequest" pr ON rcs."SourcePriceRequestID" = pr."PriceRequestID"
-            JOIN "EstimateMaterial" em ON rcs."MaterialID" = em."EstimateMaterialID"
-            LEFT JOIN "Material" m ON em."ItemID" = m."ItemID"
+            LEFT JOIN "PriceRequestItem" pri ON rcs."SourcePRItemID" = pri."PRItemID"
+            LEFT JOIN "MaterialCall" mc ON rcs."MaterialCallID" = mc."MaterialCallID"
+            LEFT JOIN "MaterialCallItem" mci ON rcs."MaterialCallItemID" = mci."MaterialCallItemID"
+            LEFT JOIN "EstimateMaterial" em ON COALESCE(rcs."MaterialID", pri."MaterialID", mci."EstimateItemID") = em."EstimateMaterialID"
+            LEFT JOIN "Material" m ON COALESCE(mci."MaterialID", em."ItemID") = m."ItemID"
             LEFT JOIN "Vendor" v ON rcs."VendorID" = v."VendorID"
             JOIN "WorkOrder" wo ON wo."WorkOrderID" = %s
             WHERE (
-                wo."SourceEstimateID" = rcs."EstimateID"
-                OR em."EstimateID" = wo."SourceEstimateID"
+                (
+                    rcs."MaterialCallID" IS NOT NULL
+                    AND (
+                        mc."WorkOrderID" = wo."WorkOrderID"
+                        OR (wo."SourceEstimateID" IS NOT NULL AND mc."EstimateID" = wo."SourceEstimateID")
+                    )
+                )
+                OR (
+                    rcs."MaterialCallID" IS NULL
+                    AND wo."SourceEstimateID" IS NOT NULL
+                    AND (
+                        wo."SourceEstimateID" = rcs."EstimateID"
+                        OR em."EstimateID" = wo."SourceEstimateID"
+                    )
+                )
             )
             {rfq_where}
-            ORDER BY v."VendorName" ASC, pr."PriceRequestID" ASC, em."Description" ASC
+            ORDER BY
+                COALESCE(NULLIF(TRIM(v."VendorName"), ''), 'Unknown Vendor') ASC,
+                COALESCE(NULLIF(TRIM(mc."MaterialCallNumber"), ''), '') ASC,
+                pr."PriceRequestID" ASC,
+                COALESCE(NULLIF(TRIM(mci."Description"), ''), NULLIF(TRIM(em."Description"), ''), NULLIF(TRIM(m."Description"), ''), '') ASC
             ''',
             tuple(filter_params),
         )
         rows = [dict(row) for row in cur.fetchall()]
         seen_selection_ids = {int(row["RFQCarriedSelectionID"]) for row in rows if row.get("RFQCarriedSelectionID") is not None}
+        seen_pr_item_ids = {int(row["PRItemID"]) for row in rows if row.get("PRItemID") is not None}
 
         legacy_filters = ['wo."WorkOrderID" = %s']
         legacy_params = [work_order_id]
@@ -282,6 +351,8 @@ def get_carried_items_for_po_center(
             SELECT
                 NULL::integer AS "RFQCarriedSelectionID",
                 pr."EstimateID",
+                NULL::integer AS "MaterialCallID",
+                NULL::integer AS "MaterialCallItemID",
                 pr."PriceRequestID",
                 pri."PRItemID",
                 pr."VendorID",
@@ -298,7 +369,10 @@ def get_carried_items_for_po_center(
                 pr."EstimateID" AS "RFQEstimateID",
                 wo."WorkOrderID",
                 COALESCE(NULLIF(TRIM(pr."Status"), ''), 'Draft') AS "RFQStatus",
-                'LegacyCarry' AS "SelectionType"
+                'LegacyCarry' AS "SelectionType",
+                '' AS "MaterialCallNumber",
+                'Legacy Carry' AS "SourceType",
+                'Legacy Carry' AS "SourceLabel"
             FROM "PriceRequestItem" pri
             JOIN "PriceRequest" pr ON pri."PriceRequestID" = pr."PriceRequestID"
             JOIN "EstimateMaterial" em ON pri."MaterialID" = em."EstimateMaterialID"
@@ -306,6 +380,7 @@ def get_carried_items_for_po_center(
             LEFT JOIN "Vendor" v ON pr."VendorID" = v."VendorID"
             JOIN "WorkOrder" wo ON wo."WorkOrderID" = %s
             WHERE pri."IsCarried" = TRUE
+              AND pr."MaterialCallID" IS NULL
               AND ({' AND '.join(legacy_filters)})
             ORDER BY v."VendorName" ASC, pr."PriceRequestID" ASC, em."Description" ASC
             ''',
@@ -316,10 +391,7 @@ def get_carried_items_for_po_center(
             synthetic_key = f"legacy:{row_dict.get('PRItemID')}"
             if synthetic_key in seen_selection_ids:
                 continue
-            if any(
-                existing.get("PRItemID") == row_dict.get("PRItemID")
-                for existing in rows
-            ):
+            if row_dict.get("PRItemID") is not None and int(row_dict["PRItemID"]) in seen_pr_item_ids:
                 continue
             rows.append(row_dict)
 
@@ -342,7 +414,9 @@ def get_purchase_order_source_links(po_id: int):
                 sl."PRItemID",
                 sl."VendorID",
                 sl."EstimateID",
-                sl."MaterialID"
+                sl."MaterialID",
+                sl."MaterialCallID",
+                sl."MaterialCallItemID"
             FROM "PurchaseOrderItemSourceLink" sl
             WHERE sl."PurchaseOrderID" = %s
             ''',
@@ -467,10 +541,14 @@ def _save_purchase_order_record(
             source_vendor_id = item.get("source_vendor_id") or item.get("vendor_id")
             source_estimate_id = item.get("source_estimate_id") or item.get("estimate_id")
             source_material_id = item.get("estimate_material_id") or item.get("mat_id")
+            source_material_call_id = item.get("source_material_call_id") or item.get("material_call_id")
+            source_material_call_item_id = item.get("source_material_call_item_id") or item.get("material_call_item_id")
             if all(
                 value in (None, "", 0, "0")
                 for value in (
                     source_selection_id,
+                    source_material_call_id,
+                    source_material_call_item_id,
                     source_price_request_id,
                     source_pr_item_id,
                     source_vendor_id,
@@ -489,9 +567,11 @@ def _save_purchase_order_record(
                     "PRItemID",
                     "VendorID",
                     "EstimateID",
-                    "MaterialID"
+                    "MaterialID",
+                    "MaterialCallID",
+                    "MaterialCallItemID"
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''',
                 (
                     po_item_id,
@@ -502,6 +582,8 @@ def _save_purchase_order_record(
                     source_vendor_id or None,
                     source_estimate_id or None,
                     source_material_id or None,
+                    source_material_call_id or None,
+                    source_material_call_item_id or None,
                 ),
             )
         conn.commit()
@@ -2121,6 +2203,7 @@ def get_existing_po_id(work_order_id: int, vendor_id: int):
 def get_purchase_orders_for_pipeline():
     """Pulls the POs for the bottom-left Master Ledger."""
     started_at = time.perf_counter()
+    row_count = 0
     try:
         ensure_purchase_schema()
         from neon_ai.database.connection import get_connection
@@ -2135,11 +2218,160 @@ def get_purchase_orders_for_pipeline():
                 LEFT JOIN "Site" s ON wo."SiteID" = s."SiteID"
                 ORDER BY po."PurchaseOrderID" DESC
             ''')
-            return cur.fetchall()
+            rows = cur.fetchall()
+            row_count = len(rows)
+            return rows
         finally:
             conn.close()
     finally:
-        _perf_log("db", "purchases.get_purchase_orders_for_pipeline", started_at)
+        _perf_log("db", "purchases.get_purchase_orders_for_pipeline", started_at, row_count=row_count)
+
+
+def get_purchase_orders_grouped_for_pipeline():
+    """Returns a WorkOrder-first view of purchase orders for the PO Center shell."""
+    started_at = time.perf_counter()
+    purchase_order_count = 0
+    work_order_count = 0
+    parent_row_count = 0
+    child_row_count = 0
+    status_filter_used = "UPPER(JobStatus)=OPEN and IsClosed=false via list_open_work_orders_for_material_request"
+    try:
+        ensure_purchase_schema()
+        from neon_ai.database.connection import get_connection
+        from psycopg2.extras import RealDictCursor
+        from neon_ai.database.timesheets import list_open_work_orders_for_material_request
+
+        open_work_orders = list(list_open_work_orders_for_material_request() or [])
+        open_work_order_ids = [
+            int(row["WorkOrderID"])
+            for row in open_work_orders
+            if row.get("WorkOrderID") not in (None, "", 0, "0")
+        ]
+        work_order_count = len(open_work_order_ids)
+        if not open_work_order_ids:
+            return []
+
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cur.execute(
+                '''
+                SELECT
+                    w."WorkOrderID",
+                    COALESCE(NULLIF(TRIM(s."SiteName"), ''), '') AS "SiteName",
+                    COALESCE(NULLIF(TRIM(c."CustomerName"), ''), '') AS "CustomerName",
+                    COALESCE(
+                        NULLIF(TRIM(w."JobStatus"), ''),
+                        CASE
+                            WHEN COALESCE(w."IsClosed", FALSE) THEN 'Closed'
+                            ELSE 'Open'
+                        END
+                    ) AS "WorkOrderStatus",
+                    COALESCE(po_counts."POCount", 0) AS "POCount"
+                FROM "WorkOrder" w
+                LEFT JOIN "Site" s ON w."SiteID" = s."SiteID"
+                LEFT JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+                LEFT JOIN (
+                    SELECT
+                        po."WorkOrderID",
+                        COUNT(*) AS "POCount"
+                    FROM "PurchaseOrder" po
+                    GROUP BY po."WorkOrderID"
+                ) po_counts ON po_counts."WorkOrderID" = w."WorkOrderID"
+                WHERE w."WorkOrderID" = ANY(%s)
+                ORDER BY
+                    w."WorkOrderID" DESC
+                ''',
+                (open_work_order_ids,),
+            )
+            work_order_rows = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                '''
+                SELECT
+                    po."PurchaseOrderID",
+                    po."WorkOrderID",
+                    po."VendorID",
+                    po."Date",
+                    po."Status",
+                    COALESCE(po."PurchaseOrderTotal", 0) AS "PurchaseOrderTotal",
+                    COALESCE(NULLIF(TRIM(v."VendorName"), ''), 'Unknown Vendor') AS "VendorName",
+                    COALESCE(NULLIF(TRIM(s."SiteName"), ''), '') AS "SiteName",
+                    COALESCE(NULLIF(TRIM(c."CustomerName"), ''), '') AS "CustomerName",
+                    COALESCE(
+                        NULLIF(TRIM(w."JobStatus"), ''),
+                        CASE
+                            WHEN COALESCE(w."IsClosed", FALSE) THEN 'Closed'
+                            ELSE 'Open'
+                        END
+                    ) AS "WorkOrderStatus"
+                FROM "PurchaseOrder" po
+                JOIN "WorkOrder" w ON po."WorkOrderID" = w."WorkOrderID"
+                LEFT JOIN "Site" s ON w."SiteID" = s."SiteID"
+                LEFT JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+                LEFT JOIN "Vendor" v ON po."VendorID" = v."VendorID"
+                WHERE po."WorkOrderID" = ANY(%s)
+                ORDER BY
+                    po."WorkOrderID" DESC NULLS LAST,
+                    po."PurchaseOrderID" DESC
+                ''',
+                (open_work_order_ids,),
+            )
+            po_rows = [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+        purchase_order_count = len(po_rows)
+        grouped_rows: list[dict[str, Any]] = []
+        groups_by_key: dict[int, dict[str, Any]] = {}
+        for row in work_order_rows:
+            work_order_id = int(row.get("WorkOrderID") or 0)
+            group = {
+                "WorkOrderID": work_order_id,
+                "WorkOrderNumber": f"WO #{work_order_id}",
+                "CustomerName": str(row.get("CustomerName") or ""),
+                "SiteName": str(row.get("SiteName") or ""),
+                "Status": str(row.get("WorkOrderStatus") or "Open"),
+                "POCount": int(row.get("POCount") or 0),
+                "purchase_orders": [],
+            }
+            groups_by_key[work_order_id] = group
+            grouped_rows.append(group)
+
+        for row in po_rows:
+            work_order_id = int(row.get("WorkOrderID") or 0) or None
+            if work_order_id is None:
+                continue
+            group = groups_by_key.get(work_order_id)
+            if group is None:
+                group = {
+                    "WorkOrderID": work_order_id,
+                    "WorkOrderNumber": f"WO #{work_order_id}",
+                    "CustomerName": str(row.get("CustomerName") or ""),
+                    "SiteName": str(row.get("SiteName") or ""),
+                    "Status": str(row.get("WorkOrderStatus") or "Open"),
+                    "POCount": 0,
+                    "purchase_orders": [],
+                }
+                groups_by_key[work_order_id] = group
+                grouped_rows.append(group)
+            group.setdefault("purchase_orders", []).append(row)
+
+        parent_row_count = len(grouped_rows)
+        child_row_count = sum(len(list(group.get("purchase_orders") or [])) for group in grouped_rows)
+        return grouped_rows
+    finally:
+        _perf_log(
+            "db",
+            "purchases.get_purchase_orders_grouped_for_pipeline",
+            started_at,
+            row_count=purchase_order_count,
+            work_order_count=work_order_count,
+            parent_row_count=parent_row_count,
+            child_row_count=child_row_count,
+            status_filter_used=status_filter_used,
+            empty_reason="no_open_work_orders" if work_order_count == 0 else None,
+        )
 
 def get_po_items_with_receiving(po_id: int):
     """Pulls items with Ordered vs Received math."""
@@ -2201,6 +2433,61 @@ def get_po_items_with_receiving(po_id: int):
         return cur.fetchall()
     finally:
         conn.close()
+
+
+def get_purchase_order_receiving_metadata(po_id: int):
+    """Returns compact header metadata for the Receive Goods workspace."""
+    ensure_purchase_schema()
+    po_data = get_po_export_data(int(po_id))
+    if not po_data:
+        return None
+
+    line_rows = list(get_po_items_with_receiving(int(po_id)) or [])
+    receipt_choices = list(get_purchase_order_receipt_choices(int(po_id)) or [])
+
+    total_lines = len(line_rows)
+    total_ordered_qty = 0.0
+    total_received_qty = 0.0
+    total_outstanding_qty = 0.0
+    last_received_date = None
+    last_packing_slip = ""
+
+    for row in line_rows:
+        total_ordered_qty += float(row.get("QuantityOrdered") or 0)
+        total_received_qty += float(row.get("QuantityReceived") or 0)
+        total_outstanding_qty += float(row.get("Remaining") or 0)
+        date_value = row.get("LastReceivedDate")
+        if date_value and (last_received_date is None or str(date_value) > str(last_received_date)):
+            last_received_date = date_value
+
+    for choice in receipt_choices:
+        document_ref = str(choice.get("DocumentRef") or "").strip()
+        if document_ref:
+            last_packing_slip = document_ref
+            break
+
+    if not last_packing_slip:
+        for row in line_rows:
+            packing_ref = str(row.get("LastPackingSlip") or "").strip()
+            if packing_ref:
+                last_packing_slip = packing_ref
+                break
+
+    return {
+        "PurchaseOrderID": po_data.get("PurchaseOrderID"),
+        "WorkOrderID": po_data.get("WorkOrderID"),
+        "VendorID": po_data.get("VendorID"),
+        "VendorName": po_data.get("VendorName"),
+        "Status": po_data.get("Status"),
+        "Date": po_data.get("Date"),
+        "ExpectedArrivalDate": po_data.get("ExpectedArrivalDate"),
+        "LastReceivedDate": last_received_date,
+        "LastPackingSlip": last_packing_slip,
+        "TotalOrderedLines": total_lines,
+        "TotalOrderedQty": total_ordered_qty,
+        "TotalReceivedQty": total_received_qty,
+        "TotalOutstandingQty": total_outstanding_qty,
+    }
 
 def search_po_items_by_part(search_term: str):
     """Searches all PO items for a specific part description."""

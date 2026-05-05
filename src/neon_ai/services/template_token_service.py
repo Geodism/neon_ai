@@ -7,6 +7,10 @@ from typing import Any
 
 from neon_ai.database.estimates import get_detailed_estimate_data
 from neon_ai.database.invoices import get_invoice_detail
+from neon_ai.database.purchases import get_po_export_data, get_po_items
+
+
+PURCHASE_ORDER_LINE_TABLE_TOKEN = "PurchaseOrderLineTable"
 
 
 def _money(value: Any) -> float:
@@ -146,6 +150,81 @@ def _rows_to_html(rows: list[dict[str, Any]], include_type: bool = False) -> str
         amount = html.escape(str(row.get("SellTotalFormatted", _fmt_money(row.get("SellTotal")))))
         items.append(f"<li>{prefix}{desc} - {amount}</li>")
     return "<ul>" + "".join(items) + "</ul>"
+
+
+def _build_purchase_order_line_items(header: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_material_rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
+    subtotal = 0.0
+
+    for row in items:
+        quantity = _money(row.get("QuantityOrdered"))
+        unit_cost = _money(row.get("UnitPriceAtOrder"))
+        line_total = _money(row.get("LineTotal") or (quantity * unit_cost))
+        normalized = {
+            "LineType": "Material",
+            "Description": _clean_text(row.get("Description"), "Material"),
+            "PartNumber": _clean_text(row.get("PartNumber")),
+            "MaterialDescription": _clean_text(row.get("Description"), "Material"),
+            "MaterialQuantity": quantity,
+            "MaterialUnitCost": round(unit_cost, 2),
+            "MaterialLineTotal": round(line_total, 2),
+            "SellTotal": round(line_total, 2),
+            "SellTotalFormatted": _fmt_money(line_total),
+        }
+        normalized_material_rows.append(normalized)
+        all_rows.append(normalized)
+        subtotal += line_total
+
+    total = _money(header.get("PurchaseOrderTotal") or subtotal)
+    return {
+        "MaterialLineItems": normalized_material_rows,
+        "LineItems": all_rows,
+        "POSubtotal": round(subtotal, 2),
+        "POTotal": round(total, 2),
+        "POTaxAmount": 0.0,
+    }
+
+
+def _render_purchase_order_line_table(rows: list[dict[str, Any]], *, as_html: bool) -> str:
+    if not rows:
+        return "No purchase-order line items are available."
+
+    headers = ["Qty", "Description", "Unit Price", "Ext Price"]
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        normalized_rows.append(
+            [
+                f"{_money(row.get('MaterialQuantity')):.2f}".rstrip("0").rstrip("."),
+                _clean_text(row.get("Description") or row.get("MaterialDescription"), "Material"),
+                _fmt_money(row.get("MaterialUnitCost")),
+                _fmt_money(row.get("MaterialLineTotal")),
+            ]
+        )
+
+    if as_html:
+        table_rows = []
+        for cells in normalized_rows:
+            row_html = "".join(
+                f"<td style=\"border: 1px solid #999; padding: 4px 6px; vertical-align: top;\">{html.escape(cell)}</td>"
+                for cell in cells
+            )
+            table_rows.append(f"<tr>{row_html}</tr>")
+        header_html = "".join(
+            f"<th style=\"border: 1px solid #999; padding: 4px 6px; text-align: left; background: #f3f3f3;\">{html.escape(label)}</th>"
+            for label in headers
+        )
+        return (
+            "<table style=\"border-collapse: collapse; width: 100%;\">"
+            f"<thead><tr>{header_html}</tr></thead>"
+            f"<tbody>{''.join(table_rows)}</tbody>"
+            "</table>"
+        )
+
+    lines = ["\t".join(headers)]
+    for cells in normalized_rows:
+        lines.append("\t".join(cells))
+    return "\n".join(lines)
 
 
 def get_estimate_document_tokens(estimate_id: int) -> dict[str, Any]:
@@ -458,6 +537,105 @@ def get_customer_invoice_document_tokens(invoice_id: int) -> dict[str, Any]:
         }
     )
     return tokens
+
+
+def get_purchase_order_document_tokens(po_id: int) -> dict[str, Any]:
+    header = get_po_export_data(po_id)
+    if not header:
+        raise ValueError(f"Purchase Order #{po_id} could not be loaded.")
+
+    items = list(get_po_items(po_id) or [])
+    line_breakdown = _build_purchase_order_line_items(header, items)
+    po_date = header.get("Date")
+    po_date_text = (
+        po_date.isoformat()
+        if hasattr(po_date, "isoformat")
+        else str(po_date or "")
+    )
+    expected_arrival = header.get("ExpectedArrivalDate")
+    expected_arrival_text = (
+        expected_arrival.isoformat()
+        if hasattr(expected_arrival, "isoformat")
+        else str(expected_arrival or "")
+    )
+    company_name = (
+        os.environ.get("NEON_COMPANY_NAME")
+        or os.environ.get("COMPANY_NAME")
+        or "Neon_ai"
+    )
+    owner_name = (
+        os.environ.get("NEON_OWNER_NAME")
+        or os.environ.get("OWNER_NAME")
+        or "Project Team"
+    )
+    vendor_address = _clean_text(header.get("VendorAddress"))
+    site_address = " ".join(
+        part for part in (_clean_text(header.get("StreetNumber")), _clean_text(header.get("StreetName"))) if part
+    ).strip()
+
+    tokens: dict[str, Any] = {
+        "PurchaseOrderID": header.get("PurchaseOrderID"),
+        "PurchaseOrderNumber": header.get("PONumber") or header.get("PurchaseOrderID"),
+        "PODate": po_date_text,
+        "POStatus": _clean_text(header.get("Status"), "Draft"),
+        "POTaxAmount": 0.0,
+        "POTaxAmountFormatted": _fmt_money(0.0),
+        "POExpectedArrival": expected_arrival_text,
+        "POETA": expected_arrival_text,
+        "ExpectedArrivalDate": expected_arrival_text,
+        "PONotes": _clean_text(header.get("ExpectedArrivalNote")),
+        "PurchaseOrderNotes": _clean_text(header.get("ExpectedArrivalNote")),
+        "WorkOrderID": header.get("WorkOrderID"),
+        "EstimateID": header.get("EstimateID"),
+        "VendorName": _clean_text(header.get("VendorName"), "Vendor"),
+        "VendorAddress": vendor_address,
+        "VendorAccountNumber": _clean_text(header.get("AccountNumber")),
+        "CustomerName": _clean_text(header.get("CustomerName"), "Customer"),
+        "SiteName": _clean_text(header.get("SiteName"), "Project Site"),
+        "SiteAddress": site_address or _clean_text(header.get("SiteName"), "Site address pending"),
+        "CompanyName": company_name,
+        "OwnerName": owner_name,
+        "DocumentTitle": f"Purchase Order #{header.get('PurchaseOrderID')}",
+        "PurchaseOrderDocumentPath": _clean_text(header.get("ShippingDocuments")),
+    }
+    tokens.update(line_breakdown)
+    tokens.update(
+        {
+            "POTotalFormatted": _fmt_money(tokens["POTotal"]),
+            "POSubtotalFormatted": _fmt_money(tokens["POSubtotal"]),
+            "MaterialLineItemsText": _rows_to_text(tokens["MaterialLineItems"]),
+            "MaterialLineItemsHtml": _rows_to_html(tokens["MaterialLineItems"]),
+            "LineItemsText": _rows_to_text(tokens["LineItems"], include_type=True),
+            "LineItemsHtml": _rows_to_html(tokens["LineItems"], include_type=True),
+            PURCHASE_ORDER_LINE_TABLE_TOKEN: _render_purchase_order_line_table(
+                tokens["MaterialLineItems"],
+                as_html=True,
+            ),
+        }
+    )
+    return tokens
+
+
+def validate_purchase_order_document_tokens(tokens: dict[str, Any]) -> tuple[bool, list[str]]:
+    missing: list[str] = []
+    required_fields = (
+        "PurchaseOrderID",
+        "PODate",
+        "VendorName",
+        "WorkOrderID",
+    )
+    for field_name in required_fields:
+        value = tokens.get(field_name)
+        if value is None or str(value).strip() == "":
+            missing.append(field_name)
+
+    if not tokens.get("MaterialLineItems"):
+        missing.append("MaterialLineItems")
+
+    if tokens.get("POTotal") is None:
+        missing.append("POTotal")
+
+    return (len(missing) == 0, missing)
 
 
 def validate_customer_invoice_document_tokens(tokens: dict[str, Any]) -> tuple[bool, list[str]]:

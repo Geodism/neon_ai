@@ -5,6 +5,9 @@ from neon_ai.database.connection import get_connection
 from neon_ai.database.materials import get_or_create_material_from_estimate
 from psycopg2.extras import RealDictCursor
 
+DEFAULT_MATERIAL_PST_RATE = 0.07
+_ESTIMATE_MATERIAL_TAX_SCHEMA_READY = False
+
 
 def _perf_log(area: str, name: str, started_at: float) -> None:
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
@@ -21,6 +24,60 @@ def _log_estimate_sheet_save(cur, estimate_id, action_label, labor_lines, materi
         'INSERT INTO "Note" ("EstimateID", "NoteText", "Category") VALUES (%s, %s, %s)',
         (estimate_id, note_text, 'Estimate Sheet')
     )
+
+
+def _normalize_material_pst_taxable(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return True
+    return text not in {"0", "false", "no", "n", "off"}
+
+
+def _normalize_material_pst_rate(value) -> float:
+    try:
+        rate = float(value if value not in (None, "", "None") else DEFAULT_MATERIAL_PST_RATE)
+    except (TypeError, ValueError):
+        rate = DEFAULT_MATERIAL_PST_RATE
+    return max(rate, 0.0)
+
+
+def _calculate_estimate_material_line_total(quantity, unit_cost, pst_taxable=True, pst_rate=DEFAULT_MATERIAL_PST_RATE) -> float:
+    base_total = float(quantity or 0.0) * float(unit_cost or 0.0)
+    if not _normalize_material_pst_taxable(pst_taxable):
+        return round(base_total, 2)
+    rate = _normalize_material_pst_rate(pst_rate)
+    return round(base_total * (1 + rate), 2)
+
+
+def ensure_estimate_material_tax_schema(cur=None):
+    global _ESTIMATE_MATERIAL_TAX_SCHEMA_READY
+    if _ESTIMATE_MATERIAL_TAX_SCHEMA_READY:
+        return
+
+    own_connection = cur is None
+    conn = None
+    try:
+        if own_connection:
+            conn = get_connection()
+            cur = conn.cursor()
+        cur.execute('ALTER TABLE IF EXISTS public."EstimateMaterial" ADD COLUMN IF NOT EXISTS "PSTTaxable" boolean DEFAULT TRUE')
+        cur.execute(f'ALTER TABLE IF EXISTS public."EstimateMaterial" ADD COLUMN IF NOT EXISTS "PSTRate" numeric DEFAULT {DEFAULT_MATERIAL_PST_RATE}')
+        cur.execute('UPDATE public."EstimateMaterial" SET "PSTTaxable" = TRUE WHERE "PSTTaxable" IS NULL')
+        cur.execute(f'UPDATE public."EstimateMaterial" SET "PSTRate" = {DEFAULT_MATERIAL_PST_RATE} WHERE "PSTRate" IS NULL')
+        if own_connection and conn:
+            conn.commit()
+        _ESTIMATE_MATERIAL_TAX_SCHEMA_READY = True
+    except Exception:
+        if own_connection and conn:
+            conn.rollback()
+        raise
+    finally:
+        if own_connection and conn:
+            conn.close()
 
 
 def ensure_estimate_sequence(cur):
@@ -111,8 +168,12 @@ def _get_carried_quote_material_ids(cur, estimate_id):
 
 
 def _apply_carried_quote_pricing(cur, estimate_id):
+    tax_multiplier_sql = (
+        f"(1 + CASE WHEN COALESCE(em.\"PSTTaxable\", TRUE) "
+        f"THEN COALESCE(em.\"PSTRate\", {DEFAULT_MATERIAL_PST_RATE}) ELSE 0 END)"
+    )
     cur.execute(
-        '''
+        f'''
         WITH carried AS (
             SELECT DISTINCT ON (pri."MaterialID")
                 pri."MaterialID",
@@ -132,7 +193,7 @@ def _apply_carried_quote_pricing(cur, estimate_id):
         )
         UPDATE "EstimateMaterial" em
         SET "UnitCost" = carried."QuotedUnitPrice",
-            "LineTotal" = em."Quantity" * carried."QuotedUnitPrice",
+            "LineTotal" = ROUND((em."Quantity" * carried."QuotedUnitPrice" * {tax_multiplier_sql})::numeric, 2),
             "AwardedUnitCost" = carried."QuotedUnitPrice",
             "AwardedVendor" = carried."VendorName",
             "PriceSource" = 'Vendor Quote'
@@ -173,6 +234,10 @@ def _restore_noncarried_quote_lines(cur, estimate_id, carried_ids):
 
 
 def _sync_catalog_pricing(cur, estimate_id, excluded_material_ids=None):
+    tax_multiplier_sql = (
+        f"(1 + CASE WHEN COALESCE(em.\"PSTTaxable\", TRUE) "
+        f"THEN COALESCE(em.\"PSTRate\", {DEFAULT_MATERIAL_PST_RATE}) ELSE 0 END)"
+    )
     params = [estimate_id]
     exclusion_sql = ""
     if excluded_material_ids:
@@ -190,13 +255,13 @@ def _sync_catalog_pricing(cur, estimate_id, excluded_material_ids=None):
                 WHEN 'Guillevin' THEN COALESCE(m."GuillevinPrice", m."InternalPrice", 0)
                 ELSE COALESCE(m."InternalPrice", 0)
             END,
-            "LineTotal" = em."Quantity" * CASE COALESCE(m."CarryPriceSource", 'Internal')
+            "LineTotal" = ROUND((em."Quantity" * CASE COALESCE(m."CarryPriceSource", 'Internal')
                 WHEN 'Nedco' THEN COALESCE(m."NedcoPrice", m."InternalPrice", 0)
                 WHEN 'Gescan' THEN COALESCE(m."GescanPrice", m."InternalPrice", 0)
                 WHEN 'Eecol' THEN COALESCE(m."EecolPrice", m."InternalPrice", 0)
                 WHEN 'Guillevin' THEN COALESCE(m."GuillevinPrice", m."InternalPrice", 0)
                 ELSE COALESCE(m."InternalPrice", 0)
-            END,
+            END * {tax_multiplier_sql})::numeric, 2),
             "AwardedUnitCost" = NULL,
             "AwardedVendor" = NULL,
             "PriceSource" = 'Catalog'
@@ -205,6 +270,31 @@ def _sync_catalog_pricing(cur, estimate_id, excluded_material_ids=None):
           AND em."ItemID" = m."ItemID"
           AND COALESCE(em."IsCommitted", FALSE) = FALSE
           AND LOWER(TRIM(COALESCE(em."PriceSource", 'catalog'))) IN ('catalog', 'internal')
+          {exclusion_sql}
+        ''',
+        params,
+    )
+
+
+def _sync_manual_material_line_totals(cur, estimate_id, excluded_material_ids=None):
+    tax_multiplier_sql = (
+        f"(1 + CASE WHEN COALESCE(em.\"PSTTaxable\", TRUE) "
+        f"THEN COALESCE(em.\"PSTRate\", {DEFAULT_MATERIAL_PST_RATE}) ELSE 0 END)"
+    )
+    params = [estimate_id]
+    exclusion_sql = ""
+    if excluded_material_ids:
+        placeholders = ",".join(["%s"] * len(excluded_material_ids))
+        exclusion_sql = f' AND em."EstimateMaterialID" NOT IN ({placeholders})'
+        params.extend(excluded_material_ids)
+
+    cur.execute(
+        f'''
+        UPDATE "EstimateMaterial" em
+        SET "LineTotal" = ROUND((em."Quantity" * COALESCE(em."UnitCost", 0) * {tax_multiplier_sql})::numeric, 2)
+        WHERE em."EstimateID" = %s
+          AND COALESCE(em."IsCommitted", FALSE) = FALSE
+          AND LOWER(TRIM(COALESCE(em."PriceSource", 'manual'))) NOT IN ('catalog', 'vendor quote')
           {exclusion_sql}
         ''',
         params,
@@ -233,6 +323,7 @@ def sync_estimate_pricing_from_sources(estimate_id, cur=None):
         conn = get_connection()
         cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         status = _get_estimate_status(cur, estimate_id)
         if not is_estimate_editable_status(status):
             return {
@@ -244,6 +335,7 @@ def sync_estimate_pricing_from_sources(estimate_id, cur=None):
         carried_ids = _apply_carried_quote_pricing(cur, estimate_id)
         _restore_noncarried_quote_lines(cur, estimate_id, carried_ids)
         _sync_catalog_pricing(cur, estimate_id, excluded_material_ids=carried_ids)
+        _sync_manual_material_line_totals(cur, estimate_id, excluded_material_ids=carried_ids)
         _sync_labor_rates_from_roles(cur, estimate_id)
         _update_estimate_total_from_lines(cur, estimate_id)
 
@@ -288,6 +380,7 @@ def insert_full_estimate(site_id, description, billing_type, lab_markup, mat_mar
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         material_lines = _hydrate_material_catalog_links(material_lines)
         ensure_estimate_sequence(cur)
         cur.execute("""
@@ -306,11 +399,14 @@ def insert_full_estimate(site_id, description, billing_type, lab_markup, mat_mar
             )
 
         for m in material_lines:
+            pst_taxable = _normalize_material_pst_taxable(m[7] if len(m) > 7 else True)
+            pst_rate = _normalize_material_pst_rate(m[8] if len(m) > 8 else DEFAULT_MATERIAL_PST_RATE)
+            line_total = _calculate_estimate_material_line_total(m[1], m[2], pst_taxable, pst_rate)
             cur.execute('''
                 INSERT INTO "EstimateMaterial" 
-                ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "ItemID", "PartNumber", "PriceSource") 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (new_estimate_id, m[0], m[1], m[2], m[3], m[4], m[5], _resolve_price_source(m[4])))
+                ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "ItemID", "PartNumber", "PriceSource", "PSTTaxable", "PSTRate") 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (new_estimate_id, m[0], m[1], m[2], line_total, m[4], m[5], _resolve_price_source(m[4]), pst_taxable, pst_rate))
 
         sync_estimate_pricing_from_sources(new_estimate_id, cur=cur)
 
@@ -389,9 +485,10 @@ def get_estimate_materials(estimate_id):
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         # Check if your table is "EstimateMaterial" or "estimatematerial"
         cur.execute('''
-            SELECT "EstimateMaterialID", "Quantity", "Description"
+            SELECT "EstimateMaterialID", "Quantity", "Description", "PSTTaxable", "PSTRate"
             FROM "EstimateMaterial"
             WHERE "EstimateID" = %s
         ''', (estimate_id,))
@@ -410,12 +507,13 @@ def add_single_material(estimate_id: int, description: str, qty: float):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         cur.execute(
             """
-            INSERT INTO "EstimateMaterial" ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "PriceSource")
-            VALUES (%s, %s, %s, 0.0, 0.0, 'Manual')
+            INSERT INTO "EstimateMaterial" ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "PriceSource", "PSTTaxable", "PSTRate")
+            VALUES (%s, %s, %s, 0.0, 0.0, 'Manual', TRUE, %s)
             """,
-            (estimate_id, description, qty)
+            (estimate_id, description, qty, DEFAULT_MATERIAL_PST_RATE)
         )
         sync_estimate_pricing_from_sources(estimate_id, cur=cur)
         conn.commit()
@@ -536,6 +634,7 @@ def get_full_estimate(estimate_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         # 1. Grab Parent Details + Customer/Site Names
         cur.execute("""
             SELECT e.*, c."CustomerName", s."SiteName"
@@ -551,7 +650,7 @@ def get_full_estimate(estimate_id: int):
         labor = cur.fetchall()
 
         # 3. Grab Material Lines
-        cur.execute('SELECT "Description", "Quantity", "UnitCost", "LineTotal" FROM "EstimateMaterial" WHERE "EstimateID" = %s', (estimate_id,))
+        cur.execute('SELECT "Description", "Quantity", "UnitCost", "LineTotal", "PSTTaxable", "PSTRate" FROM "EstimateMaterial" WHERE "EstimateID" = %s', (estimate_id,))
         materials = cur.fetchall()
 
         return {"parent": parent, "labor": labor, "materials": materials}
@@ -562,6 +661,7 @@ def get_detailed_estimate_data(estimate_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         cur.execute("""
             SELECT 
                 e.*, 
@@ -699,6 +799,7 @@ def update_draft_estimate(est_id, site_id, desc, b_type, lab_markup, mat_markup,
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_estimate_material_tax_schema(cur=cur)
         material_lines = _hydrate_material_catalog_links(material_lines)
         # 1. Update the parent record
         cur.execute("""
@@ -737,23 +838,26 @@ def update_draft_estimate(est_id, site_id, desc, b_type, lab_markup, mat_markup,
 
         # B. Update existing and Insert new
         for m in material_lines:
-            # m = [m_desc, qty, cost, total, item_id, part_no, est_mat_id]
-            m_desc, qty, cost, total, item_id, part_no, est_mat_id = m
+            # m = [m_desc, qty, cost, total, item_id, part_no, est_mat_id, pst_taxable, pst_rate]
+            m_desc, qty, cost, total, item_id, part_no, est_mat_id, *pst_bits = m
+            pst_taxable = _normalize_material_pst_taxable(pst_bits[0] if len(pst_bits) > 0 else True)
+            pst_rate = _normalize_material_pst_rate(pst_bits[1] if len(pst_bits) > 1 else DEFAULT_MATERIAL_PST_RATE)
+            total = _calculate_estimate_material_line_total(qty, cost, pst_taxable, pst_rate)
             
             if est_mat_id is not None:
                 # It has a Golden Key! UPDATE IT!
                 cur.execute('''
                     UPDATE "EstimateMaterial"
-                    SET "Description" = %s, "Quantity" = %s, "UnitCost" = %s, "LineTotal" = %s, "ItemID" = %s, "PartNumber" = %s
+                    SET "Description" = %s, "Quantity" = %s, "UnitCost" = %s, "LineTotal" = %s, "ItemID" = %s, "PartNumber" = %s, "PSTTaxable" = %s, "PSTRate" = %s
                     WHERE "EstimateMaterialID" = %s
-                ''', (m_desc, qty, cost, total, item_id, part_no, est_mat_id))
+                ''', (m_desc, qty, cost, total, item_id, part_no, pst_taxable, pst_rate, est_mat_id))
             else:
                 # It's brand new! INSERT IT!
                 cur.execute('''
                     INSERT INTO "EstimateMaterial" 
-                    ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "ItemID", "PartNumber", "PriceSource") 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ''', (est_id, m_desc, qty, cost, total, item_id, part_no, _resolve_price_source(item_id)))
+                    ("EstimateID", "Description", "Quantity", "UnitCost", "LineTotal", "ItemID", "PartNumber", "PriceSource", "PSTTaxable", "PSTRate") 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (est_id, m_desc, qty, cost, total, item_id, part_no, _resolve_price_source(item_id), pst_taxable, pst_rate))
 
         sync_estimate_pricing_from_sources(est_id, cur=cur)
 
@@ -827,7 +931,11 @@ def get_estimate_id_from_wo(wo_id: int):
             WHERE wo."WorkOrderID" = %s
         ''', (wo_id,))
         res = cur.fetchone()
-        return res[0] if res else None
+        if not res:
+            return None
+        if isinstance(res, dict):
+            return res.get("EstimateID")
+        return res[0]
     finally:
         conn.close()
 

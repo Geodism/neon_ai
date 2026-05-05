@@ -28,6 +28,12 @@ from neon_ai.database.purchases import (
 
 
 class ReceivingViewerPage(QWidget):
+    """Hidden parallel receiving surface pending ownership decision.
+
+    Do not expose in main navigation until receiving ownership is explicitly
+    reaffirmed. Current primary procurement workflow is RFQ Center / PO Center.
+    """
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.active_po_id: int | None = None

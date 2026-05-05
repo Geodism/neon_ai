@@ -7,9 +7,11 @@ from typing import Any
 from neon_ai.database.connection import get_connection
 from neon_ai.database.rfq import (
     _build_rfq_pdf,
+    _load_estimate_rfq_estimate_row,
     _load_estimate_rfq_material_rows,
     ensure_material_request_source_schema,
     get_material_request_source_context_for_rfq,
+    get_rfq_requested_material_rows,
     get_vendor_email_for_rfq,
     mark_rfq_sent,
 )
@@ -69,6 +71,7 @@ def _load_rfq_context(rfq_id: int) -> dict[str, Any] | None:
             SELECT
                 pr."PriceRequestID",
                 pr."EstimateID",
+                pr."MaterialCallID",
                 pr."MaterialRequestSourceType",
                 pr."MaterialRequestSourceID",
                 pr."VendorID",
@@ -88,14 +91,24 @@ def _load_rfq_context(rfq_id: int) -> dict[str, Any] | None:
 
         cur.execute(
             """
-            SELECT pri."MaterialID"
+            SELECT pri."MaterialID", pri."MaterialCallItemID"
             FROM "PriceRequestItem" pri
             WHERE pri."PriceRequestID" = %s
             ORDER BY pri."PRItemID"
             """,
             (rfq_id,),
         )
-        rfq_row["MaterialIDs"] = [int(row["MaterialID"]) for row in cur.fetchall()]
+        item_rows = cur.fetchall()
+        rfq_row["MaterialIDs"] = [
+            int(row["MaterialID"])
+            for row in item_rows
+            if row.get("MaterialID") not in (None, "")
+        ]
+        rfq_row["MaterialCallItemIDs"] = [
+            int(row["MaterialCallItemID"])
+            for row in item_rows
+            if row.get("MaterialCallItemID") not in (None, "")
+        ]
         source_context = get_material_request_source_context_for_rfq(rfq_id, cur=cur)
         if source_context:
             rfq_row["MaterialRequestSourceType"] = source_context.get("MaterialRequestSourceType")
@@ -157,10 +170,6 @@ def can_send_rfq(rfq_id: int) -> tuple[bool, str, dict[str, Any]]:
         context["VendorEmail"] = get_vendor_email_for_rfq(int(rfq_row["VendorID"])) if rfq_row.get("VendorID") else None
         return False, "RFQ has already been sent.", context
 
-    material_ids = list(rfq_row.get("MaterialIDs") or [])
-    if not material_ids:
-        return False, "This RFQ has no packaged material lines to send.", context
-
     estimate_id = _get_estimate_id_from_context(rfq_row)
     if estimate_id is None:
         return (
@@ -176,10 +185,13 @@ def can_send_rfq(rfq_id: int) -> tuple[bool, str, dict[str, Any]]:
         return False, "This RFQ does not have a vendor email on file yet.", context
 
     try:
-        estimate_row, material_rows = _load_estimate_rfq_material_rows(
-            estimate_id,
-            material_ids=material_ids,
-        )
+        material_rows = list(get_rfq_requested_material_rows(rfq_id) or [])
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            estimate_row = _load_estimate_rfq_estimate_row(cur, estimate_id)
+        finally:
+            conn.close()
     except Exception as exc:
         return False, f"RFQ materials could not be loaded: {exc}", context
 
@@ -439,24 +451,15 @@ def _render_rfq_delivery_from_templates(
     except Exception as exc:
         return fallback_subject, fallback_body, None, None, f"Selected RFQ templates could not be rendered: {exc}"
 
-    if not table_token_present:
-        fallback_table = _render_requested_material_table(material_rows, as_html=html_mode)
-        if html_mode:
-            rendered_body = (
-                rendered_body.rstrip()
-                + "\n<hr>\n<h3>Requested Material Lines</h3>\n"
-                + fallback_table
-            )
-        else:
-            rendered_body = (
-                rendered_body.rstrip()
-                + "\n\nRequested Material Lines\n"
-                + fallback_table
-            )
-
     warning = None
     if missing_selection_messages:
         warning = "; ".join(missing_selection_messages) + ". Continuing with the remaining available RFQ templates."
+    if material_rows and not table_token_present:
+        token_warning = (
+            "The selected RFQ body template does not contain {{RFQRequestedMaterialTable}}, "
+            "so requested material lines will not appear in the email body."
+        )
+        warning = f"{warning} {token_warning}".strip() if warning else token_warning
 
     return (
         rendered_subject,
@@ -490,7 +493,6 @@ def prepare_rfq_delivery_message(
             **(context or {}),
         }
 
-    material_ids = list(rfq_row.get("MaterialIDs") or [])
     estimate_id = _get_estimate_id_from_context(rfq_row)
     if estimate_id is None:
         return {
@@ -498,7 +500,13 @@ def prepare_rfq_delivery_message(
             "reason": "This RFQ is missing estimate context. Reload the RFQ draft or save it again before previewing or sending.",
             **(context or {}),
         }
-    estimate_row, material_rows = _load_estimate_rfq_material_rows(estimate_id, material_ids=material_ids)
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        estimate_row = _load_estimate_rfq_estimate_row(cur, estimate_id)
+    finally:
+        conn.close()
+    material_rows = list(get_rfq_requested_material_rows(rfq_id) or [])
     if not estimate_row or not material_rows:
         return {
             "success": False,

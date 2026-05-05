@@ -74,21 +74,30 @@ def _get_connection_pool() -> ThreadedConnectionPool:
 
     with _POOL_LOCK:
         if _CONNECTION_POOL is None:
+            env_started_at = time.perf_counter()
             load_neon_env()
             db_url = get_required_env("DB_URL")
+            _perf_log("db", "connection.load_env", env_started_at)
+            pool_create_started_at = time.perf_counter()
             _CONNECTION_POOL = ThreadedConnectionPool(
                 minconn=_POOL_MIN_CONN,
                 maxconn=_POOL_MAX_CONN,
                 dsn=db_url,
             )
+            _perf_log("db", "connection.pool_create", pool_create_started_at)
     return _CONNECTION_POOL
 
 
 def get_connection():
     started_at = time.perf_counter()
     try:
+        pool_started_at = time.perf_counter()
         pool = _get_connection_pool()
-        return _PooledConnection(pool, pool.getconn())
+        _perf_log("db", "get_connection.pool_ready", pool_started_at)
+        getconn_started_at = time.perf_counter()
+        connection = pool.getconn()
+        _perf_log("db", "get_connection.pool_getconn", getconn_started_at)
+        return _PooledConnection(pool, connection)
     finally:
         _perf_log("db", "get_connection", started_at)
 

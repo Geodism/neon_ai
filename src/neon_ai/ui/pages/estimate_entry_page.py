@@ -4,6 +4,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from neon_ai.database.customers import get_all_customers, get_sites_for_customer
 from neon_ai.database.estimates import (
+    DEFAULT_MATERIAL_PST_RATE,
     get_all_estimate_summaries,
     get_dashboard_estimates,
     get_detailed_estimate_data,
@@ -263,19 +265,23 @@ class EstimateEntryPage(QWidget):
         self.m_qty = QLineEdit()
         self.m_qty.setMaximumWidth(70)
         mat_stage_layout.addWidget(self.m_qty)
-        mat_stage_layout.addWidget(QLabel("Unit Cost ($):"))
+        mat_stage_layout.addWidget(QLabel("Net Cost ($):"))
         self.m_cost = QLineEdit()
         self.m_cost.setMaximumWidth(80)
         mat_stage_layout.addWidget(self.m_cost)
+        self.m_pst_taxable = QCheckBox("PST?")
+        self.m_pst_taxable.setChecked(True)
+        self.m_pst_taxable.setToolTip("BC PST burden is included in estimate material cost when checked.")
+        mat_stage_layout.addWidget(self.m_pst_taxable)
         self.add_material_button = QPushButton("Add Material")
         self.add_material_button.clicked.connect(self.add_material)
         mat_stage_layout.addStretch(1)
         mat_stage_layout.addWidget(self.add_material_button)
         mat_layout.addWidget(mat_stage)
 
-        self.mat_table = LedgerTable(self.remove_material_line, 0, 8)
+        self.mat_table = LedgerTable(self.remove_material_line, 0, 10)
         self.mat_table.setHorizontalHeaderLabels(
-            ["Description", "Qty", "Unit Cost", "Cost Total", "Sell Total", "ItemID", "PartNumber", "EstimateMaterialID"]
+            ["Description", "Qty", "Net Cost", "PST?", "Total Cost", "Sell Total", "ItemID", "PartNumber", "EstimateMaterialID", "PSTRate"]
         )
         self.mat_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.mat_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -283,11 +289,14 @@ class EstimateEntryPage(QWidget):
         self.mat_table.setColumnWidth(0, 220)
         self.mat_table.setColumnWidth(1, 70)
         self.mat_table.setColumnWidth(2, 80)
-        self.mat_table.setColumnWidth(3, 90)
+        self.mat_table.setColumnWidth(3, 55)
         self.mat_table.setColumnWidth(4, 90)
-        self.mat_table.setColumnHidden(5, True)
+        self.mat_table.setColumnWidth(5, 90)
         self.mat_table.setColumnHidden(6, True)
         self.mat_table.setColumnHidden(7, True)
+        self.mat_table.setColumnHidden(8, True)
+        self.mat_table.setColumnHidden(9, True)
+        self.mat_table.itemChanged.connect(self.on_material_table_item_changed)
         mat_layout.addWidget(self.mat_table)
         layout.addWidget(mat_group)
 
@@ -536,7 +545,10 @@ class EstimateEntryPage(QWidget):
                 desc = row.get("Description") or "Material"
                 qty = float(row.get("Quantity") or 0)
                 unit_cost = float(row.get("UnitCost") or 0)
-                cost = float(row.get("LineTotal") or (qty * unit_cost))
+                raw_pst_taxable = row.get("PSTTaxable")
+                pst_taxable = True if raw_pst_taxable is None else str(raw_pst_taxable).strip().lower() not in {"0", "false", "no", "off"}
+                pst_rate = float(row.get("PSTRate") or DEFAULT_MATERIAL_PST_RATE)
+                cost = float(row.get("LineTotal") or self._calculate_material_cost_total(qty, unit_cost, pst_taxable, pst_rate))
                 sell = cost * (1 + m_mu)
                 self._append_material_row(
                     desc,
@@ -547,6 +559,8 @@ class EstimateEntryPage(QWidget):
                     row.get("ItemID"),
                     row.get("PartNumber"),
                     row.get("EstimateMaterialID"),
+                    pst_taxable,
+                    pst_rate,
                 )
 
             self.update_grand_total()
@@ -581,11 +595,20 @@ class EstimateEntryPage(QWidget):
             self.m_desc,
             self.m_qty,
             self.m_cost,
+            self.m_pst_taxable,
             self.add_labor_button,
             self.add_material_button,
             self.save_button,
         ]:
             widget.setEnabled(enabled)
+        for row in range(self.mat_table.rowCount()):
+            pst_item = self.mat_table.item(row, 3)
+            if pst_item is None:
+                continue
+            flags = pst_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if lock:
+                flags = flags & ~Qt.ItemFlag.ItemIsEnabled
+            pst_item.setFlags(flags)
 
     def load_sites(self, _value: str | None = None) -> None:
         customer_name = self.customer_combo.currentText()
@@ -645,29 +668,108 @@ class EstimateEntryPage(QWidget):
         item_id,
         part_no,
         est_mat_id,
+        pst_taxable: bool = True,
+        pst_rate: float = DEFAULT_MATERIAL_PST_RATE,
     ) -> None:
         row = self.mat_table.rowCount()
-        self.mat_table.insertRow(row)
-        values = [
-            desc,
-            f"{qty:.2f}",
-            f"${unit_cost:.2f}",
-            f"${cost_total:,.2f}",
-            f"${sell_total:,.2f}",
-            "" if item_id is None else str(item_id),
-            "" if part_no is None else str(part_no),
-            "" if est_mat_id is None else str(est_mat_id),
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if column in (1, 2, 3, 4):
-                item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignCenter if column == 1 else Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                )
-            self.mat_table.setItem(row, column, item)
+        blocker = self.mat_table.blockSignals(True)
+        try:
+            self.mat_table.insertRow(row)
+            values = [
+                desc,
+                f"{qty:.2f}",
+                f"${unit_cost:.2f}",
+                "",
+                f"${cost_total:,.2f}",
+                f"${sell_total:,.2f}",
+                "" if item_id is None else str(item_id),
+                "" if part_no is None else str(part_no),
+                "" if est_mat_id is None else str(est_mat_id),
+                f"{float(pst_rate):.4f}",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 3:
+                    flags = item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                    if self.form_locked:
+                        flags = flags & ~Qt.ItemFlag.ItemIsEnabled
+                    item.setFlags(flags)
+                    item.setCheckState(Qt.CheckState.Checked if pst_taxable else Qt.CheckState.Unchecked)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                elif column in (1, 2, 4, 5):
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter if column == 1 else Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                self.mat_table.setItem(row, column, item)
+        finally:
+            self.mat_table.blockSignals(blocker)
+        self._update_material_row_costs(row)
 
     def _parse_currency(self, text: str) -> float:
         return float(str(text).replace("$", "").replace(",", "").strip() or 0)
+
+    def _material_row_pst_taxable(self, row: int) -> bool:
+        item = self.mat_table.item(row, 3)
+        if item is None:
+            return True
+        return item.checkState() == Qt.CheckState.Checked
+
+    def _material_row_pst_rate(self, row: int) -> float:
+        item = self.mat_table.item(row, 9)
+        try:
+            return max(float(item.text() if item else DEFAULT_MATERIAL_PST_RATE), 0.0)
+        except ValueError:
+            return DEFAULT_MATERIAL_PST_RATE
+
+    def _calculate_material_cost_total(self, qty: float, unit_cost: float, pst_taxable: bool, pst_rate: float) -> float:
+        base_total = qty * unit_cost
+        if not pst_taxable:
+            return base_total
+        return base_total * (1 + pst_rate)
+
+    def _update_material_row_costs(self, row: int) -> None:
+        qty = float(self.mat_table.item(row, 1).text() or 0)
+        unit_cost = self._parse_currency(self.mat_table.item(row, 2).text())
+        pst_taxable = self._material_row_pst_taxable(row)
+        pst_rate = self._material_row_pst_rate(row)
+        base_total = qty * unit_cost
+        pst_amount = base_total * pst_rate if pst_taxable else 0.0
+        cost_total = self._calculate_material_cost_total(qty, unit_cost, pst_taxable, pst_rate)
+        try:
+            mat_markup = float(self.mat_markup_edit.text() or 0) / 100
+        except ValueError:
+            mat_markup = 0.0
+        sell_total = cost_total * (1 + mat_markup)
+
+        blocker = self.mat_table.blockSignals(True)
+        try:
+            cost_item = self.mat_table.item(row, 4)
+            if cost_item is not None:
+                cost_item.setText(f"${cost_total:,.2f}")
+                cost_item.setToolTip(
+                    f"Base cost: ${base_total:,.2f}\n"
+                    f"PST burden: ${pst_amount:,.2f} at {pst_rate * 100:.2f}%\n"
+                    f"Estimate cost incl. PST: ${cost_total:,.2f}"
+                )
+            sell_item = self.mat_table.item(row, 5)
+            if sell_item is not None:
+                sell_item.setText(f"${sell_total:,.2f}")
+            pst_item = self.mat_table.item(row, 3)
+            if pst_item is not None:
+                pst_item.setToolTip(
+                    "Checked: estimate-side BC PST burden is included in material cost.\n"
+                    "Unchecked: estimate-side material cost stays pre-PST."
+                )
+        finally:
+            self.mat_table.blockSignals(blocker)
+
+    def on_material_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self.is_loading or self.form_locked:
+            return
+        if item.column() != 3:
+            return
+        self._update_material_row_costs(item.row())
+        self.update_grand_total()
 
     def recalculate_all_sell_prices(self, *_args) -> None:
         if self.is_loading or self.form_locked:
@@ -681,8 +783,8 @@ class EstimateEntryPage(QWidget):
                 self.labor_table.item(row, 4).setText(f"${(cost * (1 + l_mu)):,.2f}")
 
             for row in range(self.mat_table.rowCount()):
-                cost = self._parse_currency(self.mat_table.item(row, 3).text())
-                self.mat_table.item(row, 4).setText(f"${(cost * (1 + m_mu)):,.2f}")
+                cost = self._parse_currency(self.mat_table.item(row, 4).text())
+                self.mat_table.item(row, 5).setText(f"${(cost * (1 + m_mu)):,.2f}")
 
             self.update_grand_total()
         except ValueError:
@@ -690,7 +792,7 @@ class EstimateEntryPage(QWidget):
 
     def update_margin_display(self) -> None:
         try:
-            total_mat_cost = sum(self._parse_currency(self.mat_table.item(row, 3).text()) for row in range(self.mat_table.rowCount()))
+            total_mat_cost = sum(self._parse_currency(self.mat_table.item(row, 4).text()) for row in range(self.mat_table.rowCount()))
             total_lab_cost = sum(self._parse_currency(self.labor_table.item(row, 3).text()) for row in range(self.labor_table.rowCount()))
             mat_mu = float(self.mat_markup_edit.text() or 0) / 100
             lab_mu = float(self.lab_markup_edit.text() or 0) / 100
@@ -708,7 +810,7 @@ class EstimateEntryPage(QWidget):
         for row in range(self.labor_table.rowCount()):
             total += self._parse_currency(self.labor_table.item(row, 4).text())
         for row in range(self.mat_table.rowCount()):
-            total += self._parse_currency(self.mat_table.item(row, 4).text())
+            total += self._parse_currency(self.mat_table.item(row, 5).text())
         self.total_label.setText(f"ESTIMATED TOTAL: ${total:,.2f}")
         self.update_margin_display()
 
@@ -737,20 +839,23 @@ class EstimateEntryPage(QWidget):
             cost = float(self.m_cost.text() or 0)
             if not desc or qty <= 0:
                 return
-            cost_total = qty * cost
+            pst_taxable = self.m_pst_taxable.isChecked()
+            pst_rate = DEFAULT_MATERIAL_PST_RATE
+            cost_total = self._calculate_material_cost_total(qty, cost, pst_taxable, pst_rate)
             mat_markup = float(self.mat_markup_edit.text() or 0)
             sell_total = cost_total * (1 + (mat_markup / 100))
             item_id = getattr(self.m_desc, "current_item_id", None)
             part_no = getattr(self.m_desc, "current_part_no", None)
-            self._append_material_row(desc, qty, cost, cost_total, sell_total, item_id, part_no, None)
+            self._append_material_row(desc, qty, cost, cost_total, sell_total, item_id, part_no, None, pst_taxable, pst_rate)
             self.m_desc.setCurrentText("")
             self.m_qty.setText("")
             self.m_cost.setText("")
+            self.m_pst_taxable.setChecked(True)
             self.m_desc.current_item_id = None
             self.m_desc.current_part_no = None
             self.update_grand_total()
         except ValueError:
-            QMessageBox.critical(self, "Error", "Quantity and Unit Cost must be numbers.")
+            QMessageBox.critical(self, "Error", "Quantity and Net Cost must be numbers.")
 
     def remove_labor_line(self) -> None:
         if self.form_locked:
@@ -797,18 +902,21 @@ class EstimateEntryPage(QWidget):
 
             material_lines = []
             for row in range(self.mat_table.rowCount()):
-                item_id_text = self.mat_table.item(row, 5).text()
-                part_no_text = self.mat_table.item(row, 6).text()
-                est_mat_id_text = self.mat_table.item(row, 7).text()
+                item_id_text = self.mat_table.item(row, 6).text()
+                part_no_text = self.mat_table.item(row, 7).text()
+                est_mat_id_text = self.mat_table.item(row, 8).text()
+                pst_rate_text = self.mat_table.item(row, 9).text()
                 material_lines.append(
                     [
                         self.mat_table.item(row, 0).text(),
                         float(self.mat_table.item(row, 1).text()),
                         self._parse_currency(self.mat_table.item(row, 2).text()),
-                        self._parse_currency(self.mat_table.item(row, 3).text()),
+                        self._parse_currency(self.mat_table.item(row, 4).text()),
                         int(item_id_text) if item_id_text not in ("", "None") else None,
                         part_no_text if part_no_text not in ("", "None") else None,
                         int(est_mat_id_text) if est_mat_id_text not in ("", "None") else None,
+                        self._material_row_pst_taxable(row),
+                        float(pst_rate_text or DEFAULT_MATERIAL_PST_RATE),
                     ]
                 )
 
@@ -859,6 +967,7 @@ class EstimateEntryPage(QWidget):
         self.m_desc.setCurrentText("")
         self.m_qty.setText("")
         self.m_cost.setText("")
+        self.m_pst_taxable.setChecked(True)
         self.m_desc.current_item_id = None
         self.m_desc.current_part_no = None
         self.update_grand_total()
