@@ -5,6 +5,7 @@ import re
 import shutil
 import time
 from typing import Any
+from neon_ai.automation.runtime_flags import require_legacy_automation_runtime
 from neon_ai.database.connection import get_connection
 from psycopg2.extras import RealDictCursor
 
@@ -1618,6 +1619,10 @@ def get_backordered_purchase_orders():
 
 
 def sweep_for_backordered_purchase_orders():
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: runs the old backorder reminder automation only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.purchases.sweep_for_backordered_purchase_orders"):
+        return
+
     from neon_ai.gateway import MY_EMAIL, send_to_user
     from neon_ai.database.automation import log_estimate_action
 
@@ -1768,7 +1773,10 @@ def _run_legacy_locked_purchase_order_auto_send():
 
 
 def sweep_for_locked_purchase_orders():
-    """Fence legacy PO auto-send so locked purchase orders require explicit manual send."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: fences the old locked-purchase-order sweeper behind the explicit legacy runtime flag."""
+    if not require_legacy_automation_runtime("database.purchases.sweep_for_locked_purchase_orders"):
+        return
+
     if _legacy_po_auto_send_enabled():
         print(
             f"PO Sweeper: {LEGACY_PO_AUTO_SEND_ENV}=1 detected. "
@@ -1886,7 +1894,10 @@ def mark_purchase_order_sent(
 
 
 def process_inbound_vendor_po_email(po_id: int, sender_email: str, subject: str, body: str, attachment_path: str = None, received_at=None):
-    """Processes ETA updates, ready-for-pickup notices, and receipt updates tied to a PO."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: processes old inbound vendor PO email automation only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.purchases.process_inbound_vendor_po_email"):
+        return {"skipped": True, "reason": "legacy_automation_disabled"}
+
     from neon_ai.database.automation import log_estimate_action
     from neon_ai.database.rfq import extract_text_from_attachment, ocr_pdf_attachment
     from neon_ai.gateway import send_to_user
@@ -2036,7 +2047,10 @@ def process_inbound_vendor_po_email(po_id: int, sender_email: str, subject: str,
 
 
 def sweep_for_po_eta_followups():
-    """Handles owner reminders after ETA slips and weekly vendor check-ins for long-lead POs."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: handles old owner reminders after ETA slips and weekly vendor check-ins only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.purchases.sweep_for_po_eta_followups"):
+        return
+
     from neon_ai.gateway import MY_EMAIL, send_to_user
     from neon_ai.database.automation import log_estimate_action
 
@@ -2431,6 +2445,77 @@ def get_po_items_with_receiving(po_id: int):
         ''', (po_id,)) # <--- MY MISTAKE WAS HERE! I forgot to add this tuple!
         
         return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_po_items_with_receiving_match_context(po_id: int):
+    """Return PO receiving rows with PO/quote/catalogue lineage for staged receipt review."""
+    ensure_purchase_schema()
+    from neon_ai.database.connection import get_connection
+    from psycopg2.extras import RealDictCursor
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                poi."POItemID",
+                poi."PurchaseOrderID",
+                poi."MaterialID",
+                poi."CatalogItemID",
+                COALESCE(poi."Description", em_po."Description", m_catalog."Description") AS "PODescription",
+                poi."QuantityOrdered",
+                poi."QuantityReceived",
+                (poi."QuantityOrdered" - COALESCE(poi."QuantityReceived", 0)) AS "Remaining",
+                sl."POItemSourceLinkID",
+                sl."RFQCarriedSelectionID",
+                sl."PriceRequestID",
+                sl."PRItemID",
+                sl."VendorID",
+                sl."EstimateID",
+                sl."MaterialID" AS "SourceEstimateMaterialID",
+                sl."MaterialCallID",
+                sl."MaterialCallItemID",
+                COALESCE(
+                    NULLIF(TRIM(mci."PartNumber"), ''),
+                    NULLIF(TRIM(em_source."PartNumber"), ''),
+                    NULLIF(TRIM(m_source."PartNumber"), ''),
+                    ''
+                ) AS "VendorQuotePartNumber",
+                COALESCE(
+                    NULLIF(TRIM(mci."Description"), ''),
+                    NULLIF(TRIM(em_source."Description"), ''),
+                    NULLIF(TRIM(m_source."Description"), ''),
+                    ''
+                ) AS "VendorQuoteDescription",
+                COALESCE(pri."QuantityOverride", mci."Quantity", em_source."Quantity", 0) AS "VendorQuoteQuantity",
+                pri."QuotedUnitPrice" AS "VendorQuotedUnitPrice",
+                COALESCE(
+                    NULLIF(TRIM(em_po."PartNumber"), ''),
+                    NULLIF(TRIM(m_catalog."PartNumber"), ''),
+                    ''
+                ) AS "InternalMaterialPartNumber",
+                COALESCE(
+                    NULLIF(TRIM(m_catalog."PartNumber"), ''),
+                    NULLIF(TRIM(m_source."PartNumber"), ''),
+                    ''
+                ) AS "CataloguePartNumber"
+            FROM "PurchaseOrderItem" poi
+            LEFT JOIN "PurchaseOrderItemSourceLink" sl ON sl."POItemID" = poi."POItemID"
+            LEFT JOIN "PriceRequestItem" pri ON sl."PRItemID" = pri."PRItemID"
+            LEFT JOIN "MaterialCallItem" mci ON sl."MaterialCallItemID" = mci."MaterialCallItemID"
+            LEFT JOIN "EstimateMaterial" em_source ON COALESCE(sl."MaterialID", pri."MaterialID") = em_source."EstimateMaterialID"
+            LEFT JOIN "EstimateMaterial" em_po ON poi."MaterialID" = em_po."EstimateMaterialID"
+            LEFT JOIN "Material" m_source ON COALESCE(mci."MaterialID", em_source."ItemID") = m_source."ItemID"
+            LEFT JOIN "Material" m_catalog ON poi."CatalogItemID" = m_catalog."ItemID"
+            WHERE poi."PurchaseOrderID" = %s
+            ORDER BY poi."POItemID" ASC
+            ''',
+            (po_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
 

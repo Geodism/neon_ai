@@ -4,6 +4,7 @@ import datetime
 import textwrap
 from typing import Dict, List, Optional
 from docx import Document
+from neon_ai.automation.runtime_flags import require_legacy_automation_runtime
 from neon_ai.database.connection import get_connection
 from neon_ai.database.folders import get_target_folder
 from neon_ai.doc_generator import export_estimate_doc
@@ -785,7 +786,10 @@ def has_follow_up_reminder_been_sent(estimate_id):
         conn.close()
 
 def sweep_for_sent_estimate_followups():
-    """Notifies the owner when a sent estimate has been waiting 48+ hours without a customer decision."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: notifies the owner when a sent estimate has been waiting 48+ hours without a customer decision."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_sent_estimate_followups"):
+        return
+
     from neon_ai.gateway import send_to_user
 
     conn = get_connection()
@@ -890,7 +894,10 @@ def has_rfq_completion_nudge_been_sent(estimate_id):
         conn.close()
 
 def sweep_for_completed_rfq_estimates():
-    """Nudges the owner once all RFQs are resolved but the estimate still has not been sent."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: nudges the owner once all RFQs are resolved but the estimate still has not been sent."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_completed_rfq_estimates"):
+        return
+
     from neon_ai.gateway import send_to_user
 
     conn = get_connection()
@@ -975,7 +982,10 @@ def has_estimate_age_reminder_been_sent(estimate_id):
         conn.close()
 
 def sweep_for_aging_unsent_estimates():
-    """Reminds the owner when an estimate has existed for 4+ days without being sent."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: reminds the owner when an estimate has existed for 4+ days without being sent."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_aging_unsent_estimates"):
+        return
+
     from neon_ai.gateway import send_to_user
 
     conn = get_connection()
@@ -1031,7 +1041,10 @@ def sweep_for_aging_unsent_estimates():
         )
 
 def sweep_for_deposit_invoice_reminders():
-    """Reminds the owner when an accepted job still has no exported invoice after 24 hours."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: reminds the owner when an accepted job still has no exported invoice after 24 hours."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_deposit_invoice_reminders"):
+        return
+
     from neon_ai.gateway import send_to_user
 
     conn = get_connection()
@@ -1702,7 +1715,10 @@ def _run_legacy_locked_estimate_auto_send(cur) -> None:
 
 
 def sweep_for_locked_estimates():
-    """Fence legacy estimate auto-send so locked estimates require explicit Final Doc View send."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: fences the legacy estimate auto-send path behind the explicit legacy runtime flag."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_locked_estimates"):
+        return
+
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -1811,7 +1827,10 @@ def mark_estimate_ready(estimate_id: int):
         conn.close()
 
 def sweep_for_ready_leads():
-    """Hunts for 'READY' estimates, generates Lead Sheets, and resets to DRAFT."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: hunts for 'READY' estimates, generates Lead Sheets, and resets to DRAFT only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.automation.sweep_for_ready_leads"):
+        return
+
     from neon_ai.database.connection import get_connection
     from psycopg2.extras import RealDictCursor
     # Note: We already have notify_milton_of_ready_lead in this file, so we can just call it!

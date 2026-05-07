@@ -659,6 +659,44 @@ def record_vendor_quote_price(
     return wholesaler_name
 
 
+def record_vendor_quote_history_only(
+    cur,
+    item_id,
+    unit_price,
+    vendor_name,
+    vendor_id=None,
+    rfq_id=None,
+    pr_item_id=None,
+    quote_number=None,
+    quote_date=None,
+    vendor_part_number=None,
+    source_file_path=None,
+):
+    """Persist quote-history evidence without mutating Material pricing columns.
+
+    This helper exists so Receive Quotes and approval-gated quote apply can store
+    passive vendor history while protecting Material.InternalPrice and the wider
+    catalogue baseline from silent mutation.
+    """
+    wholesaler_name = infer_wholesaler_key(vendor_name)
+    insert_material_price_history(
+        cur,
+        item_id,
+        wholesaler_name=wholesaler_name or vendor_name or "Unknown",
+        unit_price=unit_price,
+        vendor_name=vendor_name,
+        vendor_id=vendor_id,
+        rfq_id=rfq_id,
+        pr_item_id=pr_item_id,
+        vendor_part_number=vendor_part_number,
+        vendor_quote_number=quote_number,
+        quote_date=quote_date,
+        source_type="Vendor Quote",
+        source_file_path=source_file_path,
+    )
+    return wholesaler_name
+
+
 def record_purchase_order_price(item_id, unit_price, vendor_name=None, vendor_id=None, vendor_part_number=None):
     """Stores the latest direct-purchase price back into the material catalog."""
     ensure_material_schema()

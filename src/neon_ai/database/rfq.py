@@ -7,6 +7,7 @@ import json
 import shutil
 import time
 from psycopg2.extras import RealDictCursor
+from neon_ai.automation.runtime_flags import require_legacy_automation_runtime
 from neon_ai.database.connection import get_connection
 from neon_ai.database.folders import get_target_folder
 from pypdf import PdfReader
@@ -1933,7 +1934,10 @@ def get_rfq_recipient_email(rfq_id):
     return matches[0].get("recipient_email")
 
 def sweep_for_outstanding_rfq_followups():
-    """Sends 48-hour vendor reminders and 72-hour owner follow-up alerts for outstanding RFQs."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: sends 48-hour vendor reminders and 72-hour owner follow-up alerts for outstanding RFQs only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.rfq.sweep_for_outstanding_rfq_followups"):
+        return
+
     from neon_ai.gateway import send_to_user
     from neon_ai.database.automation import log_estimate_action
 
@@ -2036,7 +2040,10 @@ def extract_rfq_id_from_text(subject, body):
     return int(match.group(1)) if match else None
 
 def find_matching_rfq_for_email(sender_email, subject="", body=""):
-    """Finds the RFQ most likely associated with an inbound vendor quote email."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: finds the RFQ most likely associated with an inbound vendor quote email only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.rfq.find_matching_rfq_for_email"):
+        return None
+
     print(f"[RFQ] Looking for RFQ match for sender={sender_email} subject={subject[:80]!r}")
     rfq_id = extract_rfq_id_from_text(subject, body)
     if rfq_id:
@@ -2387,6 +2394,12 @@ def build_email_quote_number(sender_email, received_at=None):
     return f"{stamp}_{sender_slug}"[:80]
 
 def update_material_catalog_prices(vendor_name: str, matched_prices: list):
+    """Legacy explicit catalogue/vendor-price updater.
+
+    Keep this helper for future operator-approved catalogue update flows.
+    Normal quote save / proposal apply / inbound quote ingest must not call it
+    silently because Material.InternalPrice is the protected internal baseline.
+    """
     print(f"[RFQ] Updating material catalog prices for vendor: {vendor_name}")
     from neon_ai.database.materials import ensure_material_schema, record_vendor_quote_price
 
@@ -2420,8 +2433,51 @@ def update_material_catalog_prices(vendor_name: str, matched_prices: list):
     finally:
         conn.close()
 
+
+def record_material_vendor_price_history(vendor_name: str, matched_prices: list):
+    """Persist passive vendor quote history without mutating catalogue baseline fields."""
+    print(f"[RFQ] Recording vendor quote history without catalogue baseline update for vendor: {vendor_name}")
+    from neon_ai.database.materials import ensure_material_schema, record_vendor_quote_history_only
+
+    ensure_material_schema()
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    recorded = 0
+    try:
+        for item in matched_prices:
+            if not item.get("item_id"):
+                continue
+            record_vendor_quote_history_only(
+                cur,
+                item_id=item["item_id"],
+                unit_price=item["unit_price"],
+                vendor_name=vendor_name,
+                vendor_id=item.get("vendor_id"),
+                rfq_id=item.get("rfq_id"),
+                pr_item_id=item.get("pr_item_id"),
+                quote_number=item.get("quote_number"),
+                quote_date=item.get("quote_date"),
+                vendor_part_number=item.get("vendor_part_number"),
+                source_file_path=item.get("source_file_path"),
+            )
+            recorded += 1
+        conn.commit()
+        print(
+            "[RFQ] Vendor quote history rows recorded: "
+            f"{recorded}. Catalogue baseline not updated by quote save; use future explicit catalogue update workflow."
+        )
+        return recorded
+    finally:
+        conn.close()
+
+
 def ingest_vendor_quote_email(rfq_id: int, sender_email: str, subject: str, body: str, attachment_path: str = None, received_at=None):
-    """Reconciles an inbound vendor quote email to an RFQ and updates draft estimate costs."""
+    """Reconciles an inbound vendor quote email to an RFQ and updates draft estimate costs.
+
+    Lower-level helper intentionally left callable for explicit manual/test flows; the legacy
+    automation fence lives at the gateway and process_inbound_vendor_rfq_email entry points.
+    """
     from neon_ai.database.estimates import sync_estimate_pricing_from_sources
     from neon_ai.database.automation import log_estimate_action
 
@@ -2529,7 +2585,7 @@ def ingest_vendor_quote_email(rfq_id: int, sender_email: str, subject: str, body
                 "source_file_path": archived_quote_path,
             }
         )
-    material_updates = update_material_catalog_prices(rfq_context["VendorName"], matched_prices_for_catalog)
+    material_history_rows = record_material_vendor_price_history(rfq_context["VendorName"], matched_prices_for_catalog)
 
     sync_result = sync_estimate_pricing_from_sources(rfq_context["EstimateID"])
     if sync_result["estimate_pricing_updated"]:
@@ -2550,7 +2606,8 @@ def ingest_vendor_quote_email(rfq_id: int, sender_email: str, subject: str, body
             f"Received wholesaler estimate from {rfq_context['VendorName']} for RFQ #{rfq_id}. "
             f"Source email: {sender_email}. Extraction used: {extraction_result['source']}. "
             f"Matched prices: {len(matched_prices)}. Unmatched items: {len(unmatched_items)}. "
-            f"Material catalog updates: {material_updates}. "
+            f"Vendor price history rows: {material_history_rows}. "
+            f"Catalogue baseline updates: 0 (protected; future explicit workflow required). "
             f"Archived quote: {archived_quote_path or 'Email body only'}. "
             f"{estimate_effect}"
         ),
@@ -2563,19 +2620,24 @@ def ingest_vendor_quote_email(rfq_id: int, sender_email: str, subject: str, body
         "estimate_id": rfq_context["EstimateID"],
         "vendor_name": rfq_context["VendorName"],
         "site_name": rfq_context["SiteName"],
-        "matched_count": len(matched_prices),
-        "unmatched_count": len(unmatched_items),
-        "material_updates": material_updates,
-        "archived_quote_path": archived_quote_path,
-        "quote_number": quote_number,
-        "estimate_status": sync_result["estimate_status"],
-        "estimate_pricing_updated": sync_result["estimate_pricing_updated"],
+            "matched_count": len(matched_prices),
+            "unmatched_count": len(unmatched_items),
+            "material_updates": 0,
+            "material_history_rows": material_history_rows,
+            "catalogue_baseline_updated": False,
+            "archived_quote_path": archived_quote_path,
+            "quote_number": quote_number,
+            "estimate_status": sync_result["estimate_status"],
+            "estimate_pricing_updated": sync_result["estimate_pricing_updated"],
         "extraction_source": extraction_result["source"],
         "extraction_candidates": extraction_result["candidates"],
     }
 
 def process_inbound_vendor_rfq_email(rfq_id: int, sender_email: str, subject: str, body: str, attachment_path: str = None, received_at=None):
-    """Routes a matched RFQ email either into quote ingestion or vendor-response tracking."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: routes a matched RFQ email either into quote ingestion or vendor-response tracking only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.rfq.process_inbound_vendor_rfq_email"):
+        return {"skipped": True, "reason": "legacy_automation_disabled"}
+
     extraction_result = extract_best_quote_text(body or "", attachment_path=attachment_path)
     if attachment_path or contains_likely_pricing(extraction_result["text"]):
         return ingest_vendor_quote_email(
@@ -2738,6 +2800,9 @@ def save_quote_response(
     quote_date: str,
     all_items_data: list,
     source_file_path: str = None,
+    *,
+    update_catalogue_baseline: bool = False,
+    record_vendor_price_history: bool = True,
 ):
     from neon_ai.database.automation import get_project_file_paths
     from neon_ai.database.estimates import _get_estimate_status
@@ -2857,7 +2922,13 @@ def save_quote_response(
                 }
             )
         vendor_name = next((row.get("VendorName") for row in metadata.values()), None)
-        material_updates = update_material_catalog_prices(vendor_name or "", matched_prices) if matched_prices else 0
+        material_updates = 0
+        material_history_rows = 0
+        if matched_prices:
+            if update_catalogue_baseline:
+                material_updates = update_material_catalog_prices(vendor_name or "", matched_prices)
+            elif record_vendor_price_history:
+                material_history_rows = record_material_vendor_price_history(vendor_name or "", matched_prices)
 
         return {
             "saved": True,
@@ -2869,6 +2940,11 @@ def save_quote_response(
             "estimate_updated_row_count": 0,
             "estimate_update_deferred_to_bid_compare": True,
             "material_updates": material_updates,
+            "material_history_rows": material_history_rows,
+            "catalogue_baseline_updated": bool(update_catalogue_baseline and material_updates),
+            "catalogue_update_policy": (
+                "Catalogue baseline not updated by quote save; use future explicit catalogue update workflow."
+            ),
             "quote_file_path": target_file_path,
         }
     except Exception:
@@ -2981,7 +3057,9 @@ def sync_quote_to_estimate(pr_item_id: int, quoted_price: float):
 
 
 def save_quote_and_carry_items(estimate_id: int, rfq_id: int, quote_no: str, quote_date: str,
-                               all_items_data: list, carried_mat_ids: list, source_file_path: str = None):
+                               all_items_data: list, carried_mat_ids: list, source_file_path: str = None,
+                               *, update_catalogue_baseline: bool = False,
+                               record_vendor_price_history: bool = True):
     from neon_ai.database.estimates import sync_estimate_pricing_from_sources
     from neon_ai.database.automation import get_project_file_paths
 
@@ -3114,7 +3192,13 @@ def save_quote_and_carry_items(estimate_id: int, rfq_id: int, quote_no: str, quo
                 }
             )
         vendor_name = next((row.get("VendorName") for row in metadata.values()), None)
-        material_updates = update_material_catalog_prices(vendor_name or "", matched_prices) if matched_prices else 0
+        material_updates = 0
+        material_history_rows = 0
+        if matched_prices:
+            if update_catalogue_baseline:
+                material_updates = update_material_catalog_prices(vendor_name or "", matched_prices)
+            elif record_vendor_price_history:
+                material_history_rows = record_material_vendor_price_history(vendor_name or "", matched_prices)
 
         return {
             "saved": True,
@@ -3123,6 +3207,11 @@ def save_quote_and_carry_items(estimate_id: int, rfq_id: int, quote_no: str, quo
             "estimate_status": sync_result["estimate_status"],
             "estimate_pricing_updated": sync_result["estimate_pricing_updated"],
             "material_updates": material_updates,
+            "material_history_rows": material_history_rows,
+            "catalogue_baseline_updated": bool(update_catalogue_baseline and material_updates),
+            "catalogue_update_policy": (
+                "Catalogue baseline not updated by quote save; use future explicit catalogue update workflow."
+            ),
             "quote_file_path": target_file_path,
         }
     except Exception as e:

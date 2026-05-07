@@ -1,6 +1,32 @@
 import time
 
+from psycopg2.extras import RealDictCursor
+
 from neon_ai.database.connection import get_connection
+
+
+NON_OPERATIONAL_WORK_ORDER_STATUSES = {"DRAFT", "PENDINGSTART"}
+
+
+def normalize_work_order_status(status: str | None) -> str:
+    text = str(status or "").strip()
+    if not text:
+        return ""
+    compact = text.replace("_", "").replace(" ", "").upper()
+    if compact == "PENDINGSTART":
+        return "PendingStart"
+    if compact == "DRAFT":
+        return "Draft"
+    if compact == "OPEN":
+        return "Open"
+    if compact == "CLOSED":
+        return "Closed"
+    return text
+
+
+def is_non_operational_work_order_status(status: str | None) -> bool:
+    normalized = normalize_work_order_status(status)
+    return normalized.replace(" ", "").replace("_", "").upper() in NON_OPERATIONAL_WORK_ORDER_STATUSES
 
 
 def _perf_log(area: str, name: str, started_at: float) -> None:
@@ -110,10 +136,13 @@ def get_dashboard_work_orders():
                     wo."WorkOrderID", 
                     COALESCE(wo."CreatedDate", 'N/A') AS "CreatedDate",
                     s."SiteName",
-                    CASE 
-                        WHEN wo."IsClosed" THEN 'CLOSED'
-                        ELSE 'OPEN'
-                    END as "Status",
+                    COALESCE(
+                        NULLIF(TRIM(wo."JobStatus"), ''),
+                        CASE
+                            WHEN COALESCE(wo."IsClosed", FALSE) THEN 'Closed'
+                            ELSE 'Open'
+                        END
+                    ) as "Status",
                     
                     -- The Baseline (Estimated Cost)
                     (
@@ -235,6 +264,143 @@ def insert_workorder(site_id, created_date, job_status, description, billing_typ
     """, (site_id, created_date, job_status, description, billing_type))
     conn.commit()
     conn.close()
+
+
+def create_work_order_draft_safe(
+    *,
+    estimate_id: int,
+    desired_status: str = "Draft",
+    created_by: str = "automation_apply",
+    source_tag: str = "work_order_draft_wrapper",
+):
+    normalized_status = normalize_work_order_status(desired_status)
+    if normalized_status not in {"Draft", "PendingStart"}:
+        raise ValueError("Safe WorkOrder draft creation requires JobStatus = Draft or PendingStart.")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            '''
+            SELECT
+                e."EstimateID",
+                e."SiteID",
+                COALESCE(e."Description", '') AS "EstimateDescription",
+                COALESCE(e."BillingType", '') AS "BillingType",
+                COALESCE(e."Status", '') AS "EstimateStatus",
+                COALESCE(e."IsConverted", FALSE) AS "IsConverted",
+                COALESCE(s."SiteName", '') AS "SiteName",
+                COALESCE(c."CustomerName", '') AS "CustomerName"
+            FROM "Estimate" e
+            JOIN "Site" s ON e."SiteID" = s."SiteID"
+            JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
+            WHERE e."EstimateID" = %s
+            ''',
+            (int(estimate_id),),
+        )
+        estimate_row = cur.fetchone()
+        if not estimate_row:
+            raise ValueError(f"Estimate #{estimate_id} could not be loaded for safe WorkOrder draft creation.")
+        if bool(estimate_row.get("IsConverted")):
+            raise ValueError(f"Estimate #{estimate_id} is already converted; safe WorkOrder draft wrapper will not create another WorkOrder.")
+        if not estimate_row.get("SiteID"):
+            raise ValueError("Safe WorkOrder draft creation requires a resolved Site.")
+        if not str(estimate_row.get("CustomerName") or "").strip():
+            raise ValueError("Safe WorkOrder draft creation requires a resolved Customer context.")
+
+        normalized_description = str(estimate_row.get("EstimateDescription") or "").strip() or f"Estimate #{int(estimate_id)}"
+        normalized_billing_type = str(estimate_row.get("BillingType") or "").strip() or "Project"
+        warnings: list[str] = []
+
+        cur.execute(
+            '''
+            SELECT
+                "WorkOrderID",
+                "SiteID",
+                COALESCE("Description", '') AS "Description",
+                COALESCE("BillingType", '') AS "BillingType",
+                COALESCE("JobStatus", '') AS "JobStatus",
+                COALESCE("IsApproved", FALSE) AS "IsApproved",
+                COALESCE("IsClosed", FALSE) AS "IsClosed",
+                "SourceEstimateID"
+            FROM "WorkOrder"
+            WHERE "SourceEstimateID" = %s
+            ORDER BY "WorkOrderID" DESC
+            ''',
+            (int(estimate_id),),
+        )
+        existing_rows = cur.fetchall() or []
+
+        reusable_rows = [
+            row
+            for row in existing_rows
+            if not bool(row.get("IsClosed"))
+            and not bool(row.get("IsApproved"))
+            and is_non_operational_work_order_status(row.get("JobStatus"))
+        ]
+        blocking_rows = [row for row in existing_rows if row not in reusable_rows]
+
+        if blocking_rows:
+            blocking_ids = ", ".join(str(int(row["WorkOrderID"])) for row in blocking_rows if row.get("WorkOrderID"))
+            raise ValueError(
+                f"Estimate #{estimate_id} already has operational or non-reusable WorkOrder context ({blocking_ids}); "
+                "safe WorkOrder draft wrapper will not create another WorkOrder."
+            )
+        if len(reusable_rows) > 1:
+            raise ValueError(
+                f"Estimate #{estimate_id} already has multiple draft/pending WorkOrders; safe WorkOrder draft wrapper cannot pick one deterministically."
+            )
+
+        draft_reused = False
+        if reusable_rows:
+            work_order_row = reusable_rows[0]
+            draft_reused = True
+            warnings.append(
+                f"Reused existing {normalize_work_order_status(work_order_row.get('JobStatus')) or 'Draft'} WorkOrder "
+                f"#{int(work_order_row['WorkOrderID'])} for Estimate #{estimate_id}."
+            )
+        else:
+            cur.execute(
+                '''
+                INSERT INTO "WorkOrder"
+                (
+                    "SiteID",
+                    "CreatedDate",
+                    "JobStatus",
+                    "Description",
+                    "BillingType",
+                    "IsApproved",
+                    "IsClosed",
+                    "SourceEstimateID"
+                )
+                VALUES (%s, CURRENT_DATE, %s, %s, %s, FALSE, FALSE, %s)
+                RETURNING *
+                ''',
+                (
+                    int(estimate_row["SiteID"]),
+                    normalized_status,
+                    normalized_description,
+                    normalized_billing_type,
+                    int(estimate_id),
+                ),
+            )
+            work_order_row = cur.fetchone()
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "work_order": work_order_row,
+        "draft_reused": draft_reused,
+        "warnings": warnings,
+        "source_estimate_id": int(estimate_id),
+        "created_by": str(created_by or "automation_apply").strip() or "automation_apply",
+        "source_tag": str(source_tag or "work_order_draft_wrapper").strip() or "work_order_draft_wrapper",
+    }
 
 def get_workorders():
     conn = get_connection()

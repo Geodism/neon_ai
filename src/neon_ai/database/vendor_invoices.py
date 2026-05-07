@@ -3,11 +3,13 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from decimal import Decimal
 
 from docx import Document
 from psycopg2.extras import Json, RealDictCursor
 
+from neon_ai.automation.runtime_flags import require_legacy_automation_runtime
 from neon_ai.database.connection import get_connection
 from neon_ai.database.folders import get_target_folder
 from neon_ai.database.purchases import (
@@ -400,6 +402,416 @@ def _find_vendor_invoice_by_number(po_id: int, invoice_number: str):
         return cur.fetchone()
     finally:
         conn.close()
+
+
+def _list_vendor_invoices_for_po(po_id: int, exclude_invoice_id: int | None = None):
+    ensure_vendor_invoice_schema()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        sql = '''
+            SELECT
+                "VendorInvoiceID",
+                "PurchaseOrderID",
+                COALESCE("VendorInvoiceNumber", '') AS "VendorInvoiceNumber",
+                COALESCE("VendorInvoiceDate"::text, '') AS "VendorInvoiceDate",
+                COALESCE("VendorInvoiceDueDate"::text, '') AS "VendorInvoiceDueDate",
+                COALESCE("VendorInvoiceAmount", 0) AS "VendorInvoiceAmount",
+                COALESCE("VendorInvoiceStatus", '') AS "VendorInvoiceStatus",
+                COALESCE("Description", '') AS "Description"
+            FROM "VendorInvoice"
+            WHERE "PurchaseOrderID" = %s
+        '''
+        params = [int(po_id)]
+        if exclude_invoice_id:
+            sql += ' AND "VendorInvoiceID" != %s'
+            params.append(int(exclude_invoice_id))
+        sql += ' ORDER BY "VendorInvoiceID" DESC'
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _normalize_compare_text(value) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _coerce_compare_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_line_compare_entries(line_candidates) -> list[dict]:
+    normalized = []
+    for item in line_candidates or []:
+        if not isinstance(item, dict):
+            continue
+        part_number = _normalize_compare_text(item.get("part_number"))
+        description = _normalize_compare_text(item.get("description"))
+        quantity = _coerce_compare_float(
+            item.get("quantity")
+            if item.get("quantity") not in (None, "")
+            else item.get("received_qty_candidate")
+            if item.get("received_qty_candidate") not in (None, "")
+            else item.get("invoice_qty")
+            if item.get("invoice_qty") not in (None, "")
+            else item.get("invoiced_qty")
+        )
+        line_amount = _coerce_compare_float(
+            item.get("line_amount")
+            if item.get("line_amount") not in (None, "")
+            else item.get("line_total")
+            if item.get("line_total") not in (None, "")
+            else item.get("invoice_line_total")
+            if item.get("invoice_line_total") not in (None, "")
+            else item.get("subtotal")
+        )
+        if not part_number and not description:
+            continue
+        normalized.append(
+            {
+                "part_number": part_number,
+                "description": description,
+                "quantity": round(float(quantity), 3) if quantity is not None else None,
+                "line_amount": round(float(line_amount), 2) if line_amount is not None else None,
+            }
+        )
+    return normalized
+
+
+def _build_line_compare_counter(entries: list[dict]) -> Counter:
+    counter = Counter()
+    for item in entries:
+        part_number = str(item.get("part_number") or "")
+        description = str(item.get("description") or "")
+        key = (
+            part_number,
+            "" if part_number else description,
+            item.get("quantity"),
+        )
+        counter[key] += 1
+    return counter
+
+
+def _summarize_line_similarity(incoming_lines: list[dict], existing_lines: list[dict]) -> dict:
+    incoming_counter = _build_line_compare_counter(incoming_lines)
+    existing_counter = _build_line_compare_counter(existing_lines)
+    overlap_counter = incoming_counter & existing_counter
+    overlap_count = int(sum(overlap_counter.values()))
+    incoming_count = int(sum(incoming_counter.values()))
+    existing_count = int(sum(existing_counter.values()))
+    incoming_qty_total = round(
+        sum(float(item.get("quantity") or 0.0) for item in incoming_lines if item.get("quantity") is not None),
+        3,
+    )
+    existing_qty_total = round(
+        sum(float(item.get("quantity") or 0.0) for item in existing_lines if item.get("quantity") is not None),
+        3,
+    )
+    strong_match = (
+        incoming_count > 0
+        and existing_count > 0
+        and overlap_count == min(incoming_count, existing_count)
+        and abs(incoming_qty_total - existing_qty_total) <= 0.001
+    )
+    return {
+        "incoming_line_count": incoming_count,
+        "existing_line_count": existing_count,
+        "overlapping_line_count": overlap_count,
+        "incoming_quantity_total": incoming_qty_total,
+        "existing_quantity_total": existing_qty_total,
+        "strong_match": strong_match,
+    }
+
+
+def _extract_receipt_identity_from_key(receipt_key: str | None) -> int | None:
+    text = str(receipt_key or "").strip()
+    if not text.startswith("receipt:"):
+        return None
+    try:
+        return int(text.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_receipt_context_for_duplicate_check(po_id: int, packing_slip_number: str) -> dict:
+    normalized_packing_slip = str(packing_slip_number or "").strip()
+    result = {
+        "receipt_key": None,
+        "receipt_id": None,
+        "receipt_ref": normalized_packing_slip or None,
+        "receipt_choices": [],
+    }
+    if not normalized_packing_slip:
+        return result
+
+    for choice in get_purchase_order_receipt_choices(int(po_id)):
+        result["receipt_choices"].append(
+            {
+                "ReceiptID": choice.get("ReceiptID"),
+                "Key": choice.get("Key"),
+                "DocumentRef": choice.get("DocumentRef"),
+            }
+        )
+        doc_ref = str(choice.get("DocumentRef") or "").strip()
+        if doc_ref and doc_ref.lower() == normalized_packing_slip.lower():
+            result["receipt_key"] = str(choice.get("Key") or "").strip() or None
+            result["receipt_id"] = int(choice["ReceiptID"]) if choice.get("ReceiptID") not in (None, "") else None
+            result["receipt_ref"] = doc_ref
+            break
+    return result
+
+
+def analyze_vendor_invoice_duplicate_risk(
+    *,
+    po_id: int,
+    invoice_number: str,
+    packing_slip_number: str = "",
+    total_amount: float | None = None,
+    line_candidates: list | None = None,
+    exclude_invoice_id: int | None = None,
+):
+    normalized_invoice_number = str(invoice_number or "").strip()
+    normalized_packing_slip = str(packing_slip_number or "").strip()
+    normalized_amount = float(total_amount or 0.0)
+    incoming_lines = _normalize_line_compare_entries(line_candidates or [])
+    incoming_receipt = _resolve_receipt_context_for_duplicate_check(int(po_id), normalized_packing_slip)
+
+    result = {
+        "supported": True,
+        "checked": True,
+        "duplicate_found": False,
+        "duplicate_outcome": None,
+        "duplicate_reason": None,
+        "review_required": False,
+        "review_reason": None,
+        "matched_purchase_order_id": int(po_id),
+        "matched_vendor_invoice_ids": [],
+        "existing_invoice_numbers": [],
+        "matching_packing_slip": normalized_packing_slip or None,
+        "matching_receipt_ids": [],
+        "matching_receipt_refs": [],
+        "exact_duplicate_vendor_invoice_id": None,
+        "reusable_existing_draft_id": None,
+        "amount_comparison": {
+            "input_total_amount": round(normalized_amount, 2) if normalized_amount else 0.0,
+            "matched_invoice_amounts": [],
+        },
+        "line_comparison_summary": {
+            "input_line_count": len(incoming_lines),
+            "strong_match_invoice_ids": [],
+            "comparisons": [],
+        },
+        "uncertainty_notes": [],
+        "existing_matches": [],
+    }
+
+    if not normalized_invoice_number and not normalized_packing_slip and not normalized_amount and not incoming_lines:
+        result["checked"] = False
+        result["uncertainty_notes"].append("Not enough invoice identity was supplied for semantic duplicate detection.")
+        return result
+
+    exact_duplicate = _find_vendor_invoice_by_number(int(po_id), normalized_invoice_number) if normalized_invoice_number else None
+    if exact_duplicate and (not exclude_invoice_id or int(exact_duplicate.get("VendorInvoiceID") or 0) != int(exclude_invoice_id)):
+        invoice_id = int(exact_duplicate.get("VendorInvoiceID") or 0)
+        existing_status = str(exact_duplicate.get("VendorInvoiceStatus") or "").strip() or "Draft"
+        result["duplicate_found"] = True
+        result["duplicate_outcome"] = "DUPLICATE_INVOICE_POSSIBLE"
+        result["duplicate_reason"] = (
+            f"Vendor invoice {normalized_invoice_number} already exists for PO #{po_id}."
+        )
+        result["exact_duplicate_vendor_invoice_id"] = invoice_id
+        result["matched_vendor_invoice_ids"] = [invoice_id]
+        result["existing_invoice_numbers"] = [str(exact_duplicate.get("VendorInvoiceNumber") or normalized_invoice_number)]
+        if existing_status == "Draft":
+            result["reusable_existing_draft_id"] = invoice_id
+        existing_amount = _coerce_compare_float(exact_duplicate.get("VendorInvoiceAmount"))
+        result["amount_comparison"]["matched_invoice_amounts"].append(
+            {
+                "vendor_invoice_id": invoice_id,
+                "invoice_number": str(exact_duplicate.get("VendorInvoiceNumber") or normalized_invoice_number),
+                "invoice_total_amount": round(existing_amount, 2) if existing_amount is not None else None,
+                "difference": round(abs(existing_amount - normalized_amount), 2)
+                if existing_amount is not None and normalized_amount
+                else None,
+            }
+        )
+        return result
+
+    severity_rank = {
+        "DUPLICATE_PACKING_SLIP_INVOICE_POSSIBLE": 4,
+        "DUPLICATE_RECEIPT_BILLING_POSSIBLE": 3,
+        "POSSIBLE_REBILL_OF_ALREADY_INVOICED_PARTS": 2,
+        "DUPLICATE_INVOICE_POSSIBLE": 1,
+    }
+    chosen_match = None
+    existing_invoice_count = 0
+
+    for row in _list_vendor_invoices_for_po(int(po_id), exclude_invoice_id=exclude_invoice_id):
+        existing_invoice_count += 1
+        invoice_id = int(row.get("VendorInvoiceID") or 0)
+        memory = get_vendor_invoice_memory(invoice_id)
+        existing_number = str(row.get("VendorInvoiceNumber") or "").strip()
+        existing_amount = _coerce_compare_float(row.get("VendorInvoiceAmount"))
+        existing_packing_slip = str(
+            memory.get("packing_slip_number")
+            or memory.get("receipt_ref")
+            or ""
+        ).strip()
+        existing_receipt_key = str(memory.get("receipt_key") or "").strip()
+        existing_receipt_id = _extract_receipt_identity_from_key(existing_receipt_key)
+        existing_receipt_ref = str(memory.get("receipt_ref") or "").strip()
+        existing_lines = _normalize_line_compare_entries(memory.get("line_candidates") or memory.get("rows") or [])
+        amount_difference = (
+            abs(float(existing_amount) - normalized_amount)
+            if existing_amount is not None and normalized_amount
+            else None
+        )
+        similar_total = (
+            existing_amount is not None
+            and normalized_amount > 0
+            and amount_difference is not None
+            and amount_difference <= max(0.01, min(5.0, max(abs(existing_amount), abs(normalized_amount)) * 0.005))
+        )
+        line_similarity = _summarize_line_similarity(incoming_lines, existing_lines)
+        distinct_packing_slip_evidence = bool(
+            normalized_packing_slip
+            and existing_packing_slip
+            and existing_packing_slip.lower() != normalized_packing_slip.lower()
+        )
+        distinct_receipt_evidence = bool(
+            incoming_receipt.get("receipt_id") is not None
+            and existing_receipt_id is not None
+            and int(incoming_receipt["receipt_id"]) != int(existing_receipt_id)
+        ) or bool(
+            incoming_receipt.get("receipt_ref")
+            and existing_receipt_ref
+            and str(incoming_receipt["receipt_ref"]).strip().lower() != existing_receipt_ref.lower()
+        )
+        distinct_shipment_evidence = bool(distinct_packing_slip_evidence or distinct_receipt_evidence)
+
+        outcome = None
+        reason = None
+        if normalized_packing_slip and existing_packing_slip and existing_packing_slip.lower() == normalized_packing_slip.lower():
+            outcome = "DUPLICATE_PACKING_SLIP_INVOICE_POSSIBLE"
+            reason = (
+                f"Packing slip {normalized_packing_slip} is already linked to vendor invoice {existing_number or invoice_id} on PO #{po_id}."
+            )
+        elif (
+            incoming_receipt.get("receipt_id") is not None
+            and existing_receipt_id is not None
+            and int(incoming_receipt["receipt_id"]) == int(existing_receipt_id)
+        ) or (
+            incoming_receipt.get("receipt_ref")
+            and existing_receipt_ref
+            and str(incoming_receipt["receipt_ref"]).strip().lower() == existing_receipt_ref.lower()
+        ):
+            outcome = "DUPLICATE_RECEIPT_BILLING_POSSIBLE"
+            reason = (
+                f"Receipt evidence for {incoming_receipt.get('receipt_ref') or normalized_packing_slip or 'this invoice'} "
+                f"already appears on vendor invoice {existing_number or invoice_id} for PO #{po_id}."
+            )
+        elif similar_total and line_similarity.get("strong_match") and not distinct_shipment_evidence:
+            outcome = "POSSIBLE_REBILL_OF_ALREADY_INVOICED_PARTS"
+            reason = (
+                f"Invoice total and matched line quantities look like a rebill of parts already invoiced on PO #{po_id}."
+            )
+
+        result["line_comparison_summary"]["comparisons"].append(
+            {
+                "vendor_invoice_id": invoice_id,
+                "invoice_number": existing_number,
+                "same_total": bool(similar_total),
+                "amount_difference": round(float(amount_difference), 2) if amount_difference is not None else None,
+                "overlapping_line_count": int(line_similarity.get("overlapping_line_count") or 0),
+                "strong_match": bool(line_similarity.get("strong_match")),
+                "distinct_shipment_evidence": bool(distinct_shipment_evidence),
+            }
+        )
+        if line_similarity.get("strong_match"):
+            result["line_comparison_summary"]["strong_match_invoice_ids"].append(invoice_id)
+        if similar_total:
+            result["amount_comparison"]["matched_invoice_amounts"].append(
+                {
+                    "vendor_invoice_id": invoice_id,
+                    "invoice_number": existing_number,
+                    "invoice_total_amount": round(float(existing_amount), 2) if existing_amount is not None else None,
+                    "difference": round(float(amount_difference), 2) if amount_difference is not None else None,
+                }
+            )
+
+        if not outcome:
+            continue
+
+        result["duplicate_found"] = True
+        result["matched_vendor_invoice_ids"].append(invoice_id)
+        if existing_number:
+            result["existing_invoice_numbers"].append(existing_number)
+        if existing_receipt_id is not None:
+            result["matching_receipt_ids"].append(existing_receipt_id)
+        if existing_receipt_ref:
+            result["matching_receipt_refs"].append(existing_receipt_ref)
+        result["existing_matches"].append(
+            {
+                "vendor_invoice_id": invoice_id,
+                "invoice_number": existing_number,
+                "vendor_invoice_status": str(row.get("VendorInvoiceStatus") or "").strip(),
+                "packing_slip_number": existing_packing_slip or None,
+                "receipt_id": existing_receipt_id,
+                "receipt_ref": existing_receipt_ref or None,
+                "same_total": bool(similar_total),
+                "line_similarity": line_similarity,
+                "distinct_shipment_evidence": bool(distinct_shipment_evidence),
+                "duplicate_outcome": outcome,
+            }
+        )
+        current_rank = severity_rank.get(outcome, 0)
+        chosen_rank = severity_rank.get(chosen_match["outcome"], 0) if chosen_match else -1
+        if current_rank > chosen_rank:
+            chosen_match = {
+                "outcome": outcome,
+                "reason": reason,
+            }
+
+    if chosen_match:
+        result["duplicate_outcome"] = chosen_match["outcome"]
+        result["duplicate_reason"] = chosen_match["reason"]
+        if chosen_match["outcome"] == "POSSIBLE_REBILL_OF_ALREADY_INVOICED_PARTS":
+            result["uncertainty_notes"].append(
+                "Similar total and line quantities matched a prior vendor invoice. Operator review is required before any new draft is staged."
+            )
+
+    has_incoming_shipment_identity = bool(
+        normalized_packing_slip
+        or incoming_receipt.get("receipt_id") is not None
+        or str(incoming_receipt.get("receipt_ref") or "").strip()
+    )
+    has_incoming_line_identity = bool(incoming_lines)
+    if (
+        not result["duplicate_found"]
+        and existing_invoice_count > 0
+        and not has_incoming_shipment_identity
+        and not has_incoming_line_identity
+    ):
+        result["review_required"] = True
+        result["review_reason"] = (
+            f"PO #{po_id} already has vendor invoice history, but this invoice does not include enough shipment evidence "
+            "to distinguish it from prior billing. Review before staging a new draft payable record."
+        )
+        result["uncertainty_notes"].append(
+            "Prior invoices exist on this PO, but no packing slip, receipt, or line-level shipment evidence was supplied for this invoice."
+        )
+
+    result["matched_vendor_invoice_ids"] = sorted({int(value) for value in result["matched_vendor_invoice_ids"] if value not in (None, "")})
+    result["existing_invoice_numbers"] = sorted({str(value) for value in result["existing_invoice_numbers"] if str(value or "").strip()})
+    result["matching_receipt_ids"] = sorted({int(value) for value in result["matching_receipt_ids"] if value not in (None, "")})
+    result["matching_receipt_refs"] = sorted({str(value) for value in result["matching_receipt_refs"] if str(value or "").strip()})
+    return result
 
 
 def _next_vendor_invoice_number(po_id: int):
@@ -967,6 +1379,158 @@ def save_vendor_invoice_draft(
     return invoice
 
 
+def create_vendor_invoice_intake_draft(
+    *,
+    po_id: int,
+    invoice_number: str,
+    invoice_date: str = "",
+    due_date: str = "",
+    total_amount: float | None = None,
+    description: str = "",
+    vendor_name: str = "",
+    packing_slip_number: str = "",
+    line_candidates: list | None = None,
+    source_proposal_id: int | None = None,
+    source_inbound_message_id: int | None = None,
+    applied_by: str = "automation_apply",
+):
+    ensure_vendor_invoice_schema()
+    po_header = get_po_export_data(int(po_id))
+    if not po_header:
+        raise ValueError(f"PurchaseOrder #{po_id} could not be found.")
+
+    normalized_invoice_number = str(invoice_number or "").strip()
+    if not normalized_invoice_number:
+        raise ValueError("Vendor invoice draft intake requires an invoice number.")
+
+    normalized_vendor_name = str(vendor_name or "").strip()
+    normalized_packing_slip = str(packing_slip_number or "").strip()
+    normalized_description = str(description or "").strip() or "Vendor invoice draft created from approved automation intake."
+    normalized_amount = float(total_amount or 0.0)
+
+    duplicate_result = analyze_vendor_invoice_duplicate_risk(
+        po_id=int(po_id),
+        invoice_number=normalized_invoice_number,
+        packing_slip_number=normalized_packing_slip,
+        total_amount=normalized_amount,
+        line_candidates=line_candidates or [],
+    )
+    if (duplicate_result.get("duplicate_found") or duplicate_result.get("review_required")) and not duplicate_result.get("reusable_existing_draft_id"):
+        raise ValueError(
+            str(
+                duplicate_result.get("duplicate_reason")
+                or duplicate_result.get("review_reason")
+                or f"Possible duplicate vendor invoice intake detected for PO #{po_id}."
+            )
+        )
+
+    existing = _find_vendor_invoice_by_number(int(po_id), normalized_invoice_number)
+    draft_reused = False
+    if existing:
+        current_status = str(existing.get("VendorInvoiceStatus") or "").strip() or "Draft"
+        if current_status != "Draft":
+            raise ValueError(
+                f"Vendor invoice {normalized_invoice_number} already exists for PO #{po_id} with status {current_status}."
+            )
+        existing_amount = float(existing.get("VendorInvoiceAmount") or 0.0)
+        existing_invoice_date = str(existing.get("VendorInvoiceDate") or "").strip()
+        existing_due_date = str(existing.get("VendorInvoiceDueDate") or "").strip()
+        if normalized_amount and existing_amount and abs(existing_amount - normalized_amount) > 0.01:
+            raise ValueError(
+                f"Vendor invoice {normalized_invoice_number} already exists as Draft for PO #{po_id} with a different amount."
+            )
+        if invoice_date and existing_invoice_date and existing_invoice_date != invoice_date:
+            raise ValueError(
+                f"Vendor invoice {normalized_invoice_number} already exists as Draft for PO #{po_id} with a different invoice date."
+            )
+        if due_date and existing_due_date and existing_due_date != due_date:
+            raise ValueError(
+                f"Vendor invoice {normalized_invoice_number} already exists as Draft for PO #{po_id} with a different due date."
+            )
+        draft_reused = True
+        invoice_row = _upsert_vendor_invoice_row(
+            invoice_id=int(existing["VendorInvoiceID"]),
+            invoice_number=normalized_invoice_number,
+            invoice_date=invoice_date or existing_invoice_date or datetime.date.today().isoformat(),
+            due_date=due_date or existing_due_date,
+            amount=normalized_amount or existing_amount,
+            description=normalized_description or str(existing.get("Description") or "").strip(),
+            status="Draft",
+        )
+    else:
+        invoice_row = _upsert_vendor_invoice_row(
+            po_id=int(po_id),
+            invoice_number=normalized_invoice_number,
+            invoice_date=invoice_date or datetime.date.today().isoformat(),
+            due_date=due_date,
+            amount=normalized_amount,
+            description=normalized_description,
+            status="Draft",
+        )
+
+    invoice_id = int(invoice_row["VendorInvoiceID"])
+    existing_memory = get_vendor_invoice_memory(invoice_id)
+    receipt_key = existing_memory.get("receipt_key") or "all_received"
+    receipt_label = existing_memory.get("receipt_label") or "All received material on this PO"
+    receipt_ref = existing_memory.get("receipt_ref") or ""
+    receipt_date = existing_memory.get("receipt_date") or ""
+
+    if normalized_packing_slip:
+        for choice in get_purchase_order_receipt_choices(int(po_id)):
+            doc_ref = str(choice.get("DocumentRef") or "").strip()
+            if doc_ref and doc_ref.lower() == normalized_packing_slip.lower():
+                receipt_key = str(choice.get("Key") or receipt_key)
+                receipt_label = str(choice.get("Label") or receipt_label)
+                receipt_ref = doc_ref
+                receipt_date = str(choice.get("ReceiveDate") or receipt_date)
+                break
+
+    default_rows = _build_default_invoice_rows(int(po_id), invoice_id, receipt_key)
+    default_row_total = round(sum(float(row.get("subtotal") or 0.0) for row in default_rows), 2)
+    warnings = []
+    if normalized_amount and abs(default_row_total - normalized_amount) > 0.01:
+        warnings.append(
+            "Extracted invoice total differs from PO/receipt-based default draft rows. Operator reconciliation is still required."
+        )
+
+    memory_payload = dict(existing_memory or {})
+    memory_payload.update(
+        {
+            "po_id": int(po_id),
+            "rows": default_rows,
+            "receipt_key": receipt_key,
+            "receipt_label": receipt_label,
+            "receipt_ref": receipt_ref,
+            "receipt_date": receipt_date,
+            "source_proposal_id": source_proposal_id,
+            "source_inbound_message_id": source_inbound_message_id,
+            "draft_origin": "automation_apply_vendor_invoice_intake",
+            "applied_by": applied_by,
+            "invoice_number": normalized_invoice_number,
+            "invoice_date": invoice_date or str(invoice_row.get("VendorInvoiceDate") or "").strip(),
+            "due_date": due_date or str(invoice_row.get("VendorInvoiceDueDate") or "").strip(),
+            "invoice_total_amount": normalized_amount,
+            "vendor_name": normalized_vendor_name or str(po_header.get("VendorName") or "").strip(),
+            "packing_slip_number": normalized_packing_slip or None,
+            "line_candidates": line_candidates or [],
+            "default_row_total": default_row_total,
+            "warnings": warnings,
+            "duplicate_check_result": duplicate_result,
+            "last_updated_at": datetime.datetime.now().isoformat(),
+        }
+    )
+    upsert_vendor_invoice_memory(invoice_id, memory_payload)
+    return {
+        "invoice": invoice_row,
+        "draft_reused": draft_reused,
+        "po_id": int(po_id),
+        "default_row_total": default_row_total,
+        "warnings": warnings,
+        "duplicate_result": duplicate_result,
+        "memory": memory_payload,
+    }
+
+
 def generate_vendor_invoice_report(invoice_id: int, force: bool = False):
     payload = get_vendor_invoice_detail(invoice_id)
     if not payload:
@@ -1075,6 +1639,10 @@ def get_vendor_invoice_detail(invoice_id: int):
 
 
 def process_inbound_vendor_invoice_email(po_id: int, sender_email: str, subject: str, body: str, attachment_path: str = None, received_at=None):
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: processes old inbound vendor invoice email automation only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.vendor_invoices.process_inbound_vendor_invoice_email"):
+        return {"skipped": True, "reason": "legacy_automation_disabled"}
+
     from neon_ai.gateway import send_to_user
 
     reference_date = received_at.date() if hasattr(received_at, "date") else datetime.date.today()
@@ -1230,6 +1798,10 @@ def get_vendor_payables_summary():
 
 
 def sweep_for_ready_to_pay_vendor_invoices():
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: runs the old ready-to-pay vendor invoice reminder sweeper only when explicitly enabled."""
+    if not require_legacy_automation_runtime("database.vendor_invoices.sweep_for_ready_to_pay_vendor_invoices"):
+        return
+
     from neon_ai.gateway import MY_EMAIL, send_to_user
 
     today = datetime.date.today()

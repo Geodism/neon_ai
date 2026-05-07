@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from neon_ai.database.material_calls import LEGACY_LOOSE_RFQ_DEBUG_ENV, legacy_loose_rfq_debug_enabled
 from neon_ai.ui.dialogs.tiber_dialog import launch_tiber
+from neon_ai.ui.pages.automation_center_page import AutomationCenterPage
 from neon_ai.ui.pages.customer_page import CustomerPage
 from neon_ai.ui.pages.dashboard_page import DashboardPage
 from neon_ai.ui.pages.document_control_page import DocumentControlPage
@@ -103,6 +104,9 @@ class NeonMainWindow(QMainWindow):
             "ðŸ§¾ INVOICING": [
                 MenuAction("Create Invoice", "InvoiceCreatorFrame"),
                 MenuAction("A/R & Tracking", "InvoiceViewerFrame"),
+            ],
+            "AUTOMATION": [
+                MenuAction("Automation Center", "AutomationCenterFrame"),
             ],
             "DOCUMENTS": [
                 MenuAction("Template & Document Control", "Template & Document Control"),
@@ -230,6 +234,7 @@ class NeonMainWindow(QMainWindow):
             "TimesheetManagerFrame": TimesheetManagerPage,
             "InvoiceCreatorFrame": InvoiceCreatorPage,
             "InvoiceViewerFrame": InvoiceViewerPage,
+            "AutomationCenterFrame": AutomationCenterPage,
             "Template & Document Control": DocumentControlPage,
             "VendorFrame": VendorPage,
             "VendorInvoiceFrame": VendorInvoicePage,

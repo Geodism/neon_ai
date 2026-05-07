@@ -10,6 +10,7 @@ import re
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 
+from neon_ai.automation.runtime_flags import require_legacy_automation_runtime
 from neon_ai.config import load_neon_env
 
 load_neon_env()
@@ -406,7 +407,10 @@ def process_customer_verification_reply(customer_id, email_subject, email_body):
     }
 
 def check_for_instructions():
-    """Main loop logic: Checks inbox, classifies content, and routes to DB or AI."""
+    """LEGACY_AUTOMATION_DISABLED_BY_DEFAULT: checks inbox, classifies content, and routes to old gateway automation only when explicitly enabled."""
+    if not require_legacy_automation_runtime("gateway.check_for_instructions"):
+        return None
+
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL_ADDR, EMAIL_PASS)

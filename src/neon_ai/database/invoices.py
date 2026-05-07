@@ -10,6 +10,7 @@ from neon_ai.database.connection import get_connection
 
 CUSTOMER_INVOICE_MEMORY_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "customer_invoice_memory.json")
 _INVOICE_SCHEMA_READY = False
+_NON_OPERATIONAL_WORK_ORDER_STATUSES = {"DRAFT", "PENDINGSTART"}
 
 
 def ensure_invoice_schema():
@@ -63,6 +64,14 @@ def _decode_invoice_memory(value):
         except Exception:
             return {}
     return {}
+
+
+def _is_non_operational_work_order_status(status: str | None) -> bool:
+    text = str(status or "").strip()
+    if not text:
+        return False
+    compact = text.replace("_", "").replace(" ", "").upper()
+    return compact in _NON_OPERATIONAL_WORK_ORDER_STATUSES
 
 
 def _read_customer_invoice_memory_from_db(invoice_id: int):
@@ -510,6 +519,182 @@ def save_invoice_draft(wo_id: int, data: dict):
     return draft
 
 
+def _normalize_invoice_billing_mode(raw_value) -> str:
+    text = str(raw_value or "").strip().lower()
+    if text in {"t&m", "time and materials", "time & materials"}:
+        return "T&M"
+    if text in {"stipulated", "stipulated price", "fixed price"}:
+        return "Stipulated"
+    if "time" in text and "material" in text:
+        return "T&M"
+    return "Stipulated"
+
+
+def _list_draft_invoices_for_workorder(cur, wo_id: int) -> list[dict]:
+    cur.execute(
+        '''
+        SELECT *
+        FROM "Invoice"
+        WHERE "WorkOrderID" = %s
+          AND COALESCE("InvoiceStatus", '') = 'Draft'
+        ORDER BY "CustomerInvoiceId" DESC
+        ''',
+        (wo_id,),
+    )
+    return list(cur.fetchall() or [])
+
+
+def _draft_invoice_has_export_or_send_evidence(invoice_row: dict | None) -> bool:
+    row = invoice_row or {}
+    return bool(
+        str(row.get("CustomerInvoiceDocPath") or "").strip()
+        or row.get("CustomerInvoiceSentAt")
+        or str(row.get("InvoiceStatus") or "").strip() in {"Exported", "Sent", "Paid"}
+    )
+
+
+def _derive_safe_customer_invoice_draft_amount(work_order_id: int, billing_mode: str) -> tuple[float, list[str]]:
+    warnings: list[str] = []
+    normalized_mode = _normalize_invoice_billing_mode(billing_mode)
+    if normalized_mode == "T&M":
+        labor_total = round(sum(float(row.get("LineTotal") or 0.0) for row in get_unbilled_labor(work_order_id)), 2)
+        material_total = round(sum(float(row.get("LineTotal") or 0.0) for row in get_unbilled_materials(work_order_id)), 2)
+        total_amount = round(labor_total + material_total, 2)
+        if total_amount <= 0:
+            warnings.append("No unbilled T&M labor or material value was available, so the draft invoice amount defaulted to 0.00.")
+        return total_amount, warnings
+
+    financial_summary = get_work_order_invoice_financial_summary(work_order_id)
+    amount_still_to_invoice = round(float(financial_summary.get("AmountStillToInvoice") or 0.0), 2)
+    if amount_still_to_invoice < 0:
+        warnings.append("Amount still to invoice was negative, so the draft invoice amount defaulted to 0.00.")
+        return 0.0, warnings
+    if amount_still_to_invoice == 0:
+        warnings.append("No remaining stipulated invoice amount was available, so the draft invoice amount defaulted to 0.00.")
+    return amount_still_to_invoice, warnings
+
+
+def create_customer_invoice_draft_safe(
+    *,
+    work_order_id: int,
+    scope_of_work: str | None = None,
+    billing_mode: str | None = None,
+    invoice_amount: float | None = None,
+    created_by: str = "automation_apply",
+    source_tag: str = "customer_invoice_draft_wrapper",
+):
+    ensure_invoice_schema()
+    header = get_invoice_header_data(int(work_order_id))
+    if not header:
+        raise ValueError(f"Work Order #{work_order_id} could not be loaded for safe customer invoice draft creation.")
+
+    customer_name = str(header.get("CustomerName") or "").strip()
+    site_name = str(header.get("SiteName") or "").strip()
+    site_address = str(header.get("SiteAddress") or "").strip()
+    if not customer_name:
+        raise ValueError("Safe customer invoice draft creation requires a resolved Customer context.")
+    if not (site_name or site_address):
+        raise ValueError("Safe customer invoice draft creation requires a resolved Site context.")
+
+    normalized_mode = _normalize_invoice_billing_mode(billing_mode or header.get("BillingMode") or header.get("BillingType"))
+    normalized_scope = str(scope_of_work or header.get("ScopeOfWork") or header.get("Scope") or "").strip()
+    if not normalized_scope:
+        normalized_scope = f"Work Order #{int(work_order_id)}"
+
+    warnings: list[str] = []
+    if invoice_amount is None:
+        normalized_amount, amount_warnings = _derive_safe_customer_invoice_draft_amount(int(work_order_id), normalized_mode)
+        warnings.extend(amount_warnings)
+    else:
+        normalized_amount = round(float(invoice_amount or 0.0), 2)
+        if normalized_amount < 0:
+            raise ValueError("Safe customer invoice draft creation does not allow a negative invoice amount.")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        draft_rows = _list_draft_invoices_for_workorder(cur, int(work_order_id))
+        if len(draft_rows) > 1:
+            raise ValueError(
+                f"Work Order #{work_order_id} already has multiple Draft customer invoices; safe draft wrapper cannot pick one deterministically."
+            )
+
+        draft_reused = False
+        if draft_rows:
+            draft_row = draft_rows[0]
+            if _draft_invoice_has_export_or_send_evidence(draft_row):
+                raise ValueError(
+                    f"Draft customer invoice #{draft_row['CustomerInvoiceId']} already has export/send evidence, so safe draft wrapper will not reuse it."
+                )
+            draft_reused = True
+            invoice_row = draft_row
+            warnings.append(f"Reused existing Draft customer invoice #{draft_row['CustomerInvoiceId']} for Work Order #{work_order_id}.")
+        else:
+            cur.execute(
+                '''
+                INSERT INTO "Invoice"
+                (
+                    "WorkOrderID",
+                    "CustomerInvoiceAmount",
+                    "InvoiceStatus",
+                    "LaborPercent",
+                    "MaterialPercent",
+                    "LaborMilestoneNote",
+                    "MaterialMilestoneNote",
+                    "ScopeOfWork",
+                    "BillingMode",
+                    "CustomerInvoiceDate"
+                )
+                VALUES (%s, %s, 'Draft', %s, %s, %s, %s, %s, %s, CURRENT_DATE)
+                RETURNING *
+                ''',
+                (
+                    int(work_order_id),
+                    normalized_amount,
+                    0.0,
+                    0.0,
+                    "",
+                    "",
+                    normalized_scope,
+                    normalized_mode,
+                ),
+            )
+            invoice_row = cur.fetchone()
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    invoice_id = int(invoice_row["CustomerInvoiceId"])
+    memory_payload = dict(get_customer_invoice_memory(invoice_id) or {})
+    memory_payload.update(
+        {
+            "invoice_id": invoice_id,
+            "wo_id": int(work_order_id),
+            "mode": normalized_mode,
+            "scope": normalized_scope,
+            "review_summary": "Draft header-only customer invoice shell created without export, send, or line linking.",
+            "draft_origin": "safe_customer_invoice_draft_wrapper",
+            "created_by": str(created_by or "automation_apply").strip() or "automation_apply",
+            "source_tag": str(source_tag or "customer_invoice_draft_wrapper").strip() or "customer_invoice_draft_wrapper",
+            "line_linking_deferred": True,
+            "document_generation_deferred": True,
+            "last_saved_at": datetime.datetime.now().isoformat(),
+        }
+    )
+    upsert_customer_invoice_memory(invoice_id, memory_payload)
+    return {
+        "invoice": invoice_row,
+        "draft_reused": draft_reused,
+        "invoice_number": str(invoice_id),
+        "warnings": warnings,
+        "memory": memory_payload,
+    }
+
+
 def lock_and_export_invoice(wo_id: int, doc_path: str = None):
     ensure_invoice_schema()
     draft = _fetch_latest_invoice(wo_id, statuses=["Draft"])
@@ -617,6 +802,7 @@ def get_unbilled_workorders():
                 c."CustomerName",
                 s."SiteName",
                 wo."BillingType",
+                COALESCE(NULLIF(TRIM(wo."JobStatus"), ''), CASE WHEN COALESCE(wo."IsClosed", FALSE) THEN 'Closed' ELSE 'Open' END) AS "JobStatus",
                 EXISTS (
                     SELECT 1 FROM "Invoice" i
                     WHERE i."WorkOrderID" = wo."WorkOrderID" AND i."InvoiceStatus" = 'Draft'
@@ -625,6 +811,7 @@ def get_unbilled_workorders():
             JOIN "Site" s ON wo."SiteID" = s."SiteID"
             JOIN "Customer" c ON s."CustomerID" = c."CustomerID"
             WHERE COALESCE(wo."IsClosed", FALSE) = FALSE
+              AND UPPER(REPLACE(REPLACE(COALESCE(TRIM(wo."JobStatus"), ''), '_', ''), ' ', '')) NOT IN ('DRAFT', 'PENDINGSTART')
             ORDER BY wo."WorkOrderID" DESC
             ''',
         )
@@ -678,6 +865,7 @@ def get_invoice_pipeline_candidates():
             SELECT
                 wo."WorkOrderID",
                 COALESCE(wo."IsClosed", FALSE) AS "IsClosed",
+                COALESCE(NULLIF(TRIM(wo."JobStatus"), ''), CASE WHEN COALESCE(wo."IsClosed", FALSE) THEN 'Closed' ELSE 'Open' END) AS "JobStatus",
                 wo."BillingType",
                 c."CustomerName",
                 s."SiteName",
@@ -709,6 +897,7 @@ def get_invoice_pipeline_candidates():
     for row in rows:
         work_order_id = int(row["WorkOrderID"])
         is_closed = bool(row.get("IsClosed"))
+        job_status = str(row.get("JobStatus") or "").strip()
         customer_invoice_id = row.get("CustomerInvoiceId")
         invoice_status = str(row.get("InvoiceStatus") or "").strip()
         draft_id = row.get("CustomerInvoiceDocumentDraftID")
@@ -718,12 +907,12 @@ def get_invoice_pipeline_candidates():
         has_exported_draft_file = bool(str(row.get("FinalFilePath") or "").strip())
         has_legacy_doc_path = bool(str(row.get("CustomerInvoiceDocPath") or "").strip())
 
-        include = (not is_closed) or has_invoice or has_document_draft
+        include = ((not is_closed) and not _is_non_operational_work_order_status(job_status)) or has_invoice or has_document_draft
         if not include:
             excluded.append(
                 {
                     "WorkOrderID": work_order_id,
-                    "reason": "closed with no invoice or document activity",
+                    "reason": "non-operational work order or closed with no invoice/document activity",
                 }
             )
             continue
@@ -735,7 +924,7 @@ def get_invoice_pipeline_candidates():
         else:
             invoice_state = "Needs attention"
 
-        row["WorkOrderStatus"] = "CLOSED" if is_closed else "OPEN"
+        row["WorkOrderStatus"] = job_status or ("CLOSED" if is_closed else "OPEN")
 
         if not has_invoice:
             document_state = "Create/save invoice data first"
