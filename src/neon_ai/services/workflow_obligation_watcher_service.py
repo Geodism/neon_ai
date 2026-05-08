@@ -25,10 +25,17 @@ from neon_ai.services.automation_proposal_service import (
     list_proposals,
 )
 from neon_ai.services.inbound_intake_service import InboundMessageRecord
+from neon_ai.services.obligation_behavior_parameter_service import (
+    calculate_due_from_behavior,
+    foundation_priority_from_parameter,
+    get_obligation_behavior_parameters,
+)
 from neon_ai.services.workflow_obligation_service import (
     WorkflowObligationRecord,
+    add_workflow_obligation_link,
     create_obligation_if_missing,
     ensure_workflow_obligation_schema,
+    list_workflow_obligation_links,
     list_workflow_obligations,
     mark_satisfied,
     record_obligation_check,
@@ -118,8 +125,10 @@ def run_workflow_obligation_watcher(
     estimate_ids: list[int] | None = None,
     work_order_ids: list[int] | None = None,
     customer_invoice_ids: list[int] | None = None,
+    vendor_invoice_ids: list[int] | None = None,
     vendor_invoice_proposal_ids: list[int] | None = None,
     vendor_invoice_message_ids: list[int] | None = None,
+    create_overdue_proposals: bool = True,
     trigger_type: str = "manual_workflow_obligation_route",
 ) -> WorkflowObligationWatcherResult:
     ensure_workflow_obligation_schema()
@@ -147,8 +156,10 @@ def run_workflow_obligation_watcher(
             "estimate_ids": estimate_ids or [],
             "work_order_ids": work_order_ids or [],
             "customer_invoice_ids": customer_invoice_ids or [],
+            "vendor_invoice_ids": vendor_invoice_ids or [],
             "vendor_invoice_proposal_ids": vendor_invoice_proposal_ids or [],
             "vendor_invoice_message_ids": vendor_invoice_message_ids or [],
+            "create_overdue_proposals": bool(create_overdue_proposals),
             "mode_used": "deterministic_read_only_checks",
         },
     )
@@ -162,6 +173,7 @@ def run_workflow_obligation_watcher(
         "customer_invoice_due": 0,
         "customer_invoice_payment_due": 0,
         "vendor_invoice_reconciliation_due": 0,
+        "manual_vendor_invoice_reconciliation_due": 0,
     }
 
     try:
@@ -169,6 +181,7 @@ def run_workflow_obligation_watcher(
         work_order_sources = _discover_work_order_sources(work_order_ids=work_order_ids)
         customer_invoice_sources = _discover_customer_invoice_payment_sources(customer_invoice_ids=customer_invoice_ids)
         vendor_invoice_sources = _discover_vendor_invoice_reconciliation_sources(
+            vendor_invoice_ids=vendor_invoice_ids,
             proposal_ids=vendor_invoice_proposal_ids,
             message_ids=vendor_invoice_message_ids,
         )
@@ -176,6 +189,9 @@ def run_workflow_obligation_watcher(
         source_counts["customer_invoice_due"] = len(work_order_sources)
         source_counts["customer_invoice_payment_due"] = len(customer_invoice_sources)
         source_counts["vendor_invoice_reconciliation_due"] = len(vendor_invoice_sources)
+        source_counts["manual_vendor_invoice_reconciliation_due"] = len(
+            [source for source in vendor_invoice_sources if source.get("source_record_type") == "VendorInvoice"]
+        )
 
         for source in estimate_sources:
             obligation, created_now = _ensure_estimate_obligation(source)
@@ -209,7 +225,7 @@ def run_workflow_obligation_watcher(
                 continue
 
             _touch_unsatisfied_obligation(obligation, satisfaction=satisfaction)
-            if _is_due(obligation.expected_by):
+            if create_overdue_proposals and _is_due(obligation.expected_by):
                 proposal, created_now = create_overdue_proposal_if_missing(obligation, satisfaction=satisfaction)
                 if proposal is not None:
                     proposals_created += 1 if created_now else 0
@@ -260,7 +276,7 @@ def run_workflow_obligation_watcher(
                 continue
 
             _touch_unsatisfied_obligation(obligation, satisfaction=satisfaction)
-            if _is_due(obligation.expected_by):
+            if create_overdue_proposals and _is_due(obligation.expected_by):
                 proposal, created_now = create_overdue_proposal_if_missing(obligation, satisfaction=satisfaction)
                 if proposal is not None:
                     proposals_created += 1 if created_now else 0
@@ -311,7 +327,7 @@ def run_workflow_obligation_watcher(
                 continue
 
             _touch_unsatisfied_obligation(obligation, satisfaction=satisfaction)
-            if _is_due(obligation.expected_by):
+            if create_overdue_proposals and _is_due(obligation.expected_by):
                 proposal, created_now = create_overdue_proposal_if_missing(obligation, satisfaction=satisfaction)
                 if proposal is not None:
                     proposals_created += 1 if created_now else 0
@@ -362,7 +378,7 @@ def run_workflow_obligation_watcher(
                 continue
 
             _touch_unsatisfied_obligation(obligation, satisfaction=satisfaction)
-            if _is_due(obligation.expected_by):
+            if create_overdue_proposals and _is_due(obligation.expected_by):
                 proposal, created_now = create_overdue_proposal_if_missing(obligation, satisfaction=satisfaction)
                 if proposal is not None:
                     proposals_created += 1 if created_now else 0
@@ -753,20 +769,161 @@ def _discover_customer_invoice_payment_sources(*, customer_invoice_ids: list[int
 
 def _discover_vendor_invoice_reconciliation_sources(
     *,
+    vendor_invoice_ids: list[int] | None,
     proposal_ids: list[int] | None,
     message_ids: list[int] | None,
 ) -> list[dict[str, Any]]:
-    proposal_sources = _discover_vendor_invoice_reconciliation_proposal_sources(proposal_ids=proposal_ids)
+    has_explicit_vendor_targets = (
+        vendor_invoice_ids is not None
+        or proposal_ids is not None
+        or message_ids is not None
+    )
+    manual_sources = (
+        _discover_vendor_invoice_reconciliation_manual_sources(vendor_invoice_ids=vendor_invoice_ids)
+        if vendor_invoice_ids is not None or not has_explicit_vendor_targets
+        else []
+    )
+    proposal_sources = (
+        _discover_vendor_invoice_reconciliation_proposal_sources(proposal_ids=proposal_ids)
+        if proposal_ids is not None or not has_explicit_vendor_targets
+        else []
+    )
     referenced_message_ids = {
         int(source.get("inbound_message_id") or 0)
         for source in proposal_sources
         if int(source.get("inbound_message_id") or 0) > 0
     }
-    inbound_sources = _discover_vendor_invoice_reconciliation_message_sources(
-        message_ids=message_ids,
-        skip_message_ids=referenced_message_ids,
+    inbound_sources = (
+        _discover_vendor_invoice_reconciliation_message_sources(
+            message_ids=message_ids,
+            skip_message_ids=referenced_message_ids,
+        )
+        if message_ids is not None or not has_explicit_vendor_targets
+        else []
     )
-    return proposal_sources + inbound_sources
+    return manual_sources + proposal_sources + inbound_sources
+
+
+def _discover_vendor_invoice_reconciliation_manual_sources(
+    *,
+    vendor_invoice_ids: list[int] | None,
+) -> list[dict[str, Any]]:
+    clauses = ["COALESCE(vi.\"VendorInvoiceStatus\", '') <> 'Retired'"]
+    params: list[Any] = []
+    if vendor_invoice_ids:
+        clauses.append('vi."VendorInvoiceID" = ANY(%s)')
+        params.append([int(item) for item in vendor_invoice_ids])
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f'''
+            SELECT
+                vi."VendorInvoiceID",
+                vi."PurchaseOrderID",
+                COALESCE(vi."VendorInvoiceNumber", '') AS "VendorInvoiceNumber",
+                vi."VendorInvoiceDate",
+                vi."VendorInvoiceDueDate",
+                vi."VendorInvoiceAmount",
+                COALESCE(vi."VendorInvoiceStatus", '') AS "VendorInvoiceStatus",
+                COALESCE(vi."Description", '') AS "Description",
+                po."WorkOrderID",
+                po."VendorID",
+                COALESCE(po."Status", '') AS "PurchaseOrderStatus",
+                COALESCE(v."VendorName", '') AS "VendorName",
+                COALESCE(wo."Description", '') AS "WorkOrderDescription",
+                COALESCE(s."SiteName", '') AS "SiteName",
+                COALESCE(c."CustomerName", '') AS "CustomerName",
+                COALESCE((
+                    SELECT COUNT(*)::integer
+                    FROM public."PurchaseOrderReceipt" pr
+                    WHERE pr."PurchaseOrderID" = vi."PurchaseOrderID"
+                ), 0) AS "ReceiptCount"
+            FROM public."VendorInvoice" vi
+            LEFT JOIN public."PurchaseOrder" po ON po."PurchaseOrderID" = vi."PurchaseOrderID"
+            LEFT JOIN public."Vendor" v ON v."VendorID" = po."VendorID"
+            LEFT JOIN public."WorkOrder" wo ON wo."WorkOrderID" = po."WorkOrderID"
+            LEFT JOIN public."Site" s ON s."SiteID" = wo."SiteID"
+            LEFT JOIN public."Customer" c ON c."CustomerID" = s."CustomerID"
+            WHERE {' AND '.join(clauses)}
+            ORDER BY vi."VendorInvoiceID" ASC
+            ''',
+            tuple(params),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    sources: list[dict[str, Any]] = []
+    for row in rows:
+        vendor_invoice_id = int(row["VendorInvoiceID"])
+        purchase_order_id = _coerce_int(row.get("PurchaseOrderID"))
+        invoice_number = str(row.get("VendorInvoiceNumber") or "").strip()
+        receipt_count = int(row.get("ReceiptCount") or 0)
+        match_outcome = "NON_PO_EXPENSE_CANDIDATE"
+        if purchase_order_id is not None:
+            match_outcome = "MATCHED_PO_AND_RECEIPT_CONTEXT" if receipt_count > 0 else "MATCHED_PO_ONLY"
+        uncertainty_notes = [
+            "Manual VendorInvoice row is the source; no AutomationProposal is required for obligation creation."
+        ]
+        if purchase_order_id is None:
+            uncertainty_notes.append("No PO is linked. No PO, no money; operator/accounting review is required.")
+        elif receipt_count <= 0:
+            uncertainty_notes.append("PO is linked but receipt evidence was not found.")
+
+        sources.append(
+            {
+                "source_record_type": "VendorInvoice",
+                "source_record_id": vendor_invoice_id,
+                "workflow_type": WORKFLOW_VENDOR_INVOICE,
+                "expected_event_type": EXPECTED_VENDOR_INVOICE_RECONCILIATION,
+                "created_at": row.get("VendorInvoiceDate"),
+                "source_proposal_id": None,
+                "vendor_invoice_id": vendor_invoice_id,
+                "inbound_message_id": None,
+                "sender": None,
+                "sender_name": row.get("VendorName"),
+                "subject": f"Manual VendorInvoice {invoice_number or vendor_invoice_id}",
+                "vendor_name": row.get("VendorName") or "Unknown Vendor",
+                "invoice_number": invoice_number or str(vendor_invoice_id),
+                "invoice_date": _stringify_date_like(row.get("VendorInvoiceDate")),
+                "due_date": _stringify_date_like(row.get("VendorInvoiceDueDate")),
+                "total_amount": _coerce_float(row.get("VendorInvoiceAmount")),
+                "po_number": str(purchase_order_id) if purchase_order_id is not None else None,
+                "purchase_order_id": purchase_order_id,
+                "target_type": "PurchaseOrder" if purchase_order_id is not None else "VendorInvoice",
+                "target_id": purchase_order_id if purchase_order_id is not None else vendor_invoice_id,
+                "packing_slip_number": None,
+                "work_order_reference": row.get("WorkOrderID"),
+                "match_outcome": match_outcome,
+                "line_candidates": [],
+                "confidence": 0.86 if purchase_order_id is not None else 0.72,
+                "uncertainty_notes": uncertainty_notes,
+                "evidence_json": {
+                    "source": "manual_vendor_invoice_record",
+                    "vendor_invoice_id": vendor_invoice_id,
+                    "vendor_invoice_status": row.get("VendorInvoiceStatus"),
+                    "vendor_invoice_number": invoice_number,
+                    "purchase_order_id": purchase_order_id,
+                    "purchase_order_status": row.get("PurchaseOrderStatus"),
+                    "receipt_count": receipt_count,
+                    "vendor_name": row.get("VendorName"),
+                    "customer_name": row.get("CustomerName"),
+                    "site_name": row.get("SiteName"),
+                    "description": row.get("Description"),
+                    "no_authority_warning": "Watcher may create obligations only; it may not mark ready-to-pay, paid, or payable.",
+                },
+                "candidate_po_list": [
+                    {"PurchaseOrderID": purchase_order_id, "Status": row.get("PurchaseOrderStatus")}
+                ] if purchase_order_id is not None else [],
+                "candidate_vendor_list": [{"vendor_name": row.get("VendorName")}] if row.get("VendorName") else [],
+                "duplicate_check_result": {"supported": False, "checked": False, "duplicate_found": False},
+                "classification_route": "manual_vendor_invoice_record",
+                "vendor_invoice_status": row.get("VendorInvoiceStatus"),
+                "receipt_count": receipt_count,
+            }
+        )
+    return sources
 
 
 def _discover_vendor_invoice_reconciliation_proposal_sources(
@@ -867,6 +1024,14 @@ def _discover_vendor_invoice_reconciliation_message_sources(
     for row in rows:
         classification = row.get("ClassificationJson") if isinstance(row.get("ClassificationJson"), dict) else {}
         body_excerpt = row.get("BodyExcerpt") or row.get("BodyText") or ""
+        po_number = classification.get("po_number")
+        match_outcome = "READY_FOR_OPERATOR_RECONCILIATION_REVIEW"
+        uncertainty_notes = [
+            "No vendor invoice intake proposal existed yet; obligation is sourced directly from the inbound intake record."
+        ]
+        if not str(po_number or "").strip():
+            match_outcome = "NON_PO_EXPENSE_CANDIDATE"
+            uncertainty_notes.append("No PO was found in the manually imported vendor-invoice source. No PO, no money.")
         sources.append(
             {
                 "source_record_type": "InboundMessage",
@@ -884,13 +1049,13 @@ def _discover_vendor_invoice_reconciliation_message_sources(
                 "invoice_date": classification.get("invoice_date"),
                 "due_date": classification.get("due_date"),
                 "total_amount": classification.get("total_amount"),
-                "po_number": classification.get("po_number"),
+                "po_number": po_number,
                 "packing_slip_number": classification.get("packing_slip_number"),
                 "work_order_reference": classification.get("work_order_reference"),
-                "match_outcome": "READY_FOR_OPERATOR_RECONCILIATION_REVIEW",
+                "match_outcome": match_outcome,
                 "line_candidates": classification.get("line_candidates") if isinstance(classification.get("line_candidates"), list) else [],
                 "confidence": classification.get("confidence"),
-                "uncertainty_notes": ["No vendor invoice intake proposal existed yet; obligation is sourced directly from the inbound intake record."],
+                "uncertainty_notes": uncertainty_notes,
                 "evidence_json": {
                     "inbound_message_id": int(row["InboundMessageID"]),
                     "sender": row.get("Sender"),
@@ -898,7 +1063,7 @@ def _discover_vendor_invoice_reconciliation_message_sources(
                     "subject": row.get("Subject"),
                     "source_excerpt": str(body_excerpt)[:600],
                     "classification_route": row.get("WorkflowGuess") or row.get("IntentGuess"),
-                    "missing_evidence_list": ["vendor_invoice_intake_proposal_missing"],
+                    "missing_evidence_list": ["vendor_invoice_intake_proposal_missing"] + ([] if str(po_number or "").strip() else ["purchase_order"]),
                 },
                 "candidate_po_list": [],
                 "candidate_vendor_list": [],
@@ -909,8 +1074,31 @@ def _discover_vendor_invoice_reconciliation_message_sources(
     return sources
 
 
+def _safe_behavior_parameters(obligation_type: str, workflow_type: str | None) -> dict[str, Any]:
+    try:
+        return get_obligation_behavior_parameters(obligation_type, workflow_type=workflow_type)
+    except Exception:
+        return {}
+
+
+def _safe_behavior_parameter_evidence(parameters: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = {
+        "due_after_days",
+        "default_priority",
+        "default_owner_role",
+        "default_snooze_days",
+        "operator_nudge_enabled",
+        "operator_nudge_after_overdue_hours",
+        "preferred_action",
+        "escalation_after_days",
+        "cash_flow_amount_threshold",
+    }
+    return {key: parameters.get(key) for key in sorted(safe_keys) if key in parameters}
+
+
 def _ensure_estimate_obligation(source: dict[str, Any]) -> tuple[WorkflowObligationRecord, bool]:
-    expected_by = _estimate_expected_by(source)
+    behavior_parameters = _safe_behavior_parameters("CUSTOMER_RESPONSE_REQUIRED", WORKFLOW_ESTIMATE)
+    expected_by = _estimate_expected_by(source, behavior_parameters=behavior_parameters)
     existing = list_workflow_obligations(
         limit=5,
         source_record_type="Estimate",
@@ -921,12 +1109,16 @@ def _ensure_estimate_obligation(source: dict[str, Any]) -> tuple[WorkflowObligat
     obligation = create_obligation_if_missing(
         source_record_type="Estimate",
         source_record_id=source["EstimateID"],
+        source_entity_type="Estimate",
+        source_entity_id=source["EstimateID"],
+        obligation_type="CUSTOMER_RESPONSE_REQUIRED",
         workflow_type=WORKFLOW_ESTIMATE,
         expected_event_type=EXPECTED_ESTIMATE_REPLY,
         expected_by=expected_by,
-        severity="Medium",
+        severity=str(behavior_parameters.get("default_priority") or "Medium"),
+        priority=foundation_priority_from_parameter(behavior_parameters.get("default_priority")),
         status=STATUS_WAITING,
-        owner_role="Sales",
+        owner_role=str(behavior_parameters.get("default_owner_role") or "Sales"),
         owner_user_id=None,
         escalation_level=0,
         escalation_policy_code="ESTIMATE_SENT_REPLY_DUE",
@@ -946,13 +1138,16 @@ def _ensure_estimate_obligation(source: dict[str, Any]) -> tuple[WorkflowObligat
             "site_id": source.get("SiteID"),
             "site_name": source.get("SiteName"),
             "workflow_limitation": "Due date currently uses a 3-calendar-day window when no business-day helper is wired.",
+            "behavior_parameters": _safe_behavior_parameter_evidence(behavior_parameters),
         },
     )
+    _ensure_obligation_link(obligation, "Estimate", source["EstimateID"], "source_record")
     return obligation, created_now
 
 
 def _ensure_work_order_obligation(source: dict[str, Any]) -> tuple[WorkflowObligationRecord, bool]:
-    expected_by = _work_order_expected_by(source)
+    behavior_parameters = _safe_behavior_parameters("BILLING_REVIEW", WORKFLOW_BILLING)
+    expected_by = _work_order_expected_by(source, behavior_parameters=behavior_parameters)
     existing = list_workflow_obligations(
         limit=5,
         source_record_type="WorkOrder",
@@ -963,12 +1158,16 @@ def _ensure_work_order_obligation(source: dict[str, Any]) -> tuple[WorkflowOblig
     obligation = create_obligation_if_missing(
         source_record_type="WorkOrder",
         source_record_id=source["WorkOrderID"],
+        source_entity_type="WorkOrder",
+        source_entity_id=source["WorkOrderID"],
+        obligation_type="BILLING_REVIEW",
         workflow_type=WORKFLOW_BILLING,
         expected_event_type=EXPECTED_CUSTOMER_INVOICE,
         expected_by=expected_by,
-        severity="Medium",
+        severity=str(behavior_parameters.get("default_priority") or "Medium"),
+        priority=foundation_priority_from_parameter(behavior_parameters.get("default_priority")),
         status=STATUS_WAITING,
-        owner_role="Billing",
+        owner_role=str(behavior_parameters.get("default_owner_role") or "Billing"),
         owner_user_id=None,
         escalation_level=0,
         escalation_policy_code="WORK_COMPLETE_INVOICE_DUE",
@@ -986,8 +1185,10 @@ def _ensure_work_order_obligation(source: dict[str, Any]) -> tuple[WorkflowOblig
             "customer_name": source.get("CustomerName"),
             "site_name": source.get("SiteName"),
             "workflow_limitation": "WorkOrder completion currently uses JobStatus/IsClosed plus CreatedDate as the best available completion proxy.",
+            "behavior_parameters": _safe_behavior_parameter_evidence(behavior_parameters),
         },
     )
+    _ensure_obligation_link(obligation, "WorkOrder", source["WorkOrderID"], "source_record")
     return obligation, created_now
 
 
@@ -1006,6 +1207,9 @@ def _ensure_customer_invoice_payment_obligation(source: dict[str, Any]) -> tuple
     obligation = create_obligation_if_missing(
         source_record_type="CustomerInvoice",
         source_record_id=source_record_id,
+        source_entity_type="CustomerInvoice",
+        source_entity_id=source_record_id,
+        obligation_type="CASH_FLOW_REVIEW",
         workflow_type=WORKFLOW_CUSTOMER_INVOICE_AR,
         expected_event_type=EXPECTED_CUSTOMER_INVOICE_PAYMENT,
         expected_by=expected_by,
@@ -1027,11 +1231,13 @@ def _ensure_customer_invoice_payment_obligation(source: dict[str, Any]) -> tuple
         change_source="watcher",
         reason="Created customer invoice payment-followup obligation if missing.",
     )
+    _ensure_obligation_link(obligation, "CustomerInvoice", source_record_id, "source_record")
+    if source.get("work_order_id"):
+        _ensure_obligation_link(obligation, "WorkOrder", source.get("work_order_id"), "related_work_order")
     return obligation, created_now
 
 
 def _ensure_vendor_invoice_reconciliation_obligation(source: dict[str, Any]) -> tuple[WorkflowObligationRecord, bool]:
-    expected_by = _vendor_invoice_expected_by(source)
     source_record_type = str(source.get("source_record_type") or "AutomationProposal")
     source_record_id = str(source.get("source_record_id") or "")
     existing = list_workflow_obligations(
@@ -1043,15 +1249,23 @@ def _ensure_vendor_invoice_reconciliation_obligation(source: dict[str, Any]) -> 
     created_now = not existing
     vendor_name = str(source.get("vendor_name") or "Unknown Vendor").strip() or "Unknown Vendor"
     invoice_number = str(source.get("invoice_number") or "unknown invoice").strip() or "unknown invoice"
+    is_non_po = _coerce_int(source.get("purchase_order_id") or source.get("target_id")) is None or str(source.get("match_outcome") or "") == "NON_PO_EXPENSE_CANDIDATE"
+    obligation_type = "PAYABLE_EXCEPTION" if is_non_po else "PAYABLE_REVIEW"
+    behavior_parameters = _safe_behavior_parameters(obligation_type, WORKFLOW_VENDOR_INVOICE)
+    expected_by = _vendor_invoice_expected_by(source, behavior_parameters=behavior_parameters)
     obligation = create_obligation_if_missing(
         source_record_type=source_record_type,
         source_record_id=source_record_id,
+        source_entity_type=source_record_type,
+        source_entity_id=source_record_id,
+        obligation_type=obligation_type,
         workflow_type=WORKFLOW_VENDOR_INVOICE,
         expected_event_type=EXPECTED_VENDOR_INVOICE_RECONCILIATION,
         expected_by=expected_by,
-        severity=_vendor_invoice_obligation_severity(source),
+        severity=str(behavior_parameters.get("default_priority") or _vendor_invoice_obligation_severity(source)),
+        priority=foundation_priority_from_parameter(behavior_parameters.get("default_priority")),
         status=STATUS_WAITING,
-        owner_role="Accounting",
+        owner_role=str(behavior_parameters.get("default_owner_role") or "Accounting"),
         owner_user_id=None,
         escalation_level=0,
         escalation_policy_code="VENDOR_INVOICE_RECONCILIATION_DUE",
@@ -1060,14 +1274,51 @@ def _ensure_vendor_invoice_reconciliation_obligation(source: dict[str, Any]) -> 
             f"Vendor invoice {invoice_number} from {vendor_name} needs reconciliation review "
             f"against PO and receipt context before any payable truth is created."
         ),
-        evidence_json=_build_vendor_invoice_obligation_evidence(source),
+        evidence_json={
+            **_build_vendor_invoice_obligation_evidence(source),
+            "behavior_parameters": _safe_behavior_parameter_evidence(behavior_parameters),
+        },
         resolution_notes=None,
         notes=None,
         changed_by="WorkflowObligation watcher",
         change_source="watcher",
         reason="Created vendor invoice reconciliation obligation if missing.",
     )
+    _ensure_obligation_link(obligation, source_record_type, source_record_id, "source_record")
+    if source.get("vendor_invoice_id"):
+        _ensure_obligation_link(obligation, "VendorInvoice", source.get("vendor_invoice_id"), "vendor_invoice")
+    if source.get("purchase_order_id") or source.get("po_number"):
+        po_link_id = source.get("purchase_order_id") or source.get("po_number")
+        _ensure_obligation_link(obligation, "PurchaseOrder", po_link_id, "purchase_order")
     return obligation, created_now
+
+
+def _ensure_obligation_link(
+    obligation: WorkflowObligationRecord,
+    linked_entity_type: str,
+    linked_entity_id: Any,
+    link_role: str,
+) -> None:
+    if linked_entity_id in (None, ""):
+        return
+    entity_type = str(linked_entity_type or "").strip()
+    entity_id = str(linked_entity_id)
+    role = str(link_role or "").strip()
+    if not entity_type or not entity_id or not role:
+        return
+    try:
+        existing = list_workflow_obligation_links(obligation.obligation_id)
+        for link in existing:
+            if (
+                str(link.linked_entity_type or "") == entity_type
+                and str(link.linked_entity_id or "") == entity_id
+                and str(link.link_role or "") == role
+            ):
+                return
+        add_workflow_obligation_link(obligation.obligation_id, entity_type, entity_id, role)
+    except Exception:
+        # Source links are helpful for operator context but should not block obligation creation.
+        return
 
 
 def _check_estimate_satisfaction(obligation: WorkflowObligationRecord) -> WorkflowObligationSatisfactionResult:
@@ -1554,16 +1805,25 @@ def _customer_invoice_payment_obligation_severity(source: dict[str, Any]) -> str
     return "Medium"
 
 
-def _vendor_invoice_expected_by(source: dict[str, Any]) -> datetime | None:
+def _vendor_invoice_expected_by(
+    source: dict[str, Any],
+    *,
+    behavior_parameters: dict[str, Any] | None = None,
+) -> datetime | None:
     due_date = _coerce_datetime(source.get("due_date"))
     if due_date is not None:
         return due_date
     invoice_date = _coerce_datetime(source.get("invoice_date"))
+    fallback = invoice_date + timedelta(days=3) if invoice_date is not None else None
     if invoice_date is not None:
-        return invoice_date + timedelta(days=3)
+        return calculate_due_from_behavior(invoice_date, behavior_parameters, fallback_due=fallback)
     created_at = _coerce_datetime(source.get("created_at"))
     if created_at is not None:
-        return created_at + timedelta(days=3)
+        return calculate_due_from_behavior(
+            created_at,
+            behavior_parameters,
+            fallback_due=created_at + timedelta(days=3),
+        )
     return None
 
 
@@ -1599,6 +1859,11 @@ def _fetch_vendor_invoice_reconciliation_source(obligation: WorkflowObligationRe
             skip_message_ids=set(),
         )
         return rows[0] if rows else None
+    if obligation.source_record_type == "VendorInvoice":
+        rows = _discover_vendor_invoice_reconciliation_manual_sources(
+            vendor_invoice_ids=[int(obligation.source_record_id)]
+        )
+        return rows[0] if rows else None
     return None
 
 
@@ -1622,6 +1887,27 @@ def _customer_invoice_payment_cash_flow_flags(
 
 
 def _find_existing_vendor_invoice_for_reconciliation(source: dict[str, Any]) -> dict[str, Any] | None:
+    vendor_invoice_id = _coerce_int(source.get("vendor_invoice_id"))
+    if vendor_invoice_id is not None:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                '''
+                SELECT *
+                FROM public."VendorInvoice"
+                WHERE "VendorInvoiceID" = %s
+                LIMIT 1
+                ''',
+                (int(vendor_invoice_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
     po_number = str(source.get("po_number") or "").strip()
     invoice_number = str(source.get("invoice_number") or "").strip()
     po_id = _coerce_int(source.get("target_id")) if str(source.get("target_type") or "") == "PurchaseOrder" else _coerce_int(po_number)
@@ -1929,18 +2215,26 @@ def _customer_invoice_payment_risk_level(
     return "Medium"
 
 
-def _estimate_expected_by(source: dict[str, Any]) -> datetime | None:
+def _estimate_expected_by(
+    source: dict[str, Any],
+    *,
+    behavior_parameters: dict[str, Any] | None = None,
+) -> datetime | None:
     base = _coerce_datetime(source.get("SubmitDate")) or _coerce_datetime(source.get("CreatedDate"))
     if base is None:
         return None
-    return base + timedelta(days=3)
+    return calculate_due_from_behavior(base, behavior_parameters, fallback_due=base + timedelta(days=3))
 
 
-def _work_order_expected_by(source: dict[str, Any]) -> datetime | None:
+def _work_order_expected_by(
+    source: dict[str, Any],
+    *,
+    behavior_parameters: dict[str, Any] | None = None,
+) -> datetime | None:
     base = _coerce_datetime(source.get("CreatedDate"))
     if base is None:
         return None
-    return base + timedelta(days=1)
+    return calculate_due_from_behavior(base, behavior_parameters, fallback_due=base + timedelta(days=1))
 
 
 def _fetch_estimate_source(estimate_id: int) -> dict[str, Any] | None:

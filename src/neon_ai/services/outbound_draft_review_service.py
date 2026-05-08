@@ -7,7 +7,10 @@ from datetime import datetime
 from typing import Any
 
 from neon_ai.database.connection import get_connection
-from neon_ai.services.approved_outbound_send_service import validate_prepared_approved_outbound_draft
+from neon_ai.services.approved_outbound_send_service import (
+    get_approved_send_mode_status,
+    validate_prepared_approved_outbound_draft,
+)
 from neon_ai.services.outbound_message_log_service import ensure_outbound_message_log_table
 
 
@@ -46,6 +49,9 @@ class OutboundDraftReviewRecord:
     source_summary: str
     provider_message_id_present: bool
     test_mode_enabled: bool
+    private_operator_send_mode_enabled: bool
+    send_mode: str
+    send_mode_allows_send: bool
     recipient_allowlisted: bool
     allowlist_eligible: bool
     safety_notes: tuple[str, ...]
@@ -87,21 +93,23 @@ def _source_summary(
     return " | ".join(parts) or "-"
 
 
-def _safety_notes(record_status: str, allowlist_eligible: bool) -> tuple[str, ...]:
+def _safety_notes(record_status: str, send_mode: str, send_mode_allows_send: bool) -> tuple[str, ...]:
     notes = [
         "Prepared does not mean sent.",
         "External email cannot be unsent after a live send.",
-        "Wet send requires NEON_EMAIL_TEST_MODE=1, recipient allowlist, explicit operator approval, and the approved outbound send wrapper.",
+        "Live send requires explicit operator approval and the approved outbound send wrapper.",
+        "Test mode requires a configured allowlist; private operator mode allows manually approved sends without allowlist.",
         "This Automation Center view is read-only and does not provide send authority.",
     ]
-    if record_status == "Prepared" and not allowlist_eligible:
-        notes.append("This draft is not currently eligible for allowlisted test-mode send based on local environment settings.")
+    if record_status == "Prepared" and not send_mode_allows_send:
+        notes.append(f"This draft is not currently eligible because Level 3 send mode is {send_mode}.")
     return tuple(notes)
 
 
 def _record_from_row(row: dict[str, Any]) -> OutboundDraftReviewRecord:
     recipient = _text(row.get("RecipientEmail"))
     test_mode_enabled = os.environ.get("NEON_EMAIL_TEST_MODE") == "1"
+    mode_status = get_approved_send_mode_status(recipient_email=recipient)
     recipient_allowlisted = bool(recipient and recipient.lower() in _email_allowlist())
     allowlist_eligible = test_mode_enabled and recipient_allowlisted
     entity_type = _text(row.get("EntityType")) or "-"
@@ -138,9 +146,12 @@ def _record_from_row(row: dict[str, Any]) -> OutboundDraftReviewRecord:
         ),
         provider_message_id_present=bool(provider_message_id),
         test_mode_enabled=test_mode_enabled,
+        private_operator_send_mode_enabled=bool(mode_status.get("private_operator_mode_enabled")),
+        send_mode=str(mode_status.get("mode") or "disabled"),
+        send_mode_allows_send=bool(mode_status.get("send_mode_allows_send")),
         recipient_allowlisted=recipient_allowlisted,
         allowlist_eligible=allowlist_eligible,
-        safety_notes=_safety_notes(status, allowlist_eligible),
+        safety_notes=_safety_notes(status, str(mode_status.get("mode") or "disabled"), bool(mode_status.get("send_mode_allows_send"))),
     )
 
 
@@ -267,6 +278,9 @@ def summarize_outbound_draft_review(record: OutboundDraftReviewRecord) -> dict[s
         "sent_at": record.sent_at,
         "provider_message_id_present": record.provider_message_id_present,
         "allowlist_eligible": record.allowlist_eligible,
+        "send_mode": record.send_mode,
+        "send_mode_allows_send": record.send_mode_allows_send,
+        "private_operator_send_mode_enabled": record.private_operator_send_mode_enabled,
         "error_message": record.error_message or "-",
         "safety_notes": list(record.safety_notes),
         "send_eligible": operator_summary["send_eligible"],
@@ -304,13 +318,11 @@ def build_outbound_draft_operator_summary(record: OutboundDraftReviewRecord) -> 
         blocked_reasons.append("Prepared draft already has SentAt populated.")
     if status == "Prepared" and record.provider_message_id:
         blocked_reasons.append("Prepared draft already has ProviderMessageID populated.")
-    if os.environ.get("NEON_EMAIL_TEST_MODE") != "1":
-        blocked_reasons.append("NEON_EMAIL_TEST_MODE is not enabled.")
-    allowlist = _email_allowlist()
-    if not allowlist:
-        blocked_reasons.append("NEON_EMAIL_ALLOWLIST is empty.")
-    elif recipient and recipient.strip().lower() not in allowlist:
-        blocked_reasons.append("Recipient is not allowlisted.")
+    mode_status = get_approved_send_mode_status(recipient_email=recipient)
+    for error in mode_status.get("blocked_reasons", []):
+        normalized = _normalize_blocked_reason(str(error))
+        if normalized not in blocked_reasons:
+            blocked_reasons.append(normalized)
 
     # Reuse the authoritative validator in read-only mode so source/template/body
     # safety rules stay aligned with the approved-send wrapper.
@@ -338,14 +350,19 @@ def build_outbound_draft_operator_summary(record: OutboundDraftReviewRecord) -> 
         else "ProviderMessageID not recorded."
     )
     test_mode_summary = (
-        "NEON_EMAIL_TEST_MODE=1 is enabled."
+        "NEON_EMAIL_TEST_MODE=1 is enabled. Test-mode allowlist policy applies unless private operator mode is also enabled."
         if record.test_mode_enabled
         else "NEON_EMAIL_TEST_MODE is not enabled."
     )
+    private_operator_summary = (
+        "NEON_PRIVATE_OPERATOR_SEND_MODE=1 is enabled. Allowlist is optional for explicitly approved single-draft sends."
+        if record.private_operator_send_mode_enabled
+        else "NEON_PRIVATE_OPERATOR_SEND_MODE is not enabled."
+    )
     allowlist_summary = (
-        "Recipient is allowlisted."
+        "Recipient is allowlisted for test mode."
         if record.recipient_allowlisted
-        else "Recipient is not allowlisted or no allowlist is configured."
+        else "Recipient is not allowlisted. This blocks test mode sends, but not private operator mode sends."
     )
     return {
         "status_summary": status_summary,
@@ -354,12 +371,15 @@ def build_outbound_draft_operator_summary(record: OutboundDraftReviewRecord) -> 
         "failure_summary": failure_summary,
         "next_operator_action": _next_operator_action(record, blocked_reasons, send_eligible),
         "test_mode_summary": test_mode_summary,
+        "private_operator_summary": private_operator_summary,
+        "send_mode_summary": f"Current Level 3 send mode: {record.send_mode}.",
         "allowlist_summary": allowlist_summary,
         "provider_summary": provider_summary,
         "source_summary": record.source_summary,
         "safety_summary": (
             "Prepared does not mean sent. External email cannot be unsent. "
-            "Live send requires explicit approval, test mode, allowlist, and the approved-send wrapper."
+            "Live send requires explicit approval, one Prepared supported draft, one direct recipient, "
+            "an enabled send mode, and the approved-send wrapper."
         ),
     }
 
@@ -381,6 +401,9 @@ def build_outbound_draft_detail(record: OutboundDraftReviewRecord) -> dict[str, 
         "body_preview": body_text[:1200],
         "body_length": len(body_text),
         "test_mode_enabled": record.test_mode_enabled,
+        "private_operator_send_mode_enabled": record.private_operator_send_mode_enabled,
+        "send_mode": record.send_mode,
+        "send_mode_allows_send": record.send_mode_allows_send,
         "recipient_allowlisted": record.recipient_allowlisted,
         "operator_summary": operator_summary,
     }
@@ -407,8 +430,10 @@ def _normalize_blocked_reason(error: str) -> str:
         return text
     replacements = {
         "NEON_EMAIL_TEST_MODE=1 is required.": "NEON_EMAIL_TEST_MODE is not enabled.",
-        "NEON_EMAIL_ALLOWLIST must contain the allowed test recipient.": "NEON_EMAIL_ALLOWLIST is empty.",
-        "RecipientEmail is not in NEON_EMAIL_ALLOWLIST.": "Recipient is not allowlisted.",
+        "NEON_EMAIL_ALLOWLIST must contain the allowed test recipient.": "NEON_EMAIL_ALLOWLIST is empty in test mode.",
+        "NEON_EMAIL_ALLOWLIST must contain the allowed test recipient in test mode.": "NEON_EMAIL_ALLOWLIST is empty in test mode.",
+        "RecipientEmail is not in NEON_EMAIL_ALLOWLIST.": "Recipient is not allowlisted for test mode.",
+        "RecipientEmail is not in NEON_EMAIL_ALLOWLIST for test mode.": "Recipient is not allowlisted for test mode.",
         "RecipientEmail is required.": "Recipient is missing.",
         "Subject is required.": "Subject is missing.",
         "Body is required.": "Body is missing.",
@@ -449,8 +474,10 @@ def _next_operator_action(
         return "Fix the missing recipient before attempting approved send."
     if "subject is missing" in reason_text or "body is missing" in reason_text:
         return "Fix the missing subject/body before attempting approved send."
-    if "test_mode" in reason_text or "allowlist" in reason_text:
-        return "Enable test mode and allowlist the recipient before live send."
+    if "send mode is disabled" in reason_text:
+        return "Enable test mode or private operator send mode before live send."
+    if "allowlist" in reason_text:
+        return "In test mode, allowlist the recipient before live send, or use private operator mode for manually approved private sends."
     if "cc/bcc" in reason_text or "bulk" in reason_text:
         return "Remove CC/BCC or bulk recipients; Level 3 send supports one direct recipient only."
     if send_eligible:

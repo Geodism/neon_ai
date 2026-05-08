@@ -17,6 +17,9 @@ from neon_ai.services.outbound_message_log_service import ensure_outbound_messag
 
 
 AUTOMATION_KEY = "level_3_approved_outbound_send"
+EMAIL_TEST_MODE_ENV = "NEON_EMAIL_TEST_MODE"
+EMAIL_ALLOWLIST_ENV = "NEON_EMAIL_ALLOWLIST"
+PRIVATE_OPERATOR_SEND_MODE_ENV = "NEON_PRIVATE_OPERATOR_SEND_MODE"
 CUSTOMER_REQUEST_INFO_DRAFT_TEMPLATE_CODE = "CustomerRequestInfo:draft"
 CUSTOMER_SCHEDULING_REPLY_DRAFT_TEMPLATE_CODE = "CustomerSchedulingServiceReply:draft"
 ESTIMATE_CUSTOMER_REPLY_DRAFT_TEMPLATE_CODE = "EstimateCustomerReply:draft"
@@ -288,14 +291,48 @@ def validate_prepared_approved_outbound_draft(
         errors.append("Body is required.")
 
     if require_test_mode:
-        if os.environ.get("NEON_EMAIL_TEST_MODE") != "1":
-            errors.append("NEON_EMAIL_TEST_MODE=1 is required.")
-        allowlist = _email_allowlist()
-        if not allowlist:
-            errors.append("NEON_EMAIL_ALLOWLIST must contain the allowed test recipient.")
-        elif recipient.lower() not in allowlist:
-            errors.append("RecipientEmail is not in NEON_EMAIL_ALLOWLIST.")
+        mode_status = get_approved_send_mode_status(recipient_email=recipient)
+        errors.extend(str(error) for error in mode_status.get("blocked_reasons", []) if error)
     return not errors, errors, draft
+
+
+def get_approved_send_mode_status(recipient_email: str | None = None) -> dict[str, Any]:
+    """Return safe Level 3 send-mode status without exposing secrets or sending."""
+    test_mode_enabled = os.environ.get(EMAIL_TEST_MODE_ENV) == "1"
+    private_operator_mode_enabled = os.environ.get(PRIVATE_OPERATOR_SEND_MODE_ENV) == "1"
+    recipient = str(recipient_email or "").strip().lower()
+    allowlist = _email_allowlist()
+    recipient_allowlisted = bool(recipient and recipient in allowlist)
+    blocked_reasons: list[str] = []
+
+    if private_operator_mode_enabled:
+        mode = "private_operator"
+        send_mode_allows_send = True
+    elif test_mode_enabled:
+        mode = "test"
+        send_mode_allows_send = bool(allowlist and recipient_allowlisted)
+        if not allowlist:
+            blocked_reasons.append("NEON_EMAIL_ALLOWLIST must contain the allowed test recipient in test mode.")
+        elif recipient and not recipient_allowlisted:
+            blocked_reasons.append("RecipientEmail is not in NEON_EMAIL_ALLOWLIST for test mode.")
+    else:
+        mode = "disabled"
+        send_mode_allows_send = False
+        blocked_reasons.append(
+            "Level 3 send mode is disabled. Enable NEON_EMAIL_TEST_MODE=1 or NEON_PRIVATE_OPERATOR_SEND_MODE=1."
+        )
+
+    return {
+        "mode": mode,
+        "send_mode_allows_send": send_mode_allows_send,
+        "test_mode_enabled": test_mode_enabled,
+        "private_operator_mode_enabled": private_operator_mode_enabled,
+        "allowlist_count": len(allowlist),
+        "recipient_allowlisted": recipient_allowlisted,
+        "allowlist_required": bool(test_mode_enabled and not private_operator_mode_enabled),
+        "allowlist_optional": bool(private_operator_mode_enabled),
+        "blocked_reasons": tuple(blocked_reasons),
+    }
 
 
 def validate_prepared_estimate_followup_draft(
@@ -479,6 +516,7 @@ def send_approved_prepared_outbound_draft(
             recipient=str(draft.get("RecipientEmail") or "").strip(),
             attachment_path=str(draft.get("AttachmentPath") or "").strip() or None,
             cc_recipients=None,
+            approved_outbound_authority=True,
         )
     except Exception as exc:
         send_ok = False
@@ -1024,7 +1062,7 @@ def _log_send_event(
 
 
 def _email_allowlist() -> set[str]:
-    raw = os.environ.get("NEON_EMAIL_ALLOWLIST") or ""
+    raw = os.environ.get(EMAIL_ALLOWLIST_ENV) or ""
     values: set[str] = set()
     for part in re.split(r"[,;\s]+", raw):
         email = part.strip().lower()

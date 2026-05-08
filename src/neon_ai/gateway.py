@@ -57,6 +57,7 @@ from neon_ai.database.automation import (
 EMAIL_ADDR = os.getenv("AGENT_EMAIL")
 EMAIL_PASS = os.getenv("AGENT_APP_PASSWORD")
 MY_EMAIL = os.getenv("PERSONAL_EMAIL")
+LEGACY_DIRECT_SEND_ENV = "NEON_ENABLE_LEGACY_DIRECT_SEND"
 public_router = None
 
 NON_WORKFLOW_EMAIL_INDICATORS = (
@@ -132,8 +133,43 @@ def save_incoming_attachment(part):
     print(f"[GATEWAY] Saved inbound attachment to temp file: {target_path}")
     return target_path
 
-def send_to_user(subject, content, recipient=None, attachment_path=None, cc_recipients=None):
-    """Sends an email out via the Argon SMTP gateway, with optional attachment."""
+def legacy_direct_send_enabled():
+    """Return whether legacy direct SMTP send paths are explicitly enabled."""
+    return os.getenv(LEGACY_DIRECT_SEND_ENV) == "1"
+
+
+def direct_send_allowed(*, approved_outbound_authority=False):
+    """Single outbound authority guard for SMTP provider access."""
+    return bool(approved_outbound_authority or legacy_direct_send_enabled())
+
+
+def send_to_user(
+    subject,
+    content,
+    recipient=None,
+    attachment_path=None,
+    cc_recipients=None,
+    *,
+    approved_outbound_authority=False,
+):
+    """Send email through the SMTP gateway only from approved authority paths.
+
+    Level 3 external send authority belongs to
+    neon_ai.services.approved_outbound_send_service. Legacy direct send callers
+    fail closed unless NEON_ENABLE_LEGACY_DIRECT_SEND=1 is set explicitly.
+    """
+    if not direct_send_allowed(approved_outbound_authority=approved_outbound_authority):
+        print(
+            "[OUTBOUND SEND BLOCKED] Legacy direct email send is disabled. "
+            "Use approved_outbound_send_service.py for Level 3 sends, or set "
+            f"{LEGACY_DIRECT_SEND_ENV}=1 only for explicit legacy/manual compatibility."
+        )
+        return False
+
+    if not EMAIL_ADDR or not EMAIL_PASS:
+        print("SMTP Error: sender credentials are not configured.")
+        return False
+
     msg = EmailMessage()
     msg['Subject'] = subject
     msg['From'] = EMAIL_ADDR

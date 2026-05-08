@@ -409,6 +409,7 @@ def extract_json(
     prompt: str,
     *,
     system_prompt: str | None = None,
+    max_output_tokens: int | None = None,
     allow_live_call: bool = False,
     lane: str | None = None,
 ) -> LLMResult:
@@ -419,6 +420,7 @@ def extract_json(
     result = generate_text(
         full_prompt,
         system_prompt=system_prompt,
+        max_output_tokens=max_output_tokens,
         allow_live_call=allow_live_call,
         lane=lane,
     )
@@ -493,12 +495,13 @@ def _generate_text_openai(
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-        response = client.chat.completions.create(
+        request_kwargs = build_openai_request_kwargs(
             model=lane_config.model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_output_tokens,
+            max_output_tokens=max_output_tokens,
         )
+        response = client.chat.completions.create(**request_kwargs)
         choice = response.choices[0] if getattr(response, "choices", None) else None
         text = ""
         if choice is not None and getattr(choice, "message", None) is not None:
@@ -521,6 +524,40 @@ def _generate_text_openai(
         )
     except Exception as exc:
         return _error_result(lane_config, str(exc))
+
+
+def build_openai_request_kwargs(
+    *,
+    model: str | None,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_output_tokens: int | None = None,
+    api_style: str = "chat_completions",
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    token_limit = _positive_int_or_none(max_output_tokens)
+    if token_limit is not None:
+        if api_style == "responses":
+            kwargs["max_output_tokens"] = token_limit
+        else:
+            kwargs["max_completion_tokens"] = token_limit
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _positive_int_or_none(value: int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        integer_value = int(value)
+    except (TypeError, ValueError):
+        return None
+    if integer_value <= 0:
+        return None
+    return integer_value
 
 
 def _generate_text_ollama(

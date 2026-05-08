@@ -2103,7 +2103,7 @@ class AutomationCenterPage(QWidget):
                 "Source",
                 "SentAt",
                 "Provider ID?",
-                "Allowlist",
+                "Send Mode",
             ]
         )
         self.outbound_drafts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2151,8 +2151,8 @@ class AutomationCenterPage(QWidget):
         self.outbound_draft_send_button.setEnabled(False)
         self.outbound_draft_send_button.clicked.connect(self._handle_outbound_draft_send_clicked)
         send_action_note = QLabel(
-            "Single selected Prepared draft only. The approved-send wrapper still enforces test mode, allowlist, "
-            "recipient/body checks, and supported template/source rules."
+            "Single selected Prepared draft only. The approved-send wrapper enforces explicit operator approval, "
+            "send mode, one recipient, recipient/body checks, and supported template/source rules."
         )
         send_action_note.setWordWrap(True)
         send_action_note.setStyleSheet("color: #555;")
@@ -3080,7 +3080,7 @@ class AutomationCenterPage(QWidget):
                 self.outbound_drafts_table,
                 row_index,
                 9,
-                self._bool_text(draft.allowlist_eligible),
+                str(draft.send_mode or "disabled"),
             )
         self.outbound_drafts_table.resizeColumnsToContents()
 
@@ -3850,8 +3850,8 @@ class AutomationCenterPage(QWidget):
                 f"Send this prepared draft to {recipient}?\n\n"
                 "External email cannot be unsent.\n\n"
                 "This will call the Level 3 approved-send wrapper for this one selected draft only. "
-                "The wrapper will block the send unless test mode, allowlist, recipient, subject/body, "
-                "template, source, and status checks pass."
+                "The wrapper will block the send unless explicit approval, enabled send mode, recipient, "
+                "subject/body, template, source, and status checks pass."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -4796,7 +4796,7 @@ class AutomationCenterPage(QWidget):
                 "Select an outbound draft to inspect the read-only prepared/sent/failed record."
             )
             self.outbound_draft_review_json.setPlainText(
-                "Select a Prepared outbound draft to inspect or send one approved, allowlisted test-mode email."
+                "Select a Prepared outbound draft to inspect or send one explicitly approved Level 3 email."
             )
             self._update_outbound_draft_action_buttons(None)
             return
@@ -4835,6 +4835,8 @@ class AutomationCenterPage(QWidget):
             "\n".join(
                 [
                     str(operator_summary.get("test_mode_summary") or "-"),
+                    str(operator_summary.get("private_operator_summary") or "-"),
+                    str(operator_summary.get("send_mode_summary") or "-"),
                     str(operator_summary.get("allowlist_summary") or "-"),
                     str(operator_summary.get("provider_summary") or "-"),
                     str(operator_summary.get("safety_summary") or "-"),

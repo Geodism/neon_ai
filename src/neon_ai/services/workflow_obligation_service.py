@@ -843,6 +843,15 @@ def summarize_obligation_next_action(obligation: WorkflowObligationRecord) -> st
     obligation_type = str(obligation.obligation_type or "").strip().upper()
     workflow_type = str(obligation.workflow_type or "").strip().lower()
     expected_event_type = str(obligation.expected_event_type or "").strip().lower()
+    try:
+        from neon_ai.services.obligation_behavior_parameter_service import build_obligation_behavior_context
+
+        behavior_context = build_obligation_behavior_context(obligation)
+        preferred_summary = str(behavior_context.get("preferred_action_summary") or "").strip()
+        if preferred_summary:
+            return preferred_summary
+    except Exception:
+        pass
 
     if obligation_type == "CUSTOMER_INTAKE_REVIEW":
         return "Review lead intake and apply draft Customer/Site/Estimate if appropriate."
@@ -1411,10 +1420,18 @@ def create_obligation_if_missing(
     workflow_type: str,
     expected_event_type: str,
     expected_by: datetime | date | None,
+    obligation_type: str | None = None,
     severity: str = "Medium",
+    priority: str | None = None,
     status: str = STATUS_WAITING,
     owner_role: str | None = None,
     owner_user_id: str | None = None,
+    requires_human_review: bool = True,
+    requires_approval: bool = False,
+    can_auto_resolve: bool = False,
+    source_entity_type: str | None = None,
+    source_entity_id: str | int | None = None,
+    idempotency_key: str | None = None,
     escalation_level: int = 0,
     escalation_policy_code: str | None = None,
     title: str | None = None,
@@ -1449,15 +1466,25 @@ def create_obligation_if_missing(
         cur.execute(
             """
             INSERT INTO public."WorkflowObligation" (
+                "ObligationType",
                 "SourceRecordType",
                 "SourceRecordID",
+                "SourceEntityType",
+                "SourceEntityID",
                 "WorkflowType",
                 "ExpectedEventType",
                 "ExpectedBy",
+                "DueDate",
+                "DueTime",
                 "Severity",
+                "Priority",
                 "Status",
+                "RequiresHumanReview",
+                "RequiresApproval",
+                "CanAutoResolve",
                 "OwnerRole",
                 "OwnerUserID",
+                "CreatedBy",
                 "EscalationLevel",
                 "EscalationPolicyCode",
                 "Title",
@@ -1465,24 +1492,35 @@ def create_obligation_if_missing(
                 "EvidenceJson",
                 "ResolutionNotes",
                 "Notes",
-                "SnoozeUntil"
+                "SnoozeUntil",
+                "IdempotencyKey"
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
             ON CONFLICT ("SourceRecordType", "SourceRecordID", "ExpectedEventType")
             WHERE "Status" IN ('waiting', 'overdue', 'proposal_created', 'snoozed', 'blocked', 'failed')
             DO NOTHING
             RETURNING *
             """,
             (
+                _normalize_obligation_type(obligation_type) if obligation_type else None,
                 str(source_record_type or "").strip(),
                 str(source_record_id),
+                str(source_entity_type or source_record_type or "").strip() or None,
+                str(source_entity_id if source_entity_id not in (None, "") else source_record_id),
                 str(workflow_type or "").strip(),
                 str(expected_event_type or "").strip(),
                 _coerce_datetime(expected_by),
+                (_coerce_datetime(expected_by).date() if _coerce_datetime(expected_by) is not None else None),
+                (_coerce_datetime(expected_by).time() if _coerce_datetime(expected_by) is not None else None),
                 str(severity or "Medium").strip() or "Medium",
+                str(priority or _priority_from_severity(severity)).strip() or _priority_from_severity(severity),
                 _normalize_status(status or STATUS_WAITING),
+                bool(requires_human_review),
+                bool(requires_approval),
+                bool(can_auto_resolve),
                 owner_role,
                 owner_user_id,
+                changed_by,
                 int(escalation_level or 0),
                 escalation_policy_code,
                 title,
@@ -1491,6 +1529,7 @@ def create_obligation_if_missing(
                 resolution_notes,
                 notes,
                 _coerce_datetime(snooze_until),
+                idempotency_key,
             ),
         )
         row = cur.fetchone()
@@ -1522,6 +1561,15 @@ def create_obligation_if_missing(
     if existing is None:
         raise RuntimeError("WorkflowObligation insert did not return a row and no active matching record could be found.")
     return existing
+
+
+def _priority_from_severity(severity: str | None) -> str:
+    normalized = str(severity or "").strip().upper()
+    if normalized in {"LOW", "LOW_PRIORITY"}:
+        return FOUNDATION_PRIORITY_LOW
+    if normalized in {"HIGH", "CRITICAL", "URGENT"}:
+        return FOUNDATION_PRIORITY_HIGH if normalized == "HIGH" else FOUNDATION_PRIORITY_URGENT
+    return FOUNDATION_PRIORITY_NORMAL
 
 
 def list_obligations_for_review(
@@ -2872,6 +2920,8 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, time):
         return value.isoformat()
     if isinstance(value, date):
         return value.isoformat()
