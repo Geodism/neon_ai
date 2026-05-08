@@ -27,6 +27,9 @@ from neon_ai.services.automation_proposal_service import (
     create_question,
     get_active_question_for_target,
 )
+from neon_ai.services.workflow_obligation_route_attachment_service import (
+    attach_selected_obligation_for_question_best_effort,
+)
 
 
 EXTRACTOR_VERSION = "level2_attachment_text_v1"
@@ -247,6 +250,11 @@ def create_attachment_review_question(
         required_before_action=False,
         urgency=_attachment_review_urgency(message),
         status="Open",
+    )
+    attach_selected_obligation_for_question_best_effort(
+        question,
+        automation_key=ATTACHMENT_REVIEW_AUTOMATION_KEY,
+        automation_run_id=None,
     )
     log_automation_event(
         automation_run_id=None,

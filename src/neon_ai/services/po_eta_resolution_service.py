@@ -22,6 +22,9 @@ from neon_ai.services.automation_proposal_service import (
     list_proposals,
     set_question_related_proposal,
 )
+from neon_ai.services.workflow_obligation_route_attachment_service import (
+    attach_selected_obligation_for_proposal_best_effort,
+)
 
 
 AUTOMATION_KEY = "po_eta_parts_ready_watcher"
@@ -181,6 +184,11 @@ def create_revised_po_eta_status_proposal_from_answer(
         can_auto_apply_level_2=False,
         blocked_reason=None,
         status="Pending",
+    )
+    attach_selected_obligation_for_proposal_best_effort(
+        proposal,
+        automation_key=AUTOMATION_KEY,
+        automation_run_id=None,
     )
     return proposal, False
 

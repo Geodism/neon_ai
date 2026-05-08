@@ -38,6 +38,9 @@ from neon_ai.services.workflow_obligation_service import (
     STATUS_SNOOZED,
     STATUS_WAITING,
 )
+from neon_ai.services.workflow_obligation_route_attachment_service import (
+    attach_selected_obligation_for_proposal_best_effort,
+)
 
 
 AUTOMATION_KEY = "workflow_obligation_watcher"
@@ -533,6 +536,11 @@ def create_overdue_proposal_if_missing(
         can_auto_apply_level_2=False,
         blocked_reason=None,
         status="Pending",
+    )
+    attach_selected_obligation_for_proposal_best_effort(
+        proposal,
+        automation_key=AUTOMATION_KEY,
+        automation_run_id=None,
     )
     record_obligation_check(
         obligation.obligation_id,

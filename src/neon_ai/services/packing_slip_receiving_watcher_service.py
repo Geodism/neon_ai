@@ -46,6 +46,9 @@ from neon_ai.services.inbound_intake_service import (
     update_message_status,
 )
 from neon_ai.services.llm_provider_service import extract_json, get_llm_provider_config
+from neon_ai.services.workflow_obligation_route_attachment_service import (
+    attach_selected_obligation_for_proposal_best_effort,
+)
 
 
 AUTOMATION_KEY = "packing_slip_receiving_watcher"
@@ -412,6 +415,11 @@ def process_packing_slip_receiving_message(
             can_auto_apply_level_2=False,
             blocked_reason=None,
             status="Pending",
+        )
+        attach_selected_obligation_for_proposal_best_effort(
+            proposal,
+            automation_key=AUTOMATION_KEY,
+            automation_run_id=run.automation_run_id,
         )
         updated_message = _set_message_status(message.inbound_message_id, "ProposalCreated")
         route_outcome = "proposal_created"

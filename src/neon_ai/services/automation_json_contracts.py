@@ -566,6 +566,45 @@ def validate_operator_vendor_invoice_reconciliation_answer(payload: Any) -> Json
     return _result(contract_name, errors, warnings, normalized)
 
 
+def validate_operator_customer_billing_status_resolution_answer(payload: Any) -> JsonContractValidationResult:
+    contract_name = "customer_billing_status_resolution_answer"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_text(mapping, normalized, "answer_type", errors)
+    if str(normalized.get("answer_type") or "").strip() != "customer_billing_status_resolution":
+        errors.append("answer_type must be customer_billing_status_resolution.")
+    _require_text(mapping, normalized, "resolution_outcome", errors)
+    _require_text(mapping, normalized, "operator_note", errors)
+    _require_text(mapping, normalized, "how_i_know", errors)
+    _optional_text(mapping, normalized, "answered_by")
+    _optional_int(mapping, normalized, "selected_customer_invoice_id", errors)
+    _optional_int(mapping, normalized, "selected_work_order_id", errors)
+
+    allowed_outcomes = {
+        "selected_customer_invoice",
+        "customer_invoice_missing",
+        "already_billed",
+        "not_billable_to_customer",
+        "manual_review_required",
+        "non_po_exception",
+    }
+    outcome = str(normalized.get("resolution_outcome") or "").strip()
+    if outcome and outcome not in allowed_outcomes:
+        errors.append("resolution_outcome is not recognized for customer billing status resolution.")
+
+    if outcome in {"selected_customer_invoice", "already_billed"} and normalized.get("selected_customer_invoice_id") is None:
+        errors.append("selected_customer_invoice_id is required for the selected_customer_invoice and already_billed outcomes.")
+    if outcome in {"customer_invoice_missing", "not_billable_to_customer", "manual_review_required", "non_po_exception"} and normalized.get("selected_customer_invoice_id") is not None:
+        warnings.append("selected_customer_invoice_id will be ignored for this resolution_outcome.")
+
+    return _result(contract_name, errors, warnings, normalized)
+
+
 def validate_vendor_invoice_extraction(payload: Any) -> JsonContractValidationResult:
     contract_name = "vendor_invoice_extraction"
     errors: list[str] = []
@@ -895,6 +934,97 @@ def validate_customer_billing_status_review_choices_json(payload: Any) -> JsonCo
     }
     if normalized.get("customer_billing_status") and normalized.get("customer_billing_status") not in allowed_statuses:
         errors.append("customer_billing_status is not recognized for customer billing status review choices.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_customer_billing_status_review_resolution_proposal(payload: Any) -> JsonContractValidationResult:
+    contract_name = "customer_billing_status_review_resolution_proposal"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_text(mapping, normalized, "proposal_type", errors)
+    _require_text(mapping, normalized, "workflow", errors)
+    _require_text(mapping, normalized, "target_type", errors)
+    _require_int(mapping, normalized, "target_id", errors)
+    _optional_int(mapping, normalized, "vendor_invoice_id", errors)
+    _optional_text(mapping, normalized, "vendor_name")
+    _optional_text(mapping, normalized, "vendor_invoice_number")
+    _optional_float(mapping, normalized, "vendor_invoice_total", errors, warnings, min_value=0.0)
+    _optional_text(mapping, normalized, "vendor_invoice_due_date")
+    if normalized.get("vendor_invoice_due_date") and not _looks_like_iso_date(str(normalized["vendor_invoice_due_date"])):
+        warnings.append("vendor_invoice_due_date is present but not ISO-formatted.")
+    _optional_int(mapping, normalized, "purchase_order_id", errors)
+    _optional_text(mapping, normalized, "purchase_order_number")
+    _optional_int(mapping, normalized, "work_order_id", errors)
+    _optional_int(mapping, normalized, "customer_id", errors)
+    _optional_int(mapping, normalized, "site_id", errors)
+    _require_text(mapping, normalized, "customer_billing_status", errors)
+    _require_text(mapping, normalized, "recommended_operator_action", errors)
+    _require_int(mapping, normalized, "resolution_source_question_id", errors)
+    _require_text(mapping, normalized, "resolution_outcome", errors)
+    _require_bool(mapping, normalized, "operator_resolved", errors)
+    _require_text(mapping, normalized, "resolved_by", errors)
+    _require_text(mapping, normalized, "resolved_at", errors)
+    if normalized.get("resolved_at") and not _looks_like_iso_datetime(str(normalized["resolved_at"])):
+        warnings.append("resolved_at is present but not ISO-formatted.")
+    _require_text(mapping, normalized, "operator_note", errors)
+    _require_text(mapping, normalized, "how_i_know", errors)
+    _optional_int(mapping, normalized, "selected_customer_invoice_id", errors)
+    _optional_int(mapping, normalized, "selected_work_order_id", errors)
+    _optional_float(mapping, normalized, "confidence", errors, warnings, min_value=0.0, max_value=1.0)
+    _require_bool(mapping, normalized, "requires_approval", errors)
+    _require_bool(mapping, normalized, "can_auto_apply_level_2", errors)
+    _optional_text_list(mapping, normalized, "cash_flow_flags", errors)
+    _optional_text_list(mapping, normalized, "uncertainty_notes", errors)
+
+    customer_invoice_ids = mapping.get("customer_invoice_ids")
+    if customer_invoice_ids in (None, ""):
+        normalized["customer_invoice_ids"] = []
+    elif not isinstance(customer_invoice_ids, list):
+        errors.append("customer_invoice_ids must be a list when provided.")
+        normalized["customer_invoice_ids"] = []
+    else:
+        normalized["customer_invoice_ids"] = _normalize_int_list(customer_invoice_ids, "customer_invoice_ids", errors)
+
+    allowed_statuses = {
+        "CUSTOMER_BILLING_UNKNOWN",
+        "NO_CUSTOMER_INVOICE_FOUND",
+        "CUSTOMER_INVOICE_DRAFT_EXISTS",
+        "CUSTOMER_INVOICE_EXPORTED_NOT_SENT",
+        "CUSTOMER_INVOICE_SENT_UNPAID",
+        "CUSTOMER_INVOICE_SENT_PAID",
+        "CUSTOMER_BILLING_NOT_APPLICABLE",
+        "MULTIPLE_CUSTOMER_INVOICES_FOUND",
+        "UNSAFE_BILLING_RELATIONSHIP",
+    }
+    if normalized.get("customer_billing_status") and normalized.get("customer_billing_status") not in allowed_statuses:
+        errors.append("customer_billing_status is not recognized for customer billing review resolution.")
+
+    allowed_outcomes = {
+        "selected_customer_invoice",
+        "customer_invoice_missing",
+        "already_billed",
+        "not_billable_to_customer",
+        "manual_review_required",
+        "non_po_exception",
+    }
+    if normalized.get("resolution_outcome") and normalized.get("resolution_outcome") not in allowed_outcomes:
+        errors.append("resolution_outcome is not recognized for customer billing review resolution.")
+
+    if normalized.get("proposal_type") and normalized.get("proposal_type") != "customer_billing_status_review_resolution":
+        warnings.append("customer billing review resolution proposal has an unexpected proposal_type.")
+    if normalized.get("workflow") and normalized.get("workflow") != "cash_flow_review":
+        warnings.append("customer billing review resolution proposal has an unexpected workflow.")
+    if normalized.get("operator_resolved") is not True:
+        warnings.append("customer billing review resolution proposal should record operator_resolved as true.")
+    if normalized.get("requires_approval") is not True:
+        warnings.append("customer billing review resolution proposal should remain approval-gated.")
+    if normalized.get("can_auto_apply_level_2") is not False:
+        warnings.append("customer billing review resolution proposal should not be auto-applicable at Level 2.")
     return _result(contract_name, errors, warnings, normalized)
 
 
@@ -1851,6 +1981,270 @@ def validate_outbound_followup_draft_result(payload: Any) -> JsonContractValidat
     return _result(contract_name, errors, warnings, normalized)
 
 
+def validate_customer_request_info_draft_result(payload: Any) -> JsonContractValidationResult:
+    contract_name = "customer_request_info_draft_result"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_int(mapping, normalized, "outbound_message_log_id", errors)
+    _require_text(mapping, normalized, "entity_type", errors)
+    _require_int(mapping, normalized, "entity_id", errors)
+    _require_text(mapping, normalized, "draft_status", errors)
+    _require_text(mapping, normalized, "recipient_email", errors)
+    _require_text(mapping, normalized, "subject", errors)
+    _require_text(mapping, normalized, "body", errors)
+    _optional_int(mapping, normalized, "question_id", errors)
+    _optional_int(mapping, normalized, "proposal_id", errors)
+    _optional_text(mapping, normalized, "source_question_type")
+    _optional_text(mapping, normalized, "source_action_type")
+    _optional_text(mapping, normalized, "created_by")
+    _optional_text(mapping, normalized, "created_at")
+
+    supported_question_types = {
+        "lead_intake_review_required",
+        "missing_contact_detail",
+        "missing_project_detail",
+        "customer_scheduling_service_inquiry",
+        "customer_billing_status_review",
+        "inbound_routing_review",
+    }
+    supported_action_types = {
+        "lead_intake_observation",
+        "customer_scheduling_service_inquiry_observation",
+    }
+    if normalized.get("draft_status") and normalized.get("draft_status") != "Prepared":
+        errors.append("Customer request-info draft result must be Prepared.")
+    if normalized.get("entity_type") == "AutomationQuestion":
+        if not normalized.get("source_question_type"):
+            errors.append("source_question_type is required for AutomationQuestion-backed CustomerRequestInfo:draft.")
+        elif normalized.get("source_question_type") not in supported_question_types:
+            errors.append("source_question_type is not supported for CustomerRequestInfo:draft.")
+    elif normalized.get("entity_type") == "AutomationProposal":
+        if not normalized.get("source_action_type"):
+            errors.append("source_action_type is required for AutomationProposal-backed CustomerRequestInfo:draft.")
+        elif normalized.get("source_action_type") not in supported_action_types:
+            errors.append("source_action_type is not supported for CustomerRequestInfo:draft.")
+    elif normalized.get("entity_type"):
+        errors.append("Customer request-info draft result entity_type must be AutomationQuestion or AutomationProposal.")
+    if normalized.get("created_at") and not str(normalized["created_at"]).strip():
+        warnings.append("created_at is blank.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_customer_scheduling_reply_draft_result(payload: Any) -> JsonContractValidationResult:
+    contract_name = "customer_scheduling_reply_draft_result"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_int(mapping, normalized, "outbound_message_log_id", errors)
+    _require_text(mapping, normalized, "entity_type", errors)
+    _require_int(mapping, normalized, "entity_id", errors)
+    _require_text(mapping, normalized, "draft_status", errors)
+    _require_text(mapping, normalized, "recipient_email", errors)
+    _require_text(mapping, normalized, "subject", errors)
+    _require_text(mapping, normalized, "body", errors)
+    _require_text(mapping, normalized, "reply_intent", errors)
+    _require_bool(mapping, normalized, "confirmed_schedule_time_supported", errors)
+    _optional_int(mapping, normalized, "question_id", errors)
+    _optional_int(mapping, normalized, "proposal_id", errors)
+    _optional_text(mapping, normalized, "source_question_type")
+    _optional_text(mapping, normalized, "source_action_type")
+    _optional_text(mapping, normalized, "created_by")
+    _optional_text(mapping, normalized, "created_at")
+
+    supported_question_types = {
+        "customer_scheduling_service_inquiry",
+        "customer_scheduling_service_reply_required",
+        "urgent_service_review",
+        "customer_disambiguation",
+        "site_disambiguation",
+        "callback_request",
+        "access_instruction_review",
+        "schedule_confirmation_review",
+        "reschedule_request_review",
+        "crew_eta_question_review",
+        "inbound_routing_review",
+    }
+    supported_action_types = {
+        "customer_scheduling_service_observation",
+        "customer_scheduling_service_inquiry",
+        "customer_scheduling_service_inquiry_observation",
+    }
+    supported_reply_intents = {
+        "acknowledgement",
+        "access_instructions",
+        "callback_request",
+        "reschedule_request",
+        "crew_eta_question",
+        "schedule_confirmation",
+    }
+    if normalized.get("draft_status") and normalized.get("draft_status") != "Prepared":
+        errors.append("Customer scheduling/service reply draft result must be Prepared.")
+    if normalized.get("reply_intent") and normalized.get("reply_intent") not in supported_reply_intents:
+        errors.append("reply_intent is not supported for CustomerSchedulingServiceReply:draft.")
+    if normalized.get("entity_type") == "AutomationQuestion":
+        if not normalized.get("source_question_type"):
+            errors.append("source_question_type is required for AutomationQuestion-backed CustomerSchedulingServiceReply:draft.")
+        elif normalized.get("source_question_type") not in supported_question_types:
+            errors.append("source_question_type is not supported for CustomerSchedulingServiceReply:draft.")
+    elif normalized.get("entity_type") == "AutomationProposal":
+        if not normalized.get("source_action_type"):
+            errors.append("source_action_type is required for AutomationProposal-backed CustomerSchedulingServiceReply:draft.")
+        elif normalized.get("source_action_type") not in supported_action_types:
+            errors.append("source_action_type is not supported for CustomerSchedulingServiceReply:draft.")
+    elif normalized.get("entity_type"):
+        errors.append("Customer scheduling/service reply draft result entity_type must be AutomationQuestion or AutomationProposal.")
+    if normalized.get("created_at") and not str(normalized["created_at"]).strip():
+        warnings.append("created_at is blank.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_estimate_customer_reply_draft_result(payload: Any) -> JsonContractValidationResult:
+    contract_name = "estimate_customer_reply_draft_result"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_int(mapping, normalized, "outbound_message_log_id", errors)
+    _require_text(mapping, normalized, "entity_type", errors)
+    _require_int(mapping, normalized, "entity_id", errors)
+    _require_text(mapping, normalized, "draft_status", errors)
+    _require_text(mapping, normalized, "recipient_email", errors)
+    _require_text(mapping, normalized, "subject", errors)
+    _require_text(mapping, normalized, "body", errors)
+    _require_text(mapping, normalized, "reply_intent", errors)
+    _require_bool(mapping, normalized, "no_revised_estimate_document", errors)
+    _optional_int(mapping, normalized, "question_id", errors)
+    _optional_int(mapping, normalized, "proposal_id", errors)
+    _optional_text(mapping, normalized, "source_question_type")
+    _optional_text(mapping, normalized, "source_action_type")
+    _optional_text(mapping, normalized, "created_by")
+    _optional_text(mapping, normalized, "created_at")
+
+    supported_question_types = {
+        "estimate_follow_up_or_customer_reply",
+        "estimate_followup_review_required",
+        "estimate_disambiguation",
+        "reply_required_review",
+        "existing_workflow_reply_review",
+        "urgent_customer_reply_review",
+        "estimate_question_review",
+        "estimate_revision_review",
+    }
+    supported_action_types = {
+        "estimate_revision_observation",
+        "estimate_question_observation",
+        "estimate_follow_up_or_customer_reply",
+        "estimate_reply_observation",
+    }
+    supported_reply_intents = {
+        "estimate_question_acknowledgement",
+        "revision_request_acknowledgement",
+        "clarification_request",
+        "scope_change_caution",
+    }
+    if normalized.get("draft_status") and normalized.get("draft_status") != "Prepared":
+        errors.append("Estimate customer reply draft result must be Prepared.")
+    if normalized.get("reply_intent") and normalized.get("reply_intent") not in supported_reply_intents:
+        errors.append("reply_intent is not supported for EstimateCustomerReply:draft.")
+    if normalized.get("no_revised_estimate_document") is not True:
+        errors.append("no_revised_estimate_document must be true for EstimateCustomerReply:draft.")
+    if normalized.get("entity_type") == "AutomationQuestion":
+        if not normalized.get("source_question_type"):
+            errors.append("source_question_type is required for AutomationQuestion-backed EstimateCustomerReply:draft.")
+        elif normalized.get("source_question_type") not in supported_question_types:
+            errors.append("source_question_type is not supported for EstimateCustomerReply:draft.")
+    elif normalized.get("entity_type") == "AutomationProposal":
+        if not normalized.get("source_action_type"):
+            errors.append("source_action_type is required for AutomationProposal-backed EstimateCustomerReply:draft.")
+        elif normalized.get("source_action_type") not in supported_action_types:
+            errors.append("source_action_type is not supported for EstimateCustomerReply:draft.")
+    elif normalized.get("entity_type"):
+        errors.append("Estimate customer reply draft result entity_type must be AutomationQuestion or AutomationProposal.")
+    if normalized.get("created_at") and not str(normalized["created_at"]).strip():
+        warnings.append("created_at is blank.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_estimate_hold_off_ack_draft_result(payload: Any) -> JsonContractValidationResult:
+    contract_name = "estimate_hold_off_ack_draft_result"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _require_int(mapping, normalized, "outbound_message_log_id", errors)
+    _require_text(mapping, normalized, "entity_type", errors)
+    _require_int(mapping, normalized, "entity_id", errors)
+    _require_text(mapping, normalized, "draft_status", errors)
+    _require_text(mapping, normalized, "recipient_email", errors)
+    _require_text(mapping, normalized, "subject", errors)
+    _require_text(mapping, normalized, "body", errors)
+    _require_text(mapping, normalized, "reply_intent", errors)
+    _require_bool(mapping, normalized, "no_estimate_status_mutation", errors)
+    _optional_int(mapping, normalized, "question_id", errors)
+    _optional_int(mapping, normalized, "proposal_id", errors)
+    _optional_text(mapping, normalized, "source_question_type")
+    _optional_text(mapping, normalized, "source_action_type")
+    _optional_text(mapping, normalized, "created_by")
+    _optional_text(mapping, normalized, "created_at")
+
+    supported_question_types = {
+        "estimate_follow_up_or_customer_reply",
+        "estimate_disambiguation",
+        "reply_required_review",
+        "existing_workflow_reply_review",
+        "urgent_customer_reply_review",
+        "estimate_rejection_review",
+        "estimate_hold_off_review",
+    }
+    supported_action_types = {
+        "estimate_rejection_observation",
+        "estimate_hold_off_observation",
+        "estimate_follow_up_or_customer_reply",
+    }
+    supported_reply_intents = {
+        "estimate_rejected_or_went_elsewhere",
+        "estimate_hold_off",
+        "too_expensive_no_revision",
+        "deferred_until_later",
+    }
+    if normalized.get("draft_status") and normalized.get("draft_status") != "Prepared":
+        errors.append("Estimate hold-off acknowledgement draft result must be Prepared.")
+    if normalized.get("reply_intent") and normalized.get("reply_intent") not in supported_reply_intents:
+        errors.append("reply_intent is not supported for EstimateHoldOffAcknowledgement:draft.")
+    if normalized.get("no_estimate_status_mutation") is not True:
+        errors.append("no_estimate_status_mutation must be true for EstimateHoldOffAcknowledgement:draft.")
+    if normalized.get("entity_type") == "AutomationQuestion":
+        if not normalized.get("source_question_type"):
+            errors.append("source_question_type is required for AutomationQuestion-backed EstimateHoldOffAcknowledgement:draft.")
+        elif normalized.get("source_question_type") not in supported_question_types:
+            errors.append("source_question_type is not supported for EstimateHoldOffAcknowledgement:draft.")
+    elif normalized.get("entity_type") == "AutomationProposal":
+        if not normalized.get("source_action_type"):
+            errors.append("source_action_type is required for AutomationProposal-backed EstimateHoldOffAcknowledgement:draft.")
+        elif normalized.get("source_action_type") not in supported_action_types:
+            errors.append("source_action_type is not supported for EstimateHoldOffAcknowledgement:draft.")
+    elif normalized.get("entity_type"):
+        errors.append("Estimate hold-off acknowledgement draft result entity_type must be AutomationQuestion or AutomationProposal.")
+    if normalized.get("created_at") and not str(normalized["created_at"]).strip():
+        warnings.append("created_at is blank.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
 def validate_customer_invoice_due_observation(payload: Any) -> JsonContractValidationResult:
     base = validate_workflow_obligation_overdue_proposal(payload)
     contract_name = "customer_invoice_due_observation"
@@ -2210,6 +2604,67 @@ def validate_evidence(payload: Any) -> JsonContractValidationResult:
                 normalized_evidence.append(normalized_item)
             normalized["line_match_evidence"] = normalized_evidence
 
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_workflow_obligation_evidence(payload: Any) -> JsonContractValidationResult:
+    contract_name = "workflow_obligation_evidence"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _optional_text(mapping, normalized, "source_entity_type")
+    _optional_text(mapping, normalized, "source_entity_id")
+    _optional_text(mapping, normalized, "source_message_id")
+    _optional_int(mapping, normalized, "source_automation_proposal_id", errors)
+    _optional_int(mapping, normalized, "source_automation_question_id", errors)
+    _optional_int(mapping, normalized, "source_automation_run_id", errors)
+    _optional_int(mapping, normalized, "source_vendor_invoice_id", errors)
+    _optional_int(mapping, normalized, "source_purchase_order_id", errors)
+    _optional_int(mapping, normalized, "source_work_order_id", errors)
+    _optional_text(mapping, normalized, "detected_obligation_type")
+    _optional_text(mapping, normalized, "due_date")
+    _optional_text(mapping, normalized, "due_window")
+    _optional_float(mapping, normalized, "confidence", errors, warnings, min_value=0.0, max_value=1.0)
+    _optional_bool(mapping, normalized, "requires_human_review", errors)
+    _optional_text_list(mapping, normalized, "matched_phrases", errors)
+    _optional_text_list(mapping, normalized, "source_snippets", errors)
+    _optional_text_list(mapping, normalized, "uncertainty_notes", errors)
+    _optional_text(mapping, normalized, "reason")
+    _optional_text(mapping, normalized, "explicit_review_statement")
+
+    if normalized.get("due_date") and not _looks_like_iso_date(str(normalized["due_date"])):
+        warnings.append("due_date is present but not ISO-formatted.")
+    if not normalized.get("detected_obligation_type"):
+        warnings.append("detected_obligation_type is missing; UNKNOWN_NOVEL should still be explicit when applicable.")
+    if not normalized.get("source_entity_type") and not normalized.get("source_automation_proposal_id") and not normalized.get("source_automation_question_id"):
+        warnings.append("WorkflowObligation evidence has no primary source reference.")
+    return _result(contract_name, errors, warnings, normalized)
+
+
+def validate_workflow_obligation_resolution_json(payload: Any) -> JsonContractValidationResult:
+    contract_name = "workflow_obligation_resolution_json"
+    errors: list[str] = []
+    warnings: list[str] = []
+    mapping = _require_dict(payload, contract_name, errors)
+    normalized = _base_normalized(mapping)
+    if not mapping:
+        return _result(contract_name, errors, warnings, normalized)
+
+    _optional_text(mapping, normalized, "resolution_type")
+    _optional_text(mapping, normalized, "resolution_status")
+    _optional_text(mapping, normalized, "resolved_by")
+    _optional_text(mapping, normalized, "resolved_at")
+    _optional_text(mapping, normalized, "notes")
+    _optional_bool(mapping, normalized, "no_business_mutation_occurred", errors)
+    _optional_text_list(mapping, normalized, "uncertainty_notes", errors)
+    if normalized.get("resolved_at") and not _looks_like_iso_datetime(str(normalized["resolved_at"])):
+        warnings.append("resolved_at is present but not ISO-formatted.")
+    if not normalized.get("resolution_type"):
+        warnings.append("resolution_type is missing from workflow obligation resolution json.")
     return _result(contract_name, errors, warnings, normalized)
 
 
@@ -2626,3 +3081,14 @@ def _derive_po_eta_normalized_intent(mapping: dict[str, Any]) -> str:
 
 def _looks_like_iso_date(value: str) -> bool:
     return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "").strip()))
+
+
+def _looks_like_iso_datetime(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True

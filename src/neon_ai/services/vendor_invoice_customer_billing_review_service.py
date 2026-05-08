@@ -27,6 +27,9 @@ from neon_ai.services.automation_proposal_service import (
 )
 from neon_ai.services.inbound_intake_service import get_inbound_message, list_inbound_attachments
 from neon_ai.services.workflow_obligation_service import get_workflow_obligation
+from neon_ai.services.workflow_obligation_route_attachment_service import (
+    attach_selected_obligation_for_proposal_best_effort,
+)
 
 
 AUTOMATION_KEY = "vendor_invoice_customer_billing_review"
@@ -423,6 +426,11 @@ def create_customer_billing_review_artifact(
         requires_approval=True,
         can_auto_apply_level_2=False,
         status="Pending",
+    )
+    attach_selected_obligation_for_proposal_best_effort(
+        proposal,
+        automation_key=AUTOMATION_KEY,
+        automation_run_id=None,
     )
     _log_artifact_event(
         event_type="customer_billing_review_proposal_created",

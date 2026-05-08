@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTabWidget,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -52,6 +52,7 @@ from neon_ai.services.automation_control_service import (
 from neon_ai.services.llm_provider_service import (
     LLMHealthCheckResult,
     LLMProviderConfig,
+    ModelLaneConfig,
     get_llm_provider_config,
     health_check,
 )
@@ -82,6 +83,7 @@ from neon_ai.services.automation_proposal_apply_service import (
     reject_proposal,
     supports_apply_action,
 )
+from neon_ai.services.approved_outbound_send_service import send_approved_prepared_outbound_draft
 from neon_ai.services.inbound_intake_service import (
     InboundAttachmentRecord,
     InboundMessageRecord,
@@ -96,16 +98,34 @@ from neon_ai.services.inbound_attachment_text_extraction_service import (
     get_attachment_text_summary,
 )
 from neon_ai.services.outbound_message_log_service import get_outbound_messages_for_entity
+from neon_ai.services.outbound_draft_review_service import (
+    OutboundDraftReviewRecord,
+    build_outbound_draft_detail,
+    filter_outbound_draft_reviews,
+    get_outbound_draft_filter_options,
+    list_outbound_drafts_for_review,
+    outbound_draft_send_action_enabled,
+)
 from neon_ai.services.workflow_obligation_service import (
     WorkflowObligationChangeLogRecord,
     WorkflowObligationRecord,
     add_obligation_note,
+    build_obligation_operator_summary,
     dismiss_obligation,
+    filter_workflow_obligations_for_operator_view,
     list_obligation_change_log,
     list_obligations_for_review,
     mark_obligation_satisfied_manual,
+    summarize_workflow_obligation_operator_views,
     snooze_obligation,
     update_obligation_fields,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_ALL,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_DUE_SOON,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_LABELS,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_NEEDS_HUMAN,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_ORDER,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_OVERDUE,
+    WORKFLOW_OBLIGATION_OPERATOR_VIEW_TODAY,
 )
 from neon_ai.services.packing_slip_resolution_service import (
     resolve_packing_slip_question_to_proposal,
@@ -803,7 +823,7 @@ def _obligation_next_step_text(expected_event_type: str) -> str:
 
 
 class AutomationCenterPage(QWidget):
-    def __init__(self, main_window=None) -> None:
+    def __init__(self, main_window=None, *, surface_key: str = "dashboard") -> None:
         parent = main_window if isinstance(main_window, QWidget) else None
         super().__init__(parent)
         self.main_window = main_window
@@ -818,26 +838,62 @@ class AutomationCenterPage(QWidget):
         self._selected_obligation_change_log: list[WorkflowObligationChangeLogRecord] = []
         self._proposal_records: list[AutomationProposalRecord] = []
         self._question_records: list[AutomationQuestionRecord] = []
+        self._outbound_draft_records: list[OutboundDraftReviewRecord] = []
         self._inbound_messages: list[InboundMessageRecord] = []
         self._selected_message_attachments: list[InboundAttachmentRecord] = []
         self._policy_definitions: list[AutomationPolicyDefinition] = []
         self._filtered_obligation_records: list[WorkflowObligationRecord] = []
         self._filtered_proposal_records: list[AutomationProposalRecord] = []
         self._filtered_question_records: list[AutomationQuestionRecord] = []
+        self._filtered_outbound_draft_records: list[OutboundDraftReviewRecord] = []
         self._obligation_error: str | None = None
         self._proposal_error: str | None = None
         self._question_error: str | None = None
+        self._outbound_draft_error: str | None = None
         self._memory_summary = AutomationMemorySummary(0, 0, 0, 0)
         self._pending_counts = AutomationPendingCounts(0, 0)
         self._summary = Automation24hSummary(0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+        disabled_lane = ModelLaneConfig(
+            lane="disabled",
+            provider="disabled",
+            model=None,
+            allow_live=False,
+            key_present=False,
+            available=False,
+            max_calls_per_run=None,
+            max_input_chars=None,
+            notes="LLM provider status not loaded yet.",
+        )
         self._llm_config = LLMProviderConfig(
             provider="disabled",
             model=None,
             safe_mode=True,
+            primary_local_provider="ollama",
+            primary_remote_provider="openai",
+            primary_remote_fast_provider="openai",
+            primary_remote_strong_provider="openai",
+            local_model=None,
+            remote_model=None,
+            remote_fast_model=None,
+            remote_strong_model=None,
+            allow_live_local=False,
+            allow_live_remote=False,
+            allow_live_remote_fast=False,
+            allow_live_remote_strong=False,
+            remote_escalation_only=True,
+            max_remote_calls_per_run=0,
+            max_remote_strong_calls_per_run=0,
+            max_remote_input_chars=0,
             openai_key_present=False,
             ollama_model=None,
             openai_model=None,
             notes="LLM provider status not loaded yet.",
+            lanes={
+                "local": disabled_lane,
+                "remote_fast": disabled_lane,
+                "remote_strong": disabled_lane,
+                "disabled": disabled_lane,
+            },
         )
         self._llm_health = LLMHealthCheckResult(
             success=True,
@@ -848,12 +904,29 @@ class AutomationCenterPage(QWidget):
             openai_key_present=False,
             error=None,
         )
+        self._surface_definitions: list[tuple[str, str, str]] = [
+            ("dashboard", "Dashboard / Summary", "_build_inventory_tab"),
+            ("pending_approvals", "Pending Approvals", "_build_pending_approvals_tab"),
+            ("questions", "Questions", "_build_questions_tab"),
+            ("obligations", "Workflow Obligations", "_build_obligations_tab"),
+            ("outbound_drafts", "Outbound Drafts", "_build_outbound_drafts_tab"),
+            ("intake", "Inbound Intake", "_build_intake_tab"),
+            ("activity", "Runs / Events", "_build_activity_tab"),
+            ("memory", "Automation Memory", "_build_memory_tab"),
+            ("policies", "Policies", "_build_policies_tab"),
+            ("provider", "Provider Status", "_build_provider_tab"),
+        ]
+        if surface_key not in {key for key, _label, _builder_name in self._surface_definitions}:
+            raise KeyError(f"Unknown Automation Center surface: {surface_key}")
+        self._surface_widgets: dict[str, QWidget] = {}
+        self._surface_stack_indexes: dict[str, int] = {}
+        self._current_surface_key = surface_key
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        heading = QLabel("Automation Center")
+        heading = QLabel(f"Automation: {self._surface_label(self._current_surface_key)}")
         heading.setStyleSheet("font-size: 24px; font-weight: 700;")
         layout.addWidget(heading)
 
@@ -879,31 +952,63 @@ class AutomationCenterPage(QWidget):
             banner_layout.addWidget(label)
         layout.addWidget(self.banner)
 
-        self.queue_summary_group = self._build_queue_summary_group()
-        layout.addWidget(self.queue_summary_group)
+        self.surface_shell = self._build_surface_shell()
+        layout.addWidget(self.surface_shell, 1)
 
-        self.tabs = QTabWidget()
-        self.inventory_tab = self._build_inventory_tab()
-        self.activity_tab = self._build_activity_tab()
-        self.provider_tab = self._build_provider_tab()
-        self.policies_tab = self._build_policies_tab()
-        self.memory_tab = self._build_memory_tab()
-        self.obligations_tab = self._build_obligations_tab()
-        self.pending_approvals_tab = self._build_pending_approvals_tab()
-        self.questions_tab = self._build_questions_tab()
-        self.intake_tab = self._build_intake_tab()
-        self.tabs.addTab(self.inventory_tab, "Preset Inventory")
-        self.tabs.addTab(self.activity_tab, "Last 24 Hours")
-        self.tabs.addTab(self.provider_tab, "Provider Status")
-        self.tabs.addTab(self.policies_tab, "Policies")
-        self.tabs.addTab(self.memory_tab, "Memory")
-        self.tabs.addTab(self.obligations_tab, "Obligations")
-        self.tabs.addTab(self.pending_approvals_tab, "Pending Approvals")
-        self.tabs.addTab(self.questions_tab, "Questions")
-        self.tabs.addTab(self.intake_tab, "Intake")
-        layout.addWidget(self.tabs, 1)
+        self._show_surface(self._current_surface_key, refresh=False)
 
-        self.refresh_data()
+    def _build_surface_shell(self) -> QWidget:
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        self.surface_stack = QStackedWidget()
+        shell_layout.addWidget(self.surface_stack, 1)
+        return shell
+
+    def _surface_label(self, surface_key: str) -> str:
+        for key, label, _builder_name in self._surface_definitions:
+            if key == surface_key:
+                return label
+        return surface_key
+
+    def _surface_builder_name(self, surface_key: str) -> str:
+        for key, _label, builder_name in self._surface_definitions:
+            if key == surface_key:
+                return builder_name
+        raise KeyError(f"Unknown Automation Center surface: {surface_key}")
+
+    def _ensure_surface(self, surface_key: str) -> QWidget:
+        if surface_key in self._surface_widgets:
+            return self._surface_widgets[surface_key]
+        builder = getattr(self, self._surface_builder_name(surface_key))
+        content = builder()
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(10)
+        header = QHBoxLayout()
+        title = QLabel(self._surface_label(surface_key))
+        title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(lambda checked=False, key=surface_key: self.refresh_data(key))
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(refresh_button)
+        wrapper_layout.addLayout(header)
+        wrapper_layout.addWidget(content, 1)
+        index = self.surface_stack.addWidget(wrapper)
+        self._surface_stack_indexes[surface_key] = index
+        self._surface_widgets[surface_key] = wrapper
+        return wrapper
+
+    def _show_surface(self, surface_key: str, *, refresh: bool = True) -> None:
+        self._ensure_surface(surface_key)
+        self._current_surface_key = surface_key
+        self.surface_stack.setCurrentIndex(self._surface_stack_indexes[surface_key])
+        if refresh:
+            self.refresh_data(surface_key)
 
     def _build_queue_summary_group(self) -> QGroupBox:
         group = QGroupBox("Operator Queue Summary")
@@ -1023,7 +1128,7 @@ class AutomationCenterPage(QWidget):
         overdue_only.toggled.connect(lambda *_: apply_callback())
         cash_flow_only.toggled.connect(lambda *_: apply_callback())
         sort_combo.currentIndexChanged.connect(lambda *_: apply_callback())
-        refresh_button.clicked.connect(self.refresh_data)
+        refresh_button.clicked.connect(lambda *_: self.refresh_data())
         clear_button.clicked.connect(lambda: self._clear_queue_filters(controls, apply_callback))
         return group
 
@@ -1061,35 +1166,68 @@ class AutomationCenterPage(QWidget):
             sort_mode=sort_combo.currentText() if isinstance(sort_combo, QComboBox) else "Priority Queue",
         )
 
+    def _selected_obligation_operator_view(self) -> str:
+        combo = getattr(self, "obligation_operator_view_combo", None)
+        if isinstance(combo, QComboBox):
+            value = combo.currentData()
+            if isinstance(value, str) and value.strip():
+                return value
+        return WORKFLOW_OBLIGATION_OPERATOR_VIEW_ALL
+
+    def _refresh_obligation_operator_view_counts(self, counts: dict[str, int]) -> None:
+        combo = getattr(self, "obligation_operator_view_combo", None)
+        if isinstance(combo, QComboBox):
+            for index in range(combo.count()):
+                view_name = combo.itemData(index)
+                if not isinstance(view_name, str):
+                    continue
+                label = WORKFLOW_OBLIGATION_OPERATOR_VIEW_LABELS.get(view_name, view_name.title())
+                combo.setItemText(index, f"{label} ({int(counts.get(view_name, 0))})")
+        label_widget = getattr(self, "obligation_operator_view_counts_label", None)
+        if isinstance(label_widget, QLabel):
+            label_widget.setText(
+                " | ".join(
+                    [
+                        f"Today {int(counts.get(WORKFLOW_OBLIGATION_OPERATOR_VIEW_TODAY, 0))}",
+                        f"Overdue {int(counts.get(WORKFLOW_OBLIGATION_OPERATOR_VIEW_OVERDUE, 0))}",
+                        f"Due Soon {int(counts.get(WORKFLOW_OBLIGATION_OPERATOR_VIEW_DUE_SOON, 0))}",
+                        f"Needs Human {int(counts.get(WORKFLOW_OBLIGATION_OPERATOR_VIEW_NEEDS_HUMAN, 0))}",
+                    ]
+                )
+            )
+
     def _refresh_queue_summary_cards(self) -> None:
         counts = summarize_queue_counts(self._proposal_records, self._question_records, self._obligation_records)
         for key, label in self.queue_summary_labels.items():
             label.setText(str(counts.get(key, 0)))
 
     def _refresh_queue_filter_options(self) -> None:
-        self._populate_queue_filter_options(
-            self.proposal_queue_controls,
-            workflows=[record.workflow for record in self._proposal_records],
-            item_types=[record.action_type for record in self._proposal_records],
-            statuses=[record.status for record in self._proposal_records],
-            priorities=[record.risk_level for record in self._proposal_records],
-            preferred_status="Pending",
-        )
-        self._populate_queue_filter_options(
-            self.question_queue_controls,
-            workflows=[record.workflow for record in self._question_records],
-            item_types=[record.question_type for record in self._question_records],
-            statuses=[record.status for record in self._question_records],
-            priorities=[record.urgency or "Normal" for record in self._question_records],
-            preferred_status="Open",
-        )
-        self._populate_queue_filter_options(
-            self.obligation_queue_controls,
-            workflows=[record.workflow_type for record in self._obligation_records],
-            item_types=[record.expected_event_type for record in self._obligation_records],
-            statuses=[record.status for record in self._obligation_records],
-            priorities=[record.severity for record in self._obligation_records],
-        )
+        if hasattr(self, "proposal_queue_controls"):
+            self._populate_queue_filter_options(
+                self.proposal_queue_controls,
+                workflows=[record.workflow for record in self._proposal_records],
+                item_types=[record.action_type for record in self._proposal_records],
+                statuses=[record.status for record in self._proposal_records],
+                priorities=[record.risk_level for record in self._proposal_records],
+                preferred_status="Pending",
+            )
+        if hasattr(self, "question_queue_controls"):
+            self._populate_queue_filter_options(
+                self.question_queue_controls,
+                workflows=[record.workflow for record in self._question_records],
+                item_types=[record.question_type for record in self._question_records],
+                statuses=[record.status for record in self._question_records],
+                priorities=[record.urgency or "Normal" for record in self._question_records],
+                preferred_status="Open",
+            )
+        if hasattr(self, "obligation_queue_controls"):
+            self._populate_queue_filter_options(
+                self.obligation_queue_controls,
+                workflows=[record.workflow_type for record in self._obligation_records],
+                item_types=[record.expected_event_type for record in self._obligation_records],
+                statuses=[record.status for record in self._obligation_records],
+                priorities=[record.severity for record in self._obligation_records],
+            )
 
     def _populate_queue_filter_options(
         self,
@@ -1168,6 +1306,9 @@ class AutomationCenterPage(QWidget):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
+
+        self.queue_summary_group = self._build_queue_summary_group()
+        layout.addWidget(self.queue_summary_group)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -1770,6 +1911,25 @@ class AutomationCenterPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
+        operator_view_group = QGroupBox("Operator Views")
+        operator_view_layout = QHBoxLayout(operator_view_group)
+        operator_view_layout.setContentsMargins(12, 12, 12, 12)
+        operator_view_layout.setSpacing(8)
+        operator_view_layout.addWidget(QLabel("View"))
+        self.obligation_operator_view_combo = QComboBox()
+        for view_name in WORKFLOW_OBLIGATION_OPERATOR_VIEW_ORDER:
+            self.obligation_operator_view_combo.addItem(
+                WORKFLOW_OBLIGATION_OPERATOR_VIEW_LABELS.get(view_name, view_name.title()),
+                userData=view_name,
+            )
+        self.obligation_operator_view_combo.currentIndexChanged.connect(self._apply_obligation_queue_filters)
+        operator_view_layout.addWidget(self.obligation_operator_view_combo, 1)
+        self.obligation_operator_view_counts_label = QLabel("Today 0 | Overdue 0 | Due Soon 0 | Needs Human 0")
+        self.obligation_operator_view_counts_label.setWordWrap(True)
+        self.obligation_operator_view_counts_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        operator_view_layout.addWidget(self.obligation_operator_view_counts_label, 2)
+        layout.addWidget(operator_view_group)
+
         self.obligation_queue_controls: dict[str, QWidget] = {}
         layout.addWidget(
             self._build_queue_controls(
@@ -1890,6 +2050,129 @@ class AutomationCenterPage(QWidget):
         self.obligation_change_log_text.setReadOnly(True)
         change_layout.addWidget(self.obligation_change_log_text, 1)
         detail_layout.addWidget(change_group, 1)
+
+        splitter.addWidget(detail_host)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        return tab
+
+    def _build_outbound_drafts_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        controls_group = QGroupBox("Outbound Draft Filters")
+        controls_layout = QHBoxLayout(controls_group)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        controls_layout.setSpacing(8)
+        controls_layout.addWidget(QLabel("Status"))
+        self.outbound_draft_status_combo = QComboBox()
+        self.outbound_draft_status_combo.currentIndexChanged.connect(self._apply_outbound_draft_filters)
+        controls_layout.addWidget(self.outbound_draft_status_combo)
+        controls_layout.addWidget(QLabel("Template"))
+        self.outbound_draft_template_combo = QComboBox()
+        self.outbound_draft_template_combo.currentIndexChanged.connect(self._apply_outbound_draft_filters)
+        controls_layout.addWidget(self.outbound_draft_template_combo, 1)
+        controls_layout.addWidget(QLabel("Recipient"))
+        self.outbound_draft_recipient_search = QLineEdit()
+        self.outbound_draft_recipient_search.setPlaceholderText("Search recipient")
+        self.outbound_draft_recipient_search.textChanged.connect(self._apply_outbound_draft_filters)
+        controls_layout.addWidget(self.outbound_draft_recipient_search, 1)
+        layout.addWidget(controls_group)
+
+        self.outbound_drafts_empty_label = QLabel("No Level 3 outbound drafts recorded yet.")
+        self.outbound_drafts_empty_label.setWordWrap(True)
+        self.outbound_drafts_empty_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.outbound_drafts_empty_label)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+
+        drafts_group = QGroupBox("Prepared Outbound Drafts")
+        drafts_layout = QVBoxLayout(drafts_group)
+        self.outbound_drafts_table = QTableWidget(0, 10)
+        self.outbound_drafts_table.setHorizontalHeaderLabels(
+            [
+                "Log ID",
+                "Created",
+                "Template",
+                "Status",
+                "Recipient",
+                "Subject",
+                "Source",
+                "SentAt",
+                "Provider ID?",
+                "Allowlist",
+            ]
+        )
+        self.outbound_drafts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.outbound_drafts_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.outbound_drafts_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.outbound_drafts_table.setAlternatingRowColors(True)
+        self.outbound_drafts_table.itemSelectionChanged.connect(self._handle_outbound_draft_selection_changed)
+        drafts_layout.addWidget(self.outbound_drafts_table, 1)
+        splitter.addWidget(drafts_group)
+
+        detail_host = QWidget()
+        detail_layout = QVBoxLayout(detail_host)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(12)
+
+        detail_group = QGroupBox("Outbound Draft Detail")
+        detail_form = QFormLayout(detail_group)
+        detail_form.setContentsMargins(12, 12, 12, 12)
+        detail_form.setSpacing(8)
+        self.outbound_draft_detail_meta = QLabel("-")
+        self.outbound_draft_detail_recipient = QLabel("-")
+        self.outbound_draft_detail_source = QLabel("-")
+        self.outbound_draft_detail_status = QLabel("-")
+        self.outbound_draft_detail_safety = QLabel("-")
+        for label in (
+            self.outbound_draft_detail_meta,
+            self.outbound_draft_detail_recipient,
+            self.outbound_draft_detail_source,
+            self.outbound_draft_detail_status,
+            self.outbound_draft_detail_safety,
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail_form.addRow("Draft", self.outbound_draft_detail_meta)
+        detail_form.addRow("Recipient", self.outbound_draft_detail_recipient)
+        detail_form.addRow("Source", self.outbound_draft_detail_source)
+        detail_form.addRow("Status", self.outbound_draft_detail_status)
+        detail_form.addRow("Safety", self.outbound_draft_detail_safety)
+        detail_layout.addWidget(detail_group)
+
+        send_action_group = QGroupBox("Approved Send Action")
+        send_action_layout = QVBoxLayout(send_action_group)
+        send_action_layout.setContentsMargins(12, 12, 12, 12)
+        self.outbound_draft_send_button = QPushButton("Send Selected Draft")
+        self.outbound_draft_send_button.setEnabled(False)
+        self.outbound_draft_send_button.clicked.connect(self._handle_outbound_draft_send_clicked)
+        send_action_note = QLabel(
+            "Single selected Prepared draft only. The approved-send wrapper still enforces test mode, allowlist, "
+            "recipient/body checks, and supported template/source rules."
+        )
+        send_action_note.setWordWrap(True)
+        send_action_note.setStyleSheet("color: #555;")
+        send_action_layout.addWidget(self.outbound_draft_send_button)
+        send_action_layout.addWidget(send_action_note)
+        detail_layout.addWidget(send_action_group)
+
+        body_group = QGroupBox("Body Preview")
+        body_layout = QVBoxLayout(body_group)
+        self.outbound_draft_body_preview = QTextEdit()
+        self.outbound_draft_body_preview.setReadOnly(True)
+        body_layout.addWidget(self.outbound_draft_body_preview, 1)
+        detail_layout.addWidget(body_group, 1)
+
+        json_group = QGroupBox("Review Summary")
+        json_layout = QVBoxLayout(json_group)
+        self.outbound_draft_review_json = QTextEdit()
+        self.outbound_draft_review_json.setReadOnly(True)
+        json_layout.addWidget(self.outbound_draft_review_json, 1)
+        detail_layout.addWidget(json_group, 1)
 
         splitter.addWidget(detail_host)
         splitter.setStretchFactor(0, 3)
@@ -2219,50 +2502,21 @@ class AutomationCenterPage(QWidget):
     def refresh(self) -> None:
         self.refresh_data()
 
-    def refresh_data(self) -> None:
+    def refresh_data(self, surface_key: str | None = None) -> None:
+        active_surface = surface_key or self._current_surface_key or "dashboard"
+        self._ensure_surface(active_surface)
+        refresher = getattr(self, f"_refresh_{active_surface}_surface", None)
+        if refresher is None:
+            raise KeyError(f"Unknown Automation Center refresh surface: {active_surface}")
+        refresher()
+
+    def _refresh_dashboard_surface(self) -> None:
         selected_key = self._selected_preset_key()
-        selected_run_id = self._selected_run_id()
-        selected_event_id = self._selected_event_id()
-        selected_policy_key = self._selected_policy_key()
-        selected_memory_id = self._selected_memory_id()
-        selected_obligation_id = self._selected_obligation_id()
-        selected_proposal_id = self._selected_proposal_id()
-        selected_question_id = self._selected_question_id()
-        selected_inbound_message_id = self._selected_inbound_message_id()
-        selected_inbound_attachment_id = self._selected_inbound_attachment_id()
-
-        presets = list_automation_presets()
-        self._presets_by_key = {preset.key: preset for preset in presets}
-        self._settings_by_key = {}
-        self._latest_runs_by_key = {}
-        self._recent_runs_24h = []
-        self._recent_events_24h = []
-        self._selected_run_events = []
-        self._policy_definitions = []
-        self._memory_records = []
-        self._obligation_records = []
-        self._selected_obligation_change_log = []
-        self._proposal_records = []
-        self._question_records = []
-        self._inbound_messages = []
-        self._selected_message_attachments = []
-        self._filtered_obligation_records = []
-        self._filtered_proposal_records = []
-        self._filtered_question_records = []
-        self._memory_summary = AutomationMemorySummary(0, 0, 0, 0)
-        self._pending_counts = AutomationPendingCounts(0, 0)
-        self._summary = Automation24hSummary(0, 0, 0, 0, 0, 0, 0, 0, 0.0)
-        provider_error: str | None = None
-        policy_error: str | None = None
-        memory_error: str | None = None
-        obligation_error: str | None = None
-        proposal_error: str | None = None
-        question_error: str | None = None
-        intake_error: str | None = None
-
+        presets: list[AutomationPreset] = []
         inventory_error: str | None = None
-        activity_error: str | None = None
         try:
+            presets = list_automation_presets()
+            self._presets_by_key = {preset.key: preset for preset in presets}
             self._settings_by_key = {setting.automation_key: setting for setting in list_automation_settings()}
             latest_runs: dict[str, AutomationRunRecord] = {}
             for run in list_recent_automation_runs(limit=100):
@@ -2270,7 +2524,29 @@ class AutomationCenterPage(QWidget):
             self._latest_runs_by_key = latest_runs
         except Exception as exc:
             inventory_error = str(exc)
+        try:
+            self._proposal_records = list_proposals(limit=300)
+        except Exception:
+            self._proposal_records = []
+        try:
+            self._question_records = list_questions(limit=300)
+        except Exception:
+            self._question_records = []
+        try:
+            self._obligation_records = list_obligations_for_review(limit=300, include_terminal=False)
+        except Exception:
+            self._obligation_records = []
+        self._refresh_queue_summary_cards()
+        self._populate_inventory_tab(presets, selected_key, inventory_error)
 
+    def _refresh_activity_surface(self) -> None:
+        selected_run_id = self._selected_run_id()
+        selected_event_id = self._selected_event_id()
+        activity_error: str | None = None
+        self._recent_runs_24h = []
+        self._recent_events_24h = []
+        self._selected_run_events = []
+        self._summary = Automation24hSummary(0, 0, 0, 0, 0, 0, 0, 0, 0.0)
         try:
             since = datetime.now(timezone.utc) - timedelta(hours=24)
             self._summary = get_automation_24h_summary()
@@ -2278,51 +2554,99 @@ class AutomationCenterPage(QWidget):
             self._recent_events_24h = list_events_since(since, limit=500)
         except Exception as exc:
             activity_error = str(exc)
+        self._populate_activity_tab(selected_run_id, selected_event_id, activity_error)
+
+    def _refresh_provider_surface(self) -> None:
+        provider_error: str | None = None
         try:
             self._llm_config = get_llm_provider_config()
             self._llm_health = health_check(allow_live_call=False)
         except Exception as exc:
             provider_error = str(exc)
+        self._populate_provider_tab(provider_error)
+
+    def _refresh_policies_surface(self) -> None:
+        selected_policy_key = self._selected_policy_key()
+        policy_error: str | None = None
+        self._policy_definitions = []
         try:
             self._policy_definitions = list_policy_definitions()
         except Exception as exc:
             policy_error = str(exc)
+        self._populate_policies_tab(selected_policy_key, policy_error)
+
+    def _refresh_memory_surface(self) -> None:
+        selected_memory_id = self._selected_memory_id()
+        memory_error: str | None = None
+        self._memory_records = []
+        self._memory_summary = AutomationMemorySummary(0, 0, 0, 0)
         try:
             self._memory_records = list_memory(limit=300)
             self._memory_summary = get_active_memory_summary()
         except Exception as exc:
             memory_error = str(exc)
+        self._populate_memory_tab(selected_memory_id, memory_error)
+
+    def _refresh_obligations_surface(self) -> None:
+        selected_obligation_id = self._selected_obligation_id()
+        obligation_error: str | None = None
+        self._obligation_records = []
+        self._selected_obligation_change_log = []
         try:
             self._obligation_records = list_obligations_for_review(limit=300, include_terminal=False)
         except Exception as exc:
             obligation_error = str(exc)
         self._obligation_error = obligation_error
+        self._refresh_queue_filter_options()
+        self._populate_obligations_tab(selected_obligation_id, obligation_error)
+
+    def _refresh_pending_approvals_surface(self) -> None:
+        selected_proposal_id = self._selected_proposal_id()
+        proposal_error: str | None = None
+        self._proposal_records = []
+        self._pending_counts = AutomationPendingCounts(0, 0)
         try:
             self._proposal_records = list_proposals(limit=300)
             self._pending_counts = get_pending_counts()
         except Exception as exc:
             proposal_error = str(exc)
         self._proposal_error = proposal_error
+        self._refresh_queue_filter_options()
+        self._populate_pending_approvals_tab(selected_proposal_id, proposal_error)
+
+    def _refresh_questions_surface(self) -> None:
+        selected_question_id = self._selected_question_id()
+        question_error: str | None = None
+        self._question_records = []
         try:
             self._question_records = list_questions(limit=300)
         except Exception as exc:
             question_error = str(exc)
         self._question_error = question_error
+        self._refresh_queue_filter_options()
+        self._populate_questions_tab(selected_question_id, question_error)
+
+    def _refresh_outbound_drafts_surface(self) -> None:
+        selected_outbound_draft_id = self._selected_outbound_draft_id()
+        outbound_draft_error: str | None = None
+        self._outbound_draft_records = []
+        try:
+            self._outbound_draft_records = list_outbound_drafts_for_review(limit=300)
+        except Exception as exc:
+            outbound_draft_error = str(exc)
+        self._outbound_draft_error = outbound_draft_error
+        self._populate_outbound_drafts_tab(selected_outbound_draft_id, outbound_draft_error)
+
+    def _refresh_intake_surface(self) -> None:
+        selected_inbound_message_id = self._selected_inbound_message_id()
+        selected_inbound_attachment_id = self._selected_inbound_attachment_id()
+        intake_error: str | None = None
+        self._inbound_messages = []
+        self._selected_message_attachments = []
         try:
             self._inbound_messages = list_inbound_messages(limit=300)
         except Exception as exc:
             intake_error = str(exc)
-
-        self._refresh_queue_filter_options()
-        self._refresh_queue_summary_cards()
-        self._populate_inventory_tab(presets, selected_key, inventory_error)
-        self._populate_activity_tab(selected_run_id, selected_event_id, activity_error)
-        self._populate_provider_tab(provider_error)
-        self._populate_policies_tab(selected_policy_key, policy_error)
-        self._populate_memory_tab(selected_memory_id, memory_error)
-        self._populate_obligations_tab(selected_obligation_id, obligation_error)
-        self._populate_pending_approvals_tab(selected_proposal_id, proposal_error)
-        self._populate_questions_tab(selected_question_id, question_error)
         self._populate_intake_tab(selected_inbound_message_id, selected_inbound_attachment_id, intake_error)
 
     def _populate_inventory_tab(
@@ -2385,6 +2709,9 @@ class AutomationCenterPage(QWidget):
 
     def _apply_question_queue_filters(self) -> None:
         self._populate_questions_tab(self._selected_question_id(), self._question_error)
+
+    def _apply_outbound_draft_filters(self) -> None:
+        self._populate_outbound_drafts_tab(self._selected_outbound_draft_id(), self._outbound_draft_error)
 
     def _populate_activity_tab(
         self,
@@ -2552,9 +2879,19 @@ class AutomationCenterPage(QWidget):
             self._render_memory_detail(None)
 
     def _populate_obligations_tab(self, selected_obligation_id: int | None, obligation_error: str | None) -> None:
-        self._filtered_obligation_records = filter_and_sort_obligations(
+        current = datetime.now(timezone.utc)
+        operator_view = self._selected_obligation_operator_view()
+        operator_view_counts = summarize_workflow_obligation_operator_views(self._obligation_records, now=current)
+        self._refresh_obligation_operator_view_counts(operator_view_counts)
+        operator_view_records = filter_workflow_obligations_for_operator_view(
             self._obligation_records,
+            operator_view,
+            now=current,
+        )
+        self._filtered_obligation_records = filter_and_sort_obligations(
+            operator_view_records,
             self._queue_filter_state(self.obligation_queue_controls),
+            now=current,
         )
 
         if obligation_error:
@@ -2565,6 +2902,10 @@ class AutomationCenterPage(QWidget):
                 "No active workflow obligations recorded yet. This board tracks expected next events and missing follow-up."
             )
             self.obligations_empty_label.show()
+        elif not operator_view_records:
+            view_label = WORKFLOW_OBLIGATION_OPERATOR_VIEW_LABELS.get(operator_view, operator_view.title())
+            self.obligations_empty_label.setText(f"No workflow obligations are currently in the {view_label} view.")
+            self.obligations_empty_label.show()
         elif not self._filtered_obligation_records:
             self.obligations_empty_label.setText("No workflow obligations match the current queue filters.")
             self.obligations_empty_label.show()
@@ -2573,7 +2914,7 @@ class AutomationCenterPage(QWidget):
 
         self.obligations_table.setRowCount(0)
         for row_index, obligation in enumerate(self._filtered_obligation_records):
-            meta = build_obligation_queue_metadata(obligation)
+            meta = build_obligation_queue_metadata(obligation, now=current)
             self.obligations_table.insertRow(row_index)
             self._set_table_item(
                 self.obligations_table,
@@ -2677,6 +3018,84 @@ class AutomationCenterPage(QWidget):
             self._select_proposal_id(target_proposal_id)
         else:
             self._render_proposal_detail(None)
+
+    def _populate_outbound_drafts_tab(
+        self,
+        selected_outbound_draft_id: int | None,
+        outbound_draft_error: str | None,
+    ) -> None:
+        options = get_outbound_draft_filter_options(self._outbound_draft_records)
+        self._reset_combo_values(
+            self.outbound_draft_status_combo,
+            ["All statuses", *options.get("statuses", [])],
+            preferred_value="Prepared",
+        )
+        self._reset_combo_values(
+            self.outbound_draft_template_combo,
+            ["All templates", *options.get("templates", [])],
+        )
+        self._filtered_outbound_draft_records = filter_outbound_draft_reviews(
+            self._outbound_draft_records,
+            status=self.outbound_draft_status_combo.currentText(),
+            template_code=self.outbound_draft_template_combo.currentText(),
+            recipient_search=self.outbound_draft_recipient_search.text(),
+        )
+
+        if outbound_draft_error:
+            self.outbound_drafts_empty_label.setText(f"Outbound draft review unavailable: {outbound_draft_error}")
+            self.outbound_drafts_empty_label.show()
+        elif not self._outbound_draft_records:
+            self.outbound_drafts_empty_label.setText("No Level 3 outbound drafts recorded yet.")
+            self.outbound_drafts_empty_label.show()
+        elif not self._filtered_outbound_draft_records:
+            self.outbound_drafts_empty_label.setText("No outbound drafts match the current filters.")
+            self.outbound_drafts_empty_label.show()
+        else:
+            self.outbound_drafts_empty_label.hide()
+
+        self.outbound_drafts_table.setRowCount(0)
+        for row_index, draft in enumerate(self._filtered_outbound_draft_records):
+            self.outbound_drafts_table.insertRow(row_index)
+            self._set_table_item(
+                self.outbound_drafts_table,
+                row_index,
+                0,
+                str(draft.outbound_message_log_id),
+                user_data=draft.outbound_message_log_id,
+            )
+            self._set_table_item(self.outbound_drafts_table, row_index, 1, self._format_timestamp(draft.created_at))
+            self._set_table_item(self.outbound_drafts_table, row_index, 2, draft.template_code or "-")
+            self._set_table_item(self.outbound_drafts_table, row_index, 3, draft.send_status)
+            self._set_table_item(self.outbound_drafts_table, row_index, 4, draft.recipient_email or "-")
+            self._set_table_item(self.outbound_drafts_table, row_index, 5, draft.subject or "-")
+            self._set_table_item(self.outbound_drafts_table, row_index, 6, draft.source_summary)
+            self._set_table_item(self.outbound_drafts_table, row_index, 7, self._format_timestamp(draft.sent_at))
+            self._set_table_item(
+                self.outbound_drafts_table,
+                row_index,
+                8,
+                self._bool_text(draft.provider_message_id_present),
+            )
+            self._set_table_item(
+                self.outbound_drafts_table,
+                row_index,
+                9,
+                self._bool_text(draft.allowlist_eligible),
+            )
+        self.outbound_drafts_table.resizeColumnsToContents()
+
+        if self._filtered_outbound_draft_records:
+            target_draft_id = (
+                selected_outbound_draft_id
+                if any(
+                    record.outbound_message_log_id == selected_outbound_draft_id
+                    for record in self._filtered_outbound_draft_records
+                )
+                else self._filtered_outbound_draft_records[0].outbound_message_log_id
+            )
+            self._select_outbound_draft_id(target_draft_id)
+        else:
+            self._render_outbound_draft_detail(None)
 
     def _populate_questions_tab(
         self,
@@ -2892,6 +3311,19 @@ class AutomationCenterPage(QWidget):
         except (TypeError, ValueError):
             return None
 
+    def _selected_outbound_draft_id(self) -> int | None:
+        row = self.outbound_drafts_table.currentRow()
+        if row < 0:
+            return None
+        item = self.outbound_drafts_table.item(row, 0)
+        if item is None:
+            return None
+        data = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return None
+
     def _selected_inbound_message_id(self) -> int | None:
         row = self.inbound_messages_table.currentRow()
         if row < 0:
@@ -3009,6 +3441,19 @@ class AutomationCenterPage(QWidget):
                 if int(item.data(Qt.ItemDataRole.UserRole)) == int(question_id):
                     self.questions_table.setCurrentCell(row, 0)
                     self._handle_question_selection_changed()
+                    return
+            except (TypeError, ValueError):
+                continue
+
+    def _select_outbound_draft_id(self, outbound_draft_id: int) -> None:
+        for row in range(self.outbound_drafts_table.rowCount()):
+            item = self.outbound_drafts_table.item(row, 0)
+            if item is None:
+                continue
+            try:
+                if int(item.data(Qt.ItemDataRole.UserRole)) == int(outbound_draft_id):
+                    self.outbound_drafts_table.setCurrentCell(row, 0)
+                    self._handle_outbound_draft_selection_changed()
                     return
             except (TypeError, ValueError):
                 continue
@@ -3368,6 +3813,83 @@ class AutomationCenterPage(QWidget):
                 self._render_proposal_detail(proposal)
                 return
         self._render_proposal_detail(None)
+
+    def _handle_outbound_draft_selection_changed(self) -> None:
+        row = self.outbound_drafts_table.currentRow()
+        if row < 0:
+            self._render_outbound_draft_detail(None)
+            return
+        item = self.outbound_drafts_table.item(row, 0)
+        if item is None:
+            self._render_outbound_draft_detail(None)
+            return
+        draft_id = item.data(Qt.ItemDataRole.UserRole)
+        for draft in self._outbound_draft_records:
+            if draft.outbound_message_log_id == draft_id:
+                self._render_outbound_draft_detail(draft)
+                return
+        self._render_outbound_draft_detail(None)
+
+    def _handle_outbound_draft_send_clicked(self) -> None:
+        draft = self._selected_outbound_draft_record()
+        if draft is None:
+            QMessageBox.warning(self, "Send Selected Draft", "Select one outbound draft first.")
+            return
+        if draft.send_status != "Prepared":
+            QMessageBox.warning(
+                self,
+                "Send Selected Draft",
+                "Only Prepared outbound drafts can be sent through this action.",
+            )
+            return
+        recipient = draft.recipient_email or "(missing recipient)"
+        response = QMessageBox.question(
+            self,
+            "Send Selected Draft",
+            (
+                f"Send this prepared draft to {recipient}?\n\n"
+                "External email cannot be unsent.\n\n"
+                "This will call the Level 3 approved-send wrapper for this one selected draft only. "
+                "The wrapper will block the send unless test mode, allowlist, recipient, subject/body, "
+                "template, source, and status checks pass."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = send_approved_prepared_outbound_draft(
+                draft.outbound_message_log_id,
+                approved_by="Automation Center",
+                operator_approved=True,
+                allow_live_send=True,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Send Selected Draft", str(exc))
+            return
+
+        draft_id = draft.outbound_message_log_id
+        self.refresh_data()
+        self._select_outbound_draft_id(draft_id)
+        if result.sent:
+            QMessageBox.information(
+                self,
+                "Send Selected Draft",
+                f"Outbound draft #{draft_id} was sent successfully.",
+            )
+        elif result.blocked:
+            QMessageBox.warning(
+                self,
+                "Send Selected Draft",
+                f"Approved send was blocked.\n\n{result.message}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Send Selected Draft",
+                f"Approved send did not complete.\n\n{result.message}",
+            )
 
     def _handle_proposal_approve_clicked(self) -> None:
         proposal = self._selected_proposal_record()
@@ -4134,16 +4656,16 @@ class AutomationCenterPage(QWidget):
             self._update_obligation_action_buttons(None)
             return
 
+        operator_summary = build_obligation_operator_summary(obligation)
         self.obligation_detail_meta.setText(
-            f"#{obligation.obligation_id} | {obligation.workflow_type} | {obligation.expected_event_type} | "
-            f"Severity: {obligation.severity} | Status: {obligation.status}"
+            f"#{obligation.obligation_id} | {obligation.obligation_type or '-'} | "
+            f"Status: {obligation.status} | Priority: {obligation.priority or obligation.severity or '-'} | "
+            f"{operator_summary['due_summary']}"
         )
-        self.obligation_detail_source.setText(
-            f"{obligation.source_record_type} / {obligation.source_record_id} | "
-            f"ExpectedBy: {self._format_timestamp(obligation.expected_by)} | "
-            f"SnoozeUntil: {self._format_timestamp(obligation.snooze_until)}"
-        )
+        self.obligation_detail_source.setText(operator_summary["source_summary"])
         self.obligation_detail_lifecycle.setText(
+            f"Workflow: {obligation.workflow_type or '-'} | "
+            f"ExpectedEvent: {obligation.expected_event_type or '-'} | "
             f"Created: {self._format_timestamp(obligation.created_at)} | "
             f"Updated: {self._format_timestamp(obligation.updated_at)} | "
             f"LastChecked: {self._format_timestamp(obligation.last_checked_at)} | "
@@ -4151,21 +4673,33 @@ class AutomationCenterPage(QWidget):
             f"SatisfiedAt: {self._format_timestamp(obligation.satisfied_at)}"
         )
         self.obligation_detail_owner.setText(
-            f"OwnerRole: {obligation.owner_role or '-'} | "
-            f"OwnerUserID: {obligation.owner_user_id or '-'} | "
-            f"EscalationPolicy: {obligation.escalation_policy_code or '-'} | "
-            f"EscalationLevel: {obligation.escalation_level}"
+            f"Owner: {operator_summary['owner_summary']} | "
+            f"Cash-Flow Critical: {self._bool_text(bool(operator_summary['cash_flow_critical']))} | "
+            f"Needs Human: {self._bool_text(bool(operator_summary['needs_human']))} | "
+            f"Overdue: {self._bool_text(bool(operator_summary['overdue']))}"
         )
         metadata = build_obligation_queue_metadata(obligation)
+        recent_history = operator_summary["recent_history_summary"] if isinstance(operator_summary["recent_history_summary"], list) else []
         queue_lines = [
-            "Queue Metadata:",
+            "Operator Summary:",
             f"Age: {metadata['age_text']}",
-            f"Overdue Age: {_age_text(int(metadata['overdue_days'])) if metadata['is_overdue'] else '-'}",
-            f"Cash-Flow Critical: {self._bool_text(bool(metadata['cash_flow_critical']))}",
-            f"Operator Action Needed: {self._bool_text(bool(metadata['operator_action_needed']))}",
-            f"Suggested Next Step: {metadata['suggested_next_step']}",
+            f"Due: {operator_summary['due_summary']}",
+            f"Owner: {operator_summary['owner_summary']}",
+            f"Cash-Flow Critical: {self._bool_text(bool(operator_summary['cash_flow_critical']))}",
+            f"Needs Human: {self._bool_text(bool(operator_summary['needs_human']))}",
+            f"Risk / Flags: {operator_summary['risk_summary']}",
             "",
+            "Next Operator Action:",
+            str(operator_summary["next_operator_action"]),
+            "",
+            "Recent Obligation History:",
         ]
+        if recent_history:
+            for entry in recent_history:
+                queue_lines.append(f"  - {entry}")
+        else:
+            queue_lines.append("  - No recent obligation history.")
+        queue_lines.append("")
         self.obligation_review_summary.setPlainText(
             "\n".join(queue_lines) + self._workflow_obligation_detail_text(obligation)
         )
@@ -4250,6 +4784,86 @@ class AutomationCenterPage(QWidget):
             if proposal.automation_proposal_id == proposal_id:
                 return proposal
         return None
+
+    def _render_outbound_draft_detail(self, draft: OutboundDraftReviewRecord | None) -> None:
+        if draft is None:
+            self.outbound_draft_detail_meta.setText("-")
+            self.outbound_draft_detail_recipient.setText("-")
+            self.outbound_draft_detail_source.setText("-")
+            self.outbound_draft_detail_status.setText("-")
+            self.outbound_draft_detail_safety.setText("-")
+            self.outbound_draft_body_preview.setPlainText(
+                "Select an outbound draft to inspect the read-only prepared/sent/failed record."
+            )
+            self.outbound_draft_review_json.setPlainText(
+                "Select a Prepared outbound draft to inspect or send one approved, allowlisted test-mode email."
+            )
+            self._update_outbound_draft_action_buttons(None)
+            return
+
+        detail = build_outbound_draft_detail(draft)
+        operator_summary = detail.get("operator_summary") if isinstance(detail.get("operator_summary"), dict) else {}
+        blocked_reasons = operator_summary.get("blocked_reasons")
+        if not isinstance(blocked_reasons, list):
+            blocked_reasons = []
+        blocked_text = "; ".join(str(reason) for reason in blocked_reasons) if blocked_reasons else "-"
+        self.outbound_draft_detail_meta.setText(
+            f"#{draft.outbound_message_log_id} | {draft.template_code or '-'} | "
+            f"Created: {self._format_timestamp(draft.created_at)} | CreatedBy: {draft.created_by or '-'}"
+        )
+        self.outbound_draft_detail_recipient.setText(
+            f"To: {draft.recipient_email or '-'} | Original: {draft.original_recipient_email or '-'} | "
+            f"CC: {draft.cc_email or '-'}"
+        )
+        self.outbound_draft_detail_source.setText(
+            f"{draft.source_summary} | Attachment: {draft.attachment_path or '-'}"
+        )
+        self.outbound_draft_detail_status.setText(
+            "\n".join(
+                [
+                    f"Status: {operator_summary.get('status_summary') or draft.send_status}",
+                    f"Eligible to send: {self._bool_text(bool(operator_summary.get('send_eligible')))}",
+                    f"Blocked reasons: {blocked_text}",
+                    f"Failure: {operator_summary.get('failure_summary') or '-'}",
+                    f"SentAt: {self._format_timestamp(draft.sent_at)}",
+                    f"ProviderMessageID present: {self._bool_text(draft.provider_message_id_present)}",
+                    f"Next action: {operator_summary.get('next_operator_action') or '-'}",
+                ]
+            )
+        )
+        self.outbound_draft_detail_safety.setText(
+            "\n".join(
+                [
+                    str(operator_summary.get("test_mode_summary") or "-"),
+                    str(operator_summary.get("allowlist_summary") or "-"),
+                    str(operator_summary.get("provider_summary") or "-"),
+                    str(operator_summary.get("safety_summary") or "-"),
+                ]
+            )
+        )
+        self.outbound_draft_body_preview.setPlainText(
+            "\n".join(
+                [
+                    f"Subject: {draft.subject or '-'}",
+                    "",
+                    str(detail.get("body_preview") or "-"),
+                ]
+            )
+        )
+        self.outbound_draft_review_json.setPlainText(json.dumps(detail, indent=2, sort_keys=True, default=str))
+        self._update_outbound_draft_action_buttons(draft)
+
+    def _selected_outbound_draft_record(self) -> OutboundDraftReviewRecord | None:
+        outbound_draft_id = self._selected_outbound_draft_id()
+        if outbound_draft_id is None:
+            return None
+        for draft in self._outbound_draft_records:
+            if draft.outbound_message_log_id == outbound_draft_id:
+                return draft
+        return None
+
+    def _update_outbound_draft_action_buttons(self, draft: OutboundDraftReviewRecord | None) -> None:
+        self.outbound_draft_send_button.setEnabled(outbound_draft_send_action_enabled(draft))
 
     def _update_proposal_action_buttons(self, proposal: AutomationProposalRecord | None) -> None:
         if proposal is None:
@@ -4348,15 +4962,23 @@ class AutomationCenterPage(QWidget):
         return "\n".join(lines)
 
     def _workflow_obligation_detail_text(self, obligation: WorkflowObligationRecord) -> str:
+        operator_summary = build_obligation_operator_summary(obligation)
         lines = []
         lines.append(f"Obligation ID: {obligation.obligation_id}")
+        lines.append(f"Obligation Type: {obligation.obligation_type or '-'}")
         lines.append(f"Workflow: {obligation.workflow_type}")
         lines.append(f"Expected Event: {obligation.expected_event_type}")
-        lines.append(f"Linked Source: {obligation.source_record_type} / {obligation.source_record_id}")
+        lines.append(f"Linked Source: {operator_summary['source_summary']}")
+        lines.append(f"Due Summary: {operator_summary['due_summary']}")
         lines.append(f"Expected By: {self._format_timestamp(obligation.expected_by)}")
         lines.append(f"Snooze Until: {self._format_timestamp(obligation.snooze_until)}")
-        lines.append(f"Severity: {obligation.severity}")
+        lines.append(f"Priority / Severity: {obligation.priority or '-'} / {obligation.severity}")
         lines.append(f"Status: {obligation.status}")
+        lines.append(f"Owner Summary: {operator_summary['owner_summary']}")
+        lines.append(f"Next Operator Action: {operator_summary['next_operator_action']}")
+        lines.append(f"Cash-Flow Critical: {self._bool_text(bool(operator_summary['cash_flow_critical']))}")
+        lines.append(f"Needs Human: {self._bool_text(bool(operator_summary['needs_human']))}")
+        lines.append(f"Overdue: {self._bool_text(bool(operator_summary['overdue']))}")
         lines.append(f"Last Checked: {self._format_timestamp(obligation.last_checked_at)}")
         lines.append(f"Last Proposal ID: {self._nullable_text(obligation.last_proposal_id)}")
         lines.append("")
@@ -4676,6 +5298,13 @@ class AutomationCenterPage(QWidget):
         lines.append(f"Work Order #: {proposed_change.get('work_order_id') or '-'}")
         lines.append(f"Customer Billing Status: {proposed_change.get('customer_billing_status') or '-'}")
         lines.append(f"Recommended Operator Action: {proposed_change.get('recommended_operator_action') or '-'}")
+        if str(proposed_change.get("proposal_type") or "").strip() == "customer_billing_status_review_resolution":
+            lines.append(f"Resolution Outcome: {proposed_change.get('resolution_outcome') or '-'}")
+            lines.append(f"Resolution Source Question ID: {proposed_change.get('resolution_source_question_id') or '-'}")
+            lines.append(f"Selected Customer Invoice ID: {proposed_change.get('selected_customer_invoice_id') or '-'}")
+            lines.append(f"Selected Work Order ID: {proposed_change.get('selected_work_order_id') or '-'}")
+            lines.append(f"Resolved By: {proposed_change.get('resolved_by') or '-'}")
+            lines.append(f"Resolved At: {proposed_change.get('resolved_at') or '-'}")
         cash_flow_flags = proposed_change.get("cash_flow_flags") if isinstance(proposed_change.get("cash_flow_flags"), list) else []
         if cash_flow_flags:
             lines.append(f"Cash-Flow Flags: {', '.join(str(flag) for flag in cash_flow_flags)}")
@@ -4685,11 +5314,14 @@ class AutomationCenterPage(QWidget):
         uncertainty_notes = proposed_change.get("uncertainty_notes") if isinstance(proposed_change.get("uncertainty_notes"), list) else []
         if uncertainty_notes:
             lines.append(f"Uncertainty Notes: {'; '.join(str(note) for note in uncertainty_notes)}")
+        if proposed_change.get("operator_note"):
+            lines.append(f"Operator Note: {proposed_change.get('operator_note')}")
         lines.append("")
         lines.append(f"Source Record: {evidence.get('source_record_type') or '-'} / {evidence.get('source_record_id') or '-'}")
         lines.append(f"Source VendorInvoice ID: {evidence.get('source_vendor_invoice_id') or '-'}")
         lines.append(f"Source Proposal ID: {evidence.get('source_proposal_id') or '-'}")
         lines.append(f"Source Inbound Message ID: {evidence.get('source_inbound_message_id') or '-'}")
+        lines.append(f"Source Question ID: {evidence.get('source_question_id') or '-'}")
         missing_evidence = evidence.get("missing_evidence_list") if isinstance(evidence.get("missing_evidence_list"), list) else []
         if missing_evidence:
             lines.append(f"Missing Evidence: {', '.join(str(item) for item in missing_evidence)}")
@@ -6071,3 +6703,53 @@ class AutomationCenterPage(QWidget):
 
     def _escape(self, text: str) -> str:
         return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class AutomationDashboardPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="dashboard")
+
+
+class AutomationPendingApprovalsPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="pending_approvals")
+
+
+class AutomationQuestionsPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="questions")
+
+
+class AutomationObligationsPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="obligations")
+
+
+class AutomationOutboundDraftsPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="outbound_drafts")
+
+
+class AutomationIntakePage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="intake")
+
+
+class AutomationEventsPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="activity")
+
+
+class AutomationMemoryPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="memory")
+
+
+class AutomationPolicyPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="policies")
+
+
+class AutomationProviderStatusPage(AutomationCenterPage):
+    def __init__(self, main_window=None) -> None:
+        super().__init__(main_window, surface_key="provider")

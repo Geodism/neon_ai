@@ -18,7 +18,18 @@ from PySide6.QtWidgets import (
 
 from neon_ai.database.material_calls import LEGACY_LOOSE_RFQ_DEBUG_ENV, legacy_loose_rfq_debug_enabled
 from neon_ai.ui.dialogs.tiber_dialog import launch_tiber
-from neon_ai.ui.pages.automation_center_page import AutomationCenterPage
+from neon_ai.ui.pages.automation_center_page import (
+    AutomationDashboardPage,
+    AutomationEventsPage,
+    AutomationIntakePage,
+    AutomationMemoryPage,
+    AutomationObligationsPage,
+    AutomationOutboundDraftsPage,
+    AutomationPendingApprovalsPage,
+    AutomationPolicyPage,
+    AutomationProviderStatusPage,
+    AutomationQuestionsPage,
+)
 from neon_ai.ui.pages.customer_page import CustomerPage
 from neon_ai.ui.pages.dashboard_page import DashboardPage
 from neon_ai.ui.pages.document_control_page import DocumentControlPage
@@ -47,6 +58,20 @@ from neon_ai.ui.pages.workorder_viewer_page import WorkOrderViewerPage
 class MenuAction:
     label: str
     page_key: str
+
+
+AUTOMATION_MENU_ACTIONS: tuple[MenuAction, ...] = (
+    MenuAction("Dashboard / Summary", "AutomationDashboardFrame"),
+    MenuAction("Pending Approvals", "AutomationPendingApprovalsFrame"),
+    MenuAction("Questions", "AutomationQuestionsFrame"),
+    MenuAction("Workflow Obligations", "AutomationObligationsFrame"),
+    MenuAction("Outbound Drafts", "AutomationOutboundDraftsFrame"),
+    MenuAction("Inbound Intake", "AutomationIntakeFrame"),
+    MenuAction("Runs / Events", "AutomationEventsFrame"),
+    MenuAction("Automation Memory", "AutomationMemoryFrame"),
+    MenuAction("Policies", "AutomationPolicyFrame"),
+    MenuAction("Provider Status", "AutomationProviderStatusFrame"),
+)
 
 
 def _perf_log(area: str, name: str, started_at: float) -> None:
@@ -106,7 +131,7 @@ class NeonMainWindow(QMainWindow):
                 MenuAction("A/R & Tracking", "InvoiceViewerFrame"),
             ],
             "AUTOMATION": [
-                MenuAction("Automation Center", "AutomationCenterFrame"),
+                *AUTOMATION_MENU_ACTIONS,
             ],
             "DOCUMENTS": [
                 MenuAction("Template & Document Control", "Template & Document Control"),
@@ -234,7 +259,17 @@ class NeonMainWindow(QMainWindow):
             "TimesheetManagerFrame": TimesheetManagerPage,
             "InvoiceCreatorFrame": InvoiceCreatorPage,
             "InvoiceViewerFrame": InvoiceViewerPage,
-            "AutomationCenterFrame": AutomationCenterPage,
+            "AutomationCenterFrame": AutomationDashboardPage,
+            "AutomationDashboardFrame": AutomationDashboardPage,
+            "AutomationPendingApprovalsFrame": AutomationPendingApprovalsPage,
+            "AutomationQuestionsFrame": AutomationQuestionsPage,
+            "AutomationObligationsFrame": AutomationObligationsPage,
+            "AutomationOutboundDraftsFrame": AutomationOutboundDraftsPage,
+            "AutomationIntakeFrame": AutomationIntakePage,
+            "AutomationEventsFrame": AutomationEventsPage,
+            "AutomationMemoryFrame": AutomationMemoryPage,
+            "AutomationPolicyFrame": AutomationPolicyPage,
+            "AutomationProviderStatusFrame": AutomationProviderStatusPage,
             "Template & Document Control": DocumentControlPage,
             "VendorFrame": VendorPage,
             "VendorInvoiceFrame": VendorInvoicePage,
